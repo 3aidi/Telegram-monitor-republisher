@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+import tempfile
 import time
 import unittest
 import emoji
@@ -174,7 +175,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(len(matches), 1, "channel must not be duplicated across rows")
         row = matches[0]
         self.assertEqual(row["channel_username"], "kycgroupke")
-        self.assertEqual(row["markup_multiplier"], 0.80, "re-add should update the multiplier")
+        self.assertEqual(row["markup_multiplier"], 0.75, "re-add must preserve the existing multiplier")
         self.assertEqual(row["active"], 1)
 
     def test_db_add_supplier_upgrades_numeric_placeholder_to_username(self):
@@ -187,6 +188,349 @@ class TestMonitorSystem(unittest.TestCase):
         matches = [s for s in suppliers if s["channel_id"] == -100456]
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["channel_username"], "renamedchan")
+
+    def test_db_merge_supplier_rows_never_overwrites_keep_channel_id(self):
+        """Merging two rows that BOTH hold a non-null channel_id must never crash
+        UNIQUE(channel_id): the keep row's id is definitionally correct, so it is
+        preserved and only the drop row is removed. (Regression: the old code
+        wrote the drop row's id onto the keep row while the drop row still held
+        it -> sqlite3.IntegrityError during resolve_supplier_entities.)"""
+        db_path = TEST_DB
+        keep = db.add_supplier("ownschan", channel_id=-100500, markup_multiplier=0.70, db_path=db_path)
+        drop = db.add_supplier("stalechan", channel_id=-100501, markup_multiplier=0.90, db_path=db_path)
+        ok = db.merge_supplier_rows(keep, drop, db_path=db_path)
+        self.assertTrue(ok)
+        kept = db.get_supplier_by_id(keep, db_path=db_path)
+        self.assertIsNotNone(kept)
+        self.assertEqual(kept["channel_id"], -100500, "keep row's channel_id must never be overwritten")
+        self.assertEqual(kept["active"], 1)
+        self.assertIsNone(db.get_supplier_by_id(drop, db_path=db_path), "drop row must be deleted")
+
+    def test_db_merge_supplier_rows_backfills_null_keep_channel_id(self):
+        """The ONLY case where channel_id is copied is when the keep row's is NULL:
+        a previously-unresolved keep row adopts the drop row's resolved id after
+        the drop row's unique slot is freed."""
+        db_path = TEST_DB
+        keep = db.add_supplier("noidchan", channel_id=None, markup_multiplier=0.75, db_path=db_path)
+        drop = db.add_supplier("resolvedchan", channel_id=-100502, markup_multiplier=0.75, db_path=db_path)
+        ok = db.merge_supplier_rows(keep, drop, db_path=db_path)
+        self.assertTrue(ok)
+        kept = db.get_supplier_by_id(keep, db_path=db_path)
+        self.assertEqual(kept["channel_id"], -100502)
+        self.assertIsNone(db.get_supplier_by_id(drop, db_path=db_path))
+
+    @staticmethod
+    def _fresh_db(name: str) -> str:
+        path = os.path.join(tempfile.gettempdir(), name)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        db.init_db(path)
+        return path
+
+    def test_db_env_seed_bootstrap_once_and_never_again(self):
+        """Fresh/empty DB + populated SOURCE_CHANNELS -> seeded once and the marker
+        is set; a later restart must NOT re-seed, so a supplier deleted between the
+        two startups does NOT reappear (env is one-time bootstrap, not live state)."""
+        path = self._fresh_db("env_seed_bootstrap_test.db")
+        channels = ["@chanone", "-100111"]
+        result1 = db.ensure_env_seed(channels, 0.75, db_path=path)
+        self.assertEqual(result1["state"], "seeded")
+        self.assertEqual(result1["seeded"], 2)
+        self.assertTrue(db.env_seed_completed(db_path=path))
+        self.assertEqual(db.count_suppliers(db_path=path), 2)
+
+        row = db.get_supplier_by_chat(username="chanone", db_path=path)
+        db.delete_supplier(row["id"], db_path=path)
+
+        result2 = db.ensure_env_seed(channels, 0.75, db_path=path)
+        self.assertEqual(result2["state"], "already_seeded")
+        self.assertEqual(result2["seeded"], 0)
+        self.assertIsNone(
+            db.get_supplier_by_chat(username="chanone", db_path=path),
+            "deleted supplier must not reappear after restart",
+        )
+        self.assertEqual(db.count_suppliers(db_path=path), 1)
+        db.clear_env_seed_completed(db_path=path)
+
+    def test_db_env_seed_migrates_existing_db_without_changes(self):
+        """Production migration: existing non-empty suppliers table + unset marker
+        -> marker set WITHOUT calling the env sync, and no rows added/removed/
+        duplicated as a side effect of the deploy."""
+        path = self._fresh_db("env_seed_migrate_test.db")
+        db.add_supplier("@exist1", channel_id=-100400, db_path=path)
+        db.add_supplier("@exist2", channel_id=-100401, db_path=path)
+        before = [dict(r) for r in db.list_suppliers(db_path=path)]
+        self.assertFalse(db.env_seed_completed(db_path=path))
+
+        result = db.ensure_env_seed(["@wouldhavebeen", "-100999"], 0.75, db_path=path)
+        self.assertEqual(result["state"], "migrated")
+        self.assertTrue(result["migrated"])
+        self.assertEqual(result["seeded"], 0)
+        after = [dict(r) for r in db.list_suppliers(db_path=path)]
+        self.assertEqual(before, after, "migration must not modify any supplier row")
+        self.assertTrue(db.env_seed_completed(db_path=path))
+
+        again = db.ensure_env_seed(["@alsoignored"], 0.75, db_path=path)
+        self.assertEqual(again["state"], "already_seeded")
+        self.assertEqual(db.count_suppliers(db_path=path), 2)
+        db.clear_env_seed_completed(db_path=path)
+
+    def test_db_env_seed_reseed_escape_hatch(self):
+        """/reseed_from_env path: the handler clears the marker, runs the seed sync
+        DIRECTLY (bypassing the empty-table migration guard), and re-sets the marker.
+        Existing suppliers are preserved, new ones are added, and restarts keep
+        ignoring .env afterwards."""
+        path = self._fresh_db("env_seed_reseed_test.db")
+        db.ensure_env_seed(["@a", "@b"], 0.75, db_path=path)
+        self.assertEqual(db.count_suppliers(db_path=path), 2)
+        self.assertTrue(db.env_seed_completed(db_path=path))
+
+        db.clear_env_seed_completed(db_path=path)
+        n = db.seed_suppliers_from_env(["@a", "@b", "@c"], 0.75, db_path=path)
+        db.mark_env_seed_completed(db_path=path)
+        self.assertEqual(n, 3)
+        self.assertEqual(db.count_suppliers(db_path=path), 3)
+        self.assertIsNotNone(db.get_supplier_by_chat(username="b", db_path=path))
+        self.assertIsNotNone(db.get_supplier_by_chat(username="c", db_path=path))
+        self.assertTrue(db.env_seed_completed(db_path=path))
+
+        again = db.ensure_env_seed(["@zzz"], 0.75, db_path=path)
+        self.assertEqual(again["state"], "already_seeded")
+        self.assertEqual(again["seeded"], 0)
+        self.assertIsNone(db.get_supplier_by_chat(username="zzz", db_path=path))
+        self.assertEqual(db.count_suppliers(db_path=path), 3)
+
+    def test_validate_env_seed_empty_env_ok_with_existing_suppliers(self):
+        """Empty/removed SOURCE_CHANNELS must NOT crash startup once suppliers
+        exist in the DB (the classic post-bootstrap production state)."""
+        path = self._fresh_db("validate_env_seed_existing.db")
+        db.add_supplier("@existing", channel_id=-100600, db_path=path)
+        db.mark_env_seed_completed(db_path=path)
+        self.assertIsNone(db.validate_env_seed_config("", db_path=path))
+
+    def test_validate_env_seed_empty_env_ok_with_preexisting_rows_unmarked(self):
+        """Even with the marker unset, non-empty suppliers take precedence (the
+        migration path) — empty .env stays fine."""
+        path = self._fresh_db("validate_env_seed_migration.db")
+        db.add_supplier("@keepme", channel_id=-100601, db_path=path)
+        self.assertIsNone(db.validate_env_seed_config("", db_path=path))
+
+    def test_validate_env_seed_empty_env_ok_when_all_deleted_after_seed(self):
+        """Marker set + everything deliberately deleted = intentional empty state;
+        must not crash."""
+        path = self._fresh_db("validate_env_seed_deleted.db")
+        db.mark_env_seed_completed(db_path=path)
+        self.assertIsNone(db.validate_env_seed_config("", db_path=path))
+
+    def test_validate_env_seed_empty_env_and_empty_db_returns_notice(self):
+        """Empty .env + empty DB is a VALID fresh-install state: the bot must start
+        with 0 suppliers and a warning, never crash. Assert the notice is returned
+        and the seed/bootstrap path completes safely (0 seeded, marker set)."""
+        path = self._fresh_db("validate_env_seed_fresh.db")
+        notice = db.validate_env_seed_config("", db_path=path)
+        self.assertIsNotNone(notice)
+        self.assertIn("0 monitored sources", notice)
+        self.assertIn("Sources menu", notice)
+        result = db.ensure_env_seed([], 0.75, db_path=path)
+        self.assertEqual(result["state"], "seeded")
+        self.assertEqual(result["seeded"], 0)
+        self.assertTrue(db.env_seed_completed(db_path=path))
+        self.assertEqual(db.count_suppliers(db_path=path), 0)
+
+    def test_zero_suppliers_resolved_alert_text(self):
+        """The startup watchdog alert only fires when something IS configured but
+        nothing resolved (0 configured suppliers is a calm, valid state)."""
+        import main as main_mod
+
+        self.assertIsNone(main_mod.zero_resolved_suppliers_alert_text(0, 0))
+        self.assertIsNone(main_mod.zero_resolved_suppliers_alert_text(0, 5))
+        self.assertIsNone(main_mod.zero_resolved_suppliers_alert_text(5, 5))
+        self.assertIsNone(main_mod.zero_resolved_suppliers_alert_text(5, 3))
+        text = main_mod.zero_resolved_suppliers_alert_text(5, 0)
+        self.assertIsNotNone(text)
+        self.assertIn("0 of 5", text)
+        self.assertIn("MONITORING NOTHING", text)
+
+    def test_warn_if_zero_suppliers_resolved_dms_admin(self):
+        """Active suppliers but zero resolved -> log error AND admin DM."""
+        import asyncio
+        import main as main_mod
+
+        class _FakeBot:
+            def __init__(self):
+                self.sent = []
+                self.admin = 5883701139
+
+            async def send_message(self, to, text):
+                self.sent.append((to, text))
+                return None
+
+        bot = _FakeBot()
+        sent_text = asyncio.run(
+            main_mod._warn_if_zero_suppliers_resolved(bot, active_total=4, resolved_ok=0)
+        )
+        self.assertIsNotNone(sent_text)
+        self.assertIn("0 of 4", sent_text)
+        self.assertEqual([t for _, t in bot.sent if "MONITORING NOTHING" in t], [sent_text])
+        self.assertEqual(len(bot.sent), 1)
+
+        quiet_bot = _FakeBot()
+        self.assertIsNone(asyncio.run(
+            main_mod._warn_if_zero_suppliers_resolved(quiet_bot, active_total=4, resolved_ok=4)
+        ))
+        self.assertEqual(quiet_bot.sent, [])
+
+    def test_listing_is_editable_helper(self):
+        """The shared editable-status predicate gates edit/approve/reject flows."""
+        import admin_bot
+
+        self.assertTrue(admin_bot.listing_is_editable("pending_approval"))
+        self.assertTrue(admin_bot.listing_is_editable("pending_review"))
+        self.assertFalse(admin_bot.listing_is_editable("approved"))
+        self.assertFalse(admin_bot.listing_is_editable("published"))
+        self.assertFalse(admin_bot.listing_is_editable("rejected"))
+        self.assertFalse(admin_bot.listing_is_editable("failed"))
+        self.assertFalse(admin_bot.listing_is_editable(""))
+
+    def test_normalize_channel_id_marks_bare_keeps_marked(self):
+        """Every channel_id in the DB must be the marked form (-100... prefix)
+        that matches what Telethon reports as event.chat_id."""
+        TELEGRAM_CHANNEL_MARK = 1000000000000
+        bare = 4331866910
+        marked = -(TELEGRAM_CHANNEL_MARK + bare)
+        self.assertEqual(marked, -1004331866910)
+        self.assertEqual(db.normalize_channel_id(bare), marked)
+        self.assertEqual(db.normalize_channel_id(marked), marked)
+        self.assertEqual(db.normalize_channel_id("4331866910"), marked)
+        self.assertEqual(db.normalize_channel_id("-1004331866910"), marked)
+        self.assertIsNone(db.normalize_channel_id(None))
+        self.assertIsNone(db.normalize_channel_id("not-a-number"))
+        self.assertEqual(db.normalize_channel_id(-1223456789), -1223456789)
+
+    def test_db_supplier_bare_id_and_marked_id_merge_no_duplicate(self):
+        """Adding the same channel by bare id (from entity resolution) and then
+        by marked id (numeric admin input) must NOT create duplicate rows."""
+        path = self._fresh_db("bare_marked_dupe_test.db")
+        TELEGRAM_CHANNEL_MARK = 1000000000000
+        bare = 4331866910
+        marked = -(TELEGRAM_CHANNEL_MARK + bare)
+        add_chan = "@src_chan"
+        id1 = db.add_supplier(add_chan, channel_id=bare, db_path=path)
+        id2 = db.add_supplier(add_chan, channel_id=marked, db_path=path)
+        self.assertEqual(id1, id2, "same channel added bare then marked must be one row")
+        self.assertEqual(db.count_suppliers(db_path=path), 1)
+        row = db.get_supplier_by_chat(chat_id=marked, db_path=path)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["channel_id"], marked)
+        self.assertEqual(row["channel_username"], add_chan.lstrip("@").lower())
+
+    def test_db_normalize_supplier_channel_ids_migration(self):
+        """Migration fixes bare (positive) channel_ids in place and merges into
+        already-correct rows without duplicating."""
+        path = self._fresh_db("normalize_migration_test.db")
+        TELEGRAM_CHANNEL_MARK = 1000000000000
+        bare_cha = 4331866910
+        bare_chb = 4331866911
+        marked_cha = -(TELEGRAM_CHANNEL_MARK + bare_cha)
+        marked_chb = -(TELEGRAM_CHANNEL_MARK + bare_chb)
+        # Create a legacy row with bare id via direct insert (simulates old build)
+        db.add_supplier("ok_already_marked", channel_id=marked_chb, db_path=path)
+        with db.db_session(path) as conn:
+            conn.execute(
+                "INSERT INTO suppliers (channel_username, channel_id, active, markup_multiplier, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("old_bare_chan", bare_cha, 1, 0.75, "2025-01-01T00:00:00+00:00"),
+            )
+            conn.execute(
+                "INSERT INTO suppliers (channel_username, channel_id, active, markup_multiplier, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("dup_via_bare", bare_chb, 1, 0.75, "2025-01-01T00:00:00+00:00"),
+            )
+        self.assertEqual(db.count_suppliers(db_path=path), 3)
+        report = db.normalize_supplier_channel_ids(db_path=path)
+        self.assertGreaterEqual(report["scanned"], 3)
+        self.assertEqual(report["normalized"], 1)
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(db.count_suppliers(db_path=path), 2, "dup_via_bare merged into ok_already_marked")
+        row_cha = db.get_supplier_by_chat(chat_id=marked_cha, db_path=path)
+        self.assertIsNotNone(row_cha)
+        self.assertEqual(row_cha["channel_id"], marked_cha)
+        row_chb = db.get_supplier_by_chat(chat_id=marked_chb, db_path=path)
+        self.assertIsNotNone(row_chb)
+        self.assertEqual(row_chb["channel_id"], marked_chb)
+
+    def test_resolve_supplier_entities_backfills_marked_channel_id(self):
+        """resolve_supplier_entities must store the marked -100... form, NOT
+        the bare entity.id — matching what incoming events will report."""
+        import asyncio
+        import main as main_mod
+
+        path = self._fresh_db("resolve_marked_test.db")
+        TELEGRAM_CHANNEL_MARK = 1000000000000
+        bare = 4331866910
+        marked = -(TELEGRAM_CHANNEL_MARK + bare)
+
+        db.add_supplier("@privchan", channel_id=None, db_path=path)
+
+        class _FakeEntity:
+            def __init__(self):
+                self.id = bare
+                self.username = "bbbbb"
+                self.title = "b channel"
+
+        class _FakeClient:
+            def __init__(self, entity):
+                self._entity = entity
+                self.calls = []
+            async def get_entity(self, ref):
+                self.calls.append(ref)
+                return self._entity
+
+        fake_client = _FakeClient(_FakeEntity())
+        old_default = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = path
+        try:
+            result = asyncio.run(main_mod.resolve_supplier_entities(fake_client))
+            self.assertGreaterEqual(len(result), 1)
+            row = db.get_supplier_by_chat(chat_id=marked, db_path=path)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["channel_id"], marked, "stored id must be the marked -100... form")
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+
+    def test_resolve_supplier_for_event_matches_entity_resolved_supplier(self):
+        """An incoming event.chat_id (marked form) must match a supplier that was
+        added via get_entity resolution, not just via directly-typed numeric ID."""
+        import asyncio
+        import main as main_mod
+
+        path = self._fresh_db("event_match_test.db")
+        TELEGRAM_CHANNEL_MARK = 1000000000000
+        bare = 4331866910
+        marked = -(TELEGRAM_CHANNEL_MARK + bare)
+
+        db.add_supplier("@privchan", channel_id=bare, db_path=path)
+        # Fix up the bare id that add_supplier auto-normalized if any, to be sure
+        with db.db_session(path) as conn:
+            conn.execute("UPDATE suppliers SET channel_id = ? WHERE channel_username = ?", (marked, "privchan"))
+
+        class _FakeChat:
+            username = "bbbbb"
+        class _FakeEvent:
+            chat_id = marked
+            chat = _FakeChat()
+
+        old_default = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = path
+        try:
+            supplier = main_mod.resolve_supplier_for_event(_FakeEvent())
+            self.assertIsNotNone(supplier, "resolve_supplier_for_event must match on marked chat_id")
+            self.assertEqual(supplier["channel_id"], marked)
+            self.assertTrue(supplier.get("active"))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
 
     def test_db_display_name_roundtrip(self):
         """set_supplier_display_name stores a friendly label keyed by username OR id."""

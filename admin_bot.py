@@ -4,10 +4,11 @@ import asyncio
 import logging
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
+from telethon.tl.types import PeerChannel, PeerChat
 
 import db
 import parser
@@ -24,6 +25,15 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0") or 0)
 DEST_CHANNEL = os.environ.get("DEST_CHANNEL", "")
 CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "")
 DEFAULT_MULTIPLIER = float(os.environ.get("PRICE_MULTIPLIER", "0.75"))
+
+# Statuses in which a listing may still be edited / approved / rejected. Once a
+# listing leaves this set (published, failed, rejected...) any in-flight admin
+# action (edit wizard, Approve tap) must be refused, not silently applied.
+EDITABLE_LISTING_STATUSES = ("pending_approval", "pending_review")
+
+
+def listing_is_editable(status: str) -> bool:
+    return status in EDITABLE_LISTING_STATUSES
 
 # Global reference to user_client if running unified under main.py
 user_client_ref: Optional[TelegramClient] = None
@@ -383,16 +393,244 @@ def _pretty_source(username: Optional[str], display_name: Optional[str] = None) 
     return raw if raw.startswith("@") else f"@{raw}"
 
 
+def _channel_id_from_fwd(fwd) -> Optional[int]:
+    """Extract the original chat/channel id from a MessageFwdHeader.
+
+    This is the single most reliable way to add a private channel/group with no
+    public username: when the admin forwards any post `from` it, the header
+    carries the exact chat id regardless of how the account identifies it.
+    """
+    if fwd is None:
+        return None
+    from_id = getattr(fwd, "from_id", None)
+    if isinstance(from_id, PeerChannel):
+        return from_id.channel_id
+    if isinstance(from_id, PeerChat):
+        return from_id.chat_id
+    # Legacy Telethon exposes the id directly on the header.
+    for attr in ("channel_id", "chat_id"):
+        cid = getattr(fwd, attr, None)
+        if cid:
+            return int(cid)
+    saved_from_peer = getattr(fwd, "saved_from_peer", None)
+    if isinstance(saved_from_peer, PeerChannel):
+        return saved_from_peer.channel_id
+    if isinstance(saved_from_peer, PeerChat):
+        return saved_from_peer.chat_id
+    return None
+
+
+def _supplier_ref_from_text(text: str) -> Tuple[Optional[str], Optional[int]]:
+    """Parse a channel reference -> (username_str, numeric_id_or_None).
+
+    Accepts '@handle', bare 'handle', 't.me/handle' links and numeric ids like
+    '-1001234567890'. Usernames are lowercased and stripped of '@'; numeric ids
+    are returned as ints.
+    """
+    ref = (text or "").strip()
+    if not ref:
+        return None, None
+    m = re.match(
+        r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)$",
+        ref,
+        re.IGNORECASE,
+    )
+    if m:
+        ref = m.group(1)
+    if ref.lstrip("-").isdigit():
+        return str(int(ref)), int(ref)
+    return ref.lstrip("@").lower(), None
+
+
+def _source_status_icon(s: dict) -> str:
+    """🟢 active · 🔴 paused · ⚠️ unresolved (so dead suppliers are never invisible again)."""
+    if not s.get("channel_id"):
+        return "⚠️"
+    return "🟢" if s.get("active") else "🔴"
+
+
+def _entity_display(entity, fallback: Optional[str] = None) -> str:
+    """Friendly label for a resolved Telethon entity."""
+    if entity is None:
+        return fallback or "?"
+    name = (
+        (getattr(entity, "username", None) or "").strip()
+        or (getattr(entity, "title", None) or "").strip()
+    )
+    return name or fallback or f"channel {getattr(entity, 'id', '?')}"
+
+
+async def _edit_supplier_menu(event, s: dict) -> None:
+    """Render the supplier detail menu (used by the detail view and after toggle)."""
+    sid = s["id"]
+    icon = _source_status_icon(s)
+    handle = _pretty_source(s.get("channel_username"), s.get("display_name"))
+    toggle_label = "⏸ Pause" if s["active"] else "▶ Resume"
+    if not s.get("channel_id"):
+        status_line = (
+            "⚠️ **Unresolved — NOT monitored yet.** Wrong username or private chat; "
+            "re-add it or forward a message from the channel.\n"
+        )
+    else:
+        status_line = f"Status: `{'Active' if s['active'] else 'Paused'}`\n"
+    try:
+        await event.edit(
+            f"{icon} **{handle}**\n"
+            f"{status_line}"
+            f"Markup: `{s['markup_multiplier']}`\n"
+            f"ID: `{s['channel_id'] or 'unresolved'}`\n\n"
+            f"What would you like to do?",
+            buttons=[
+                [Button.inline(toggle_label, data=f"suptoggle:{sid}")],
+                [Button.inline("⚙️ Set Multiplier", data=f"suprule:{sid}")],
+                [Button.inline("🗑 Delete Permanently", data=f"supdel:{sid}")],
+                [Button.inline("⬅️ Back", data="menu:home")],
+            ],
+        )
+    except Exception:
+        await event.answer("Menu updated", alert=True)
+
+
+async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
+    """Resolve-first, then-persist add flow used by /addsupplier and the wizard.
+
+    - Attempts to resolve the reference to a real Telegram entity via the user
+      client BEFORE any DB write.
+    - Never inserts a silently-dead row: if resolution fails the admin is told
+      why and given the "forward a message" alternative, or an explicit
+      "Add anyway (retry later)" confirmation (handled by the supaddunresolved
+      callback) — never an automatic NULL-channel_id insert.
+    - Re-uses an existing supplier row by channel_id (no duplicate rows for the
+      same real channel).
+    """
+    if fwd is not None:
+        raw_channel_id = _channel_id_from_fwd(fwd)
+        if raw_channel_id is None:
+            await event.reply(
+                "That forward isn't from a channel/group I can identify. "
+                "Forward a post **made by the channel** (not a message you typed "
+                "yourself), or send a username / numeric ID instead.",
+                buttons=_home_keyboard(),
+            )
+            return
+        channel_id = db.normalize_channel_id(raw_channel_id)
+        entity = None
+        if user_client_ref and user_client_ref.is_connected():
+            try:
+                entity = await user_client_ref.get_entity(channel_id)
+            except Exception:
+                entity = None
+        entity_username = (
+            (getattr(entity, "username", None) or "").strip().lstrip("@") or None
+        )
+        display = _entity_display(entity, fallback=f"channel {channel_id}")
+        sid = db.add_supplier(
+            entity_username or str(channel_id),
+            channel_id=channel_id,
+            markup_multiplier=DEFAULT_MULTIPLIER,
+        )
+        if display:
+            db.set_supplier_display_name(str(channel_id), display)
+        db.record_audit(
+            "supplier_added", sid, actor_id=ADMIN_USER_ID,
+            detail=f"forwarded post -> {display} (id {channel_id})",
+        )
+        if entity is None:
+            await event.reply(
+                f"✅ **Source added by forward** — stored ID `{channel_id}`.\n"
+                f"⚠️ My monitor account can't see this chat yet. Add the monitor "
+                f"account as a member and I'll start listening automatically.",
+                buttons=_home_keyboard(),
+            )
+        else:
+            await event.reply(
+                f"✅ **Source added by forward**: `{display}` (ID `{channel_id}`)\n"
+                f"Default multiplier: `{DEFAULT_MULTIPLIER}`",
+                buttons=_home_keyboard(),
+            )
+        return
+
+    username, numeric = _supplier_ref_from_text(text)
+    if not username:
+        await event.reply(
+            "I couldn't read a channel reference from that. Send a channel "
+            "username (e.g. `@kycgroupke`), a numeric ID (e.g. `-1001234567890`), "
+            "or forward a message from the channel.",
+            buttons=_home_keyboard(),
+        )
+        return
+
+    entity = None
+    if user_client_ref and user_client_ref.is_connected():
+        reference = int(numeric) if numeric is not None else username
+        try:
+            entity = await user_client_ref.get_entity(reference)
+        except Exception as exc:
+            logger.warning("Could not resolve supplier reference %r: %s", username, exc)
+
+    if entity is not None:
+        entity_id = db.normalize_channel_id(entity)
+        entity_username = (
+            (getattr(entity, "username", None) or "").strip().lstrip("@") or None
+        )
+        display = _entity_display(entity, fallback=username)
+        store_username = entity_username or (str(entity_id) if entity_id else username)
+        sid = db.add_supplier(
+            store_username,
+            channel_id=entity_id,
+            markup_multiplier=DEFAULT_MULTIPLIER,
+        )
+        if entity_id and display:
+            db.set_supplier_display_name(str(entity_id), display)
+        db.record_audit(
+            "supplier_added", sid, actor_id=ADMIN_USER_ID,
+            detail=f"{text} -> {display} (id {entity_id})",
+        )
+        await event.reply(
+            f"✅ **Source added**: `{display}` (ID `{entity_id}`)\n"
+            f"Default multiplier: `{DEFAULT_MULTIPLIER}`",
+            buttons=_home_keyboard(),
+        )
+        return
+
+    _wizard_state[ADMIN_USER_ID] = {"step": "add_confirm_unresolved", "raw": text}
+    await event.reply(
+        f"❌ Couldn't resolve that reference (`{text[:60]}`).\n\n"
+        f"• If this is a **private group/channel with no username**, forward me any "
+        f"message **from that channel/group** and I'll grab its exact ID automatically.\n"
+        f"• Or tap **Add anyway** to store it unresolved — I'll retry in the background "
+        f"and message you the moment monitoring actually starts.\n\n"
+        f"Until it resolves, the source will show as ⚠️ unresolved and won't be listened to.",
+        buttons=[
+            [Button.inline("✅ Add anyway (retry later)", data="supaddunresolved")],
+            [Button.inline("🚫 Cancel", data="wiz:cancel")],
+        ],
+        parse_mode=None,
+    )
+
+
 def _sources_menu_text(suppliers: List[dict]) -> str:
     if not suppliers:
         return "📋 **Monitored Sources:**\n\nNo sources configured yet."
     lines = ["📋 **Monitored Sources:**\n"]
+    has_unresolved = False
     for s in suppliers:
-        status_icon = "🟢" if s["active"] else "🔴"
+        icon = _source_status_icon(s)
+        if not s.get("channel_id"):
+            has_unresolved = True
+            status_tag = " ⚠️*unresolved* "
+        else:
+            status_tag = " "
         lines.append(
-            f"{status_icon} **{_pretty_source(s.get('channel_username'), s.get('display_name'))}** "
-            f"(ID: `{s['channel_id'] or 'unresolved'}`) "
+            f"{icon} **{_pretty_source(s.get('channel_username'), s.get('display_name'))}**"
+            f"{status_tag}(ID: `{s['channel_id'] or '—'}`) "
             f"· markup `{s['markup_multiplier']}`"
+        )
+    if has_unresolved:
+        lines.append(
+            "\n_⚠️ Unresolved sources are **not** being listened to yet. Re-add them "
+            "by the correct username/ID, or forward a message from the channel — "
+            "or wait for the auto-retry worker to ping you._"
         )
     return "\n".join(lines)
 
@@ -400,7 +638,7 @@ def _sources_menu_text(suppliers: List[dict]) -> str:
 def _sources_buttons(suppliers: List[dict]) -> List[List[object]]:
     buttons = []
     for s in suppliers[:12]:
-        icon = "🟢" if s["active"] else "🔴"
+        icon = _source_status_icon(s)
         label = f"{icon} {_pretty_source(s.get('channel_username'), s.get('display_name'))}"
         buttons.append([Button.inline(label, data=f"sup:{s['id']}")])
     buttons.append([
@@ -509,7 +747,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
     @bot.on(events.NewMessage())
     async def handle_pack_link(event):
-        if event.sender_id != ADMIN_USER_ID or not event.text:
+        if not await check_admin(event):
+            return
+        if not event.text:
+            return
+        if getattr(event.message, "fwd_from", None):
             return
         if event.text.strip().startswith("/"):
             return
@@ -536,31 +778,16 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         arg = (event.pattern_match.group(1) or "").strip()
         if not arg:
             await event.reply(
-                "Usage: `/addsupplier <channel_or_group>`\nExample: `/addsupplier @kycgroupke` or `/addsupplier -1001234567890`",
+                "**Add a source** — any of these work:\n"
+                "• Channel username: `@kycgroupke`\n"
+                "• Numeric ID: `-1001234567890`\n"
+                "• **Forward a message FROM the channel/group** — best for private "
+                "chats with no username (I grab its exact ID automatically).\n\n"
+                "Example: `/addsupplier @kycgroupke`",
                 buttons=_home_keyboard(),
             )
             return
-
-        channel_id = None
-        if arg.lstrip("-").isdigit():
-            channel_id = int(arg)
-            username = str(channel_id)
-        else:
-            username = arg.lstrip("@")
-            # Try to resolve channel_id via user client if connected
-            if user_client_ref and user_client_ref.is_connected():
-                try:
-                    entity = await user_client_ref.get_entity(arg)
-                    channel_id = getattr(entity, "id", None)
-                except Exception as e:
-                    logger.warning("Could not immediately resolve entity %s: %s", arg, e)
-
-        db.add_supplier(username, channel_id=channel_id, markup_multiplier=DEFAULT_MULTIPLIER)
-        await event.reply(
-            f"✅ Supplier **{arg}** added and activated!\n"
-            f"Default multiplier: `{DEFAULT_MULTIPLIER}`",
-            buttons=_home_keyboard(),
-        )
+        await _run_add_supplier_flow(event, arg)
 
     @bot.on(events.NewMessage(pattern=r"^/removesupplier(?:\s+(.+))?"))
     async def handle_remove_supplier(event):
@@ -569,17 +796,72 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         arg = (event.pattern_match.group(1) or "").strip()
         if not arg:
             await event.reply(
-                "Usage: `/removesupplier <channel_username>`\nExample: `/removesupplier @kycgroupke`",
+                "Usage: `/removesupplier <channel_username>`\n"
+                "Example: `/removesupplier @kycgroupke`\n"
+                "This **permanently deletes** the source (history is kept). For a "
+                "temporary stop use the Sources menu → Pause.",
                 buttons=_home_keyboard(),
             )
             return
 
-        username = arg.lstrip("@")
-        ok = db.remove_supplier(username)
-        if ok:
-            await event.reply(f"⏹ Supplier **@{username}** deactivated.", buttons=_home_keyboard())
-        else:
-            await event.reply(f"❌ Supplier **@{username}** not found.", buttons=_home_keyboard())
+        s = db.get_supplier_by_chat(username=arg.lstrip("@"))
+        if not s:
+            await event.reply(f"❌ Supplier **@{arg.lstrip('@')}** not found.", buttons=_home_keyboard())
+            return
+        db.delete_supplier(s["id"])
+        db.record_audit("supplier_deleted", None, actor_id=event.sender_id, detail=f"@{arg.lstrip('@')}")
+        await event.reply(f"🗑 Supplier **@{arg.lstrip('@')}** permanently deleted.", buttons=_home_keyboard())
+
+    @bot.on(events.NewMessage(pattern=r"^/dedupe_suppliers$"))
+    async def handle_dedupe_suppliers(event):
+        if not await check_admin(event):
+            return
+        summary = db.dedupe_suppliers()
+        merges = summary.get("merges", [])
+        if not merges:
+            await event.reply(
+                "🧹 No duplicate suppliers found — the table is already clean.",
+                buttons=_home_keyboard(),
+            )
+            return
+        lines = [f"🧹 **Merged {summary['rows_removed']} duplicate supplier row(s):**"]
+        for m in merges:
+            lines.append(
+                f"• row `#{m['removed']}` (stored `{m.get('duplicate_username') or '?'}`) "
+                f"merged into row `#{m['merged_into']}` (channel `{m['channel_id']}`)"
+            )
+        for m in merges:
+            db.record_audit(
+                "supplier_dedupe", None, actor_id=event.sender_id, detail=str(m)
+            )
+        await event.reply("\n".join(lines), buttons=_home_keyboard(), parse_mode="markdown")
+        suppliers = db.list_suppliers(active_only=False)
+        await event.client.send_message(
+            ADMIN_USER_ID,
+            _sources_menu_text(suppliers),
+            buttons=_sources_buttons(suppliers),
+            parse_mode=None,
+        )
+
+    @bot.on(events.NewMessage(pattern=r"^/reseed_from_env$"))
+    async def handle_reseed_from_env(event):
+        if not await check_admin(event):
+            return
+        raw = os.environ.get("SOURCE_CHANNELS", "")
+        channels = [ch.strip() for ch in raw.split(",") if ch.strip()]
+        preview = ", ".join(f"`{c}`" for c in channels) if channels else "*(none listed in .env)*"
+        await event.reply(
+            "⚠️ **Re-import SOURCE_CHANNELS from .env?**\n\n"
+            f"Currently in .env: {preview}\n\n"
+            "This is the deliberate escape hatch only:\n"
+            "• Adds/refreshes every channel listed in .env (custom multipliers are preserved).\n"
+            "• Does **NOT** delete anything — channels removed from .env are not removed here.\n"
+            "• After this, .env is ignored again on future restarts.",
+            buttons=[
+                [Button.inline("✅ Yes, Re-import", data="reseed:yes")],
+                [Button.inline("❌ Cancel", data="wiz:cancel")],
+            ],
+        )
 
     @bot.on(events.NewMessage(pattern=r"^/rule(?:\s+(.+))?"))
     async def handle_rule(event):
@@ -901,22 +1183,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if not s:
                 await event.answer("Source not found.", alert=True)
                 return
-            icon = "🟢" if s["active"] else "🔴"
-            handle = _pretty_source(s.get("channel_username"), s.get("display_name"))
-            toggle_label = "⏸ Pause" if s["active"] else "▶ Resume"
-            await event.edit(
-                f"{icon} **{handle}**\n"
-                f"Status: `{'Active' if s['active'] else 'Paused'}`\n"
-                f"Markup: `{s['markup_multiplier']}`\n"
-                f"ID: `{s['channel_id'] or 'unresolved'}`\n\n"
-                f"What would you like to do?",
-                buttons=[
-                    [Button.inline(toggle_label, data=f"suptoggle:{sid}")],
-                    [Button.inline("⚙️ Set Multiplier", data=f"suprule:{sid}")],
-                    [Button.inline("🗑 Remove Source", data=f"supremove:{sid}")],
-                    [Button.inline("⬅️ Back", data="menu:home")],
-                ],
-            )
+            await _edit_supplier_menu(event, s)
             return
 
         suptoggle_match = re.match(r"^suptoggle:(\d+)$", data_str)
@@ -933,28 +1200,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             db.record_audit(
                 "supplier_toggle", None, actor_id=ADMIN_USER_ID, detail=str(sid)
             )
-            # Re-render the same management menu (refresh status icon/label)
             refreshed = next(
                 (x for x in db.list_suppliers(active_only=False) if x["id"] == sid),
                 None,
             )
             if refreshed:
-                icon = "🟢" if refreshed["active"] else "🔴"
-                handle = _pretty_source(refreshed.get("channel_username"), refreshed.get("display_name"))
-                toggle_label = "⏸ Pause" if refreshed["active"] else "▶ Resume"
-                await event.edit(
-                    f"{icon} **{handle}**\n"
-                    f"Status: `{'Active' if refreshed['active'] else 'Paused'}`\n"
-                    f"Markup: `{refreshed['markup_multiplier']}`\n"
-                    f"ID: `{refreshed['channel_id'] or 'unresolved'}`\n\n"
-                    f"What would you like to do?",
-                    buttons=[
-                        [Button.inline(toggle_label, data=f"suptoggle:{sid}")],
-                        [Button.inline("⚙️ Set Multiplier", data=f"suprule:{sid}")],
-                        [Button.inline("🗑 Remove Source", data=f"supremove:{sid}")],
-                        [Button.inline("⬅️ Back", data="menu:home")],
-                    ],
-                )
+                await _edit_supplier_menu(event, refreshed)
             return
 
         suprule_match = re.match(r"^suprule:(\d+)$", data_str)
@@ -977,44 +1228,45 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
 
-        supremove_match = re.match(r"^supremove:(\d+)$", data_str)
-        if supremove_match:
-            sid = int(supremove_match.group(1))
-            s = next(
-                (x for x in db.list_suppliers(active_only=False) if x["id"] == sid),
-                None,
-            )
+        supdel_match = re.match(r"^supdel:(\d+)$", data_str)
+        if supdel_match:
+            sid = int(supdel_match.group(1))
+            s = db.get_supplier_by_id(sid)
             if not s:
                 await event.answer("Source not found.", alert=True)
                 return
             handle = _pretty_source(s.get("channel_username"), s.get("display_name"))
             await event.edit(
-                f"🗑 **Remove {handle}?**\nThis deactivates the source and stops monitoring it.",
+                f"🗑 **Delete {handle} permanently?**\n"
+                f"This removes the source completely and stops monitoring it.\n"
+                f"Existing listings & history stay (their source link becomes '—').\n"
+                f"This cannot be undone.",
                 buttons=[
-                    [Button.inline("✅ Yes, Remove", data=f"rem:yes:{sid}")],
+                    [Button.inline("✅ Yes, Delete Forever", data=f"del:yes:{sid}")],
                     [Button.inline("❌ Cancel", data="wiz:cancel")],
                 ],
             )
             return
 
-        rem_match = re.match(r"^rem:yes:(\d+)$", data_str)
-        if rem_match:
-            sid = int(rem_match.group(1))
-            s = next(
-                (x for x in db.list_suppliers(active_only=False) if x["id"] == sid),
-                None,
-            )
+        del_match = re.match(r"^del:yes:(\d+)$", data_str)
+        if del_match:
+            sid = int(del_match.group(1))
+            s = db.get_supplier_by_id(sid)
             if not s:
                 await event.answer("Source not found.", alert=True)
                 return
-            db.set_supplier_active(s["channel_username"], False)
+            db.delete_supplier(sid)
             db.record_audit(
-                "supplier_removed", None, actor_id=ADMIN_USER_ID, detail=str(sid)
+                "supplier_deleted", None, actor_id=ADMIN_USER_ID, detail=str(sid)
             )
-            await event.edit(
-                f"🗑 Source **{_pretty_source(s.get('channel_username'), s.get('display_name'))}** removed.",
-                buttons=None,
-            )
+            try:
+                await event.edit(
+                    f"🗑 **Source permanently deleted.**\n"
+                    f"{_pretty_source(s.get('channel_username'), s.get('display_name'))} "
+                    f"is gone from the list. History is kept."
+                )
+            except Exception:
+                await event.answer("Deleted permanently.", alert=True)
             suppliers = db.list_suppliers(active_only=False)
             await event.client.send_message(
                 ADMIN_USER_ID,
@@ -1024,11 +1276,63 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
 
+        if data_str == "reseed:yes":
+            try:
+                raw = os.environ.get("SOURCE_CHANNELS", "")
+                channels = [ch.strip() for ch in raw.split(",") if ch.strip()]
+                db.clear_env_seed_completed()
+                n = db.seed_suppliers_from_env(channels, DEFAULT_MULTIPLIER)
+                db.mark_env_seed_completed()
+                db.record_audit(
+                    "env_reseed", None, actor_id=ADMIN_USER_ID, detail=f"re-seeded {n} supplier(s)"
+                )
+                await event.edit(
+                    f"✅ Re-imported {n} channel(s) from SOURCE_CHANNELS.\n"
+                    "The one-time seed marker is set again — .env won't be consulted "
+                    "on future restarts.",
+                    buttons=_home_keyboard(),
+                )
+            except Exception:
+                logger.exception("reseed_from_env failed")
+                await event.answer("Re-seed failed — check the logs.", alert=True)
+            return
+
+        if data_str == "supaddunresolved":
+            state = _wizard_state.get(ADMIN_USER_ID) or {}
+            raw = state.get("raw") if state.get("step") == "add_confirm_unresolved" else None
+            if not raw:
+                await event.answer("That request has expired — press ➕ Add Source to start again.", alert=True)
+                return
+            _wizard_state.pop(ADMIN_USER_ID, None)
+            username, _ = _supplier_ref_from_text(raw)
+            if not username:
+                await event.answer("Invalid reference.", alert=True)
+                return
+            sid = db.add_supplier(username, channel_id=None, markup_multiplier=DEFAULT_MULTIPLIER)
+            db.record_audit(
+                "supplier_added_unresolved", sid, actor_id=ADMIN_USER_ID, detail=raw
+            )
+            try:
+                await event.edit(
+                    f"✅ Source **@{username}** stored as **unresolved**.\n"
+                    f"I'll retry resolving it in the background and ping you the moment "
+                    f"monitoring actually starts for it.\n\n"
+                    f"Faster: forward any message **from that channel** and I'll add it instantly.",
+                    buttons=_home_keyboard(),
+                )
+            except Exception:
+                await event.answer("Saved as unresolved.", alert=True)
+            return
+
         if data_str == "supadd":
             _wizard_state[ADMIN_USER_ID] = {"step": "add"}
             await event.edit(
-                "✏️ **Add a source** — send the channel username or numeric ID.\n"
-                "Example: `@kycgroupke` or `-1001234567890`",
+                "✏️ **Add a source** — any of these work:\n"
+                "• Channel username: `@kycgroupke`\n"
+                "• Numeric ID: `-1001234567890`\n"
+                "• **Forward a message FROM the channel/group** — best for private "
+                "chats with no username (I'll grab its exact ID automatically).\n\n"
+                "Send any of the above now.",
                 buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
             )
             return
@@ -1070,7 +1374,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if not listing:
                 await event.answer("Listing not found in database.", alert=True)
                 return
-            if listing["status"] not in ("pending_approval", "pending_review"):
+            if not listing_is_editable(listing["status"]):
                 await event.answer(f"Cannot edit — status is {listing['status']}", alert=True)
                 return
             listing_id = listing["id"]
@@ -1120,8 +1424,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         # Approve / Reject only valid on pending listings (never on already-approved,
         # preventing double-publish races on re-taps).
-        allowed_statuses = ("pending_approval", "pending_review")
-        if listing["status"] not in allowed_statuses:
+        if not listing_is_editable(listing["status"]):
             await event.answer(
                 f"Already processed (status: {listing['status']})", alert=True
             )
@@ -1138,6 +1441,31 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         if action == "approve":
+            # Re-check the listing's CURRENT status immediately before applying any
+            # draft. The listing loaded above is a snapshot taken when the callback
+            # arrived; if it has since moved out of the editable set (published,
+            # rejected, failed, requeued) the draft must NOT be silently applied to
+            # a stale listing. Discard it and say so instead.
+            fresh = db.get_listing_by_id(listing_id)
+            if fresh is not None and not listing_is_editable(fresh["status"]):
+                _drafts.pop(listing_id, None)
+                await event.answer(
+                    f"⚠️ Listing #{listing_id} is no longer editable "
+                    f"(status: {fresh['status']}). Draft discarded — nothing was published.",
+                    alert=True,
+                )
+                try:
+                    await event.edit(
+                        f"⚠️ **Listing #{listing_id} was NOT published.**\n"
+                        f"Status is now `{fresh['status']}`, so the draft you were "
+                        f"editing was discarded.\n"
+                        f"Check the Pending list for its current state.",
+                        buttons=_home_keyboard(),
+                    )
+                except Exception:
+                    pass
+                return
+
             # A draft (from ✏️ Edit) replaces the source content, and its price
             # line becomes the listing price if present.
             draft = _drafts.pop(listing_id, None)
@@ -1257,10 +1585,26 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
     @bot.on(events.NewMessage())
     async def handle_wizard_input(event):
-        """Fallback: complete Add Source / Set Multiplier wizards by plain-text reply."""
-        if event.sender_id != ADMIN_USER_ID or not event.text:
+        """Fallback: complete Add Source / Set Multiplier wizards by plain-text reply
+        or by forwarding a message from the channel (add-source wizard)."""
+        if not await check_admin(event):
             return
-        text = event.text.strip()
+        state = _wizard_state.get(ADMIN_USER_ID)
+
+        fwd = (
+            getattr(event.message, "fwd_from", None)
+            if getattr(event, "message", None)
+            else None
+        )
+        if state and state.get("step") == "add" and fwd is not None:
+            _wizard_state.pop(ADMIN_USER_ID, None)
+            await _run_add_supplier_flow(event, None, fwd=fwd)
+            return
+
+        text = event.text
+        if not text:
+            return
+        text = text.strip()
         if text.startswith("/"):
             return
         # Pasting an emoji-pack link must never be consumed by a wizard
@@ -1272,32 +1616,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             _wizard_state.pop(ADMIN_USER_ID, None)
             return
 
-        state = _wizard_state.get(ADMIN_USER_ID)
         if not state:
             return
         _wizard_state.pop(ADMIN_USER_ID, None)
 
         if state["step"] == "add":
-            arg = text
-            channel_id = None
-            if arg.lstrip("-").isdigit():
-                channel_id = int(arg)
-                username = str(channel_id)
-            else:
-                username = arg.lstrip("@")
-                if user_client_ref and user_client_ref.is_connected():
-                    try:
-                        entity = await user_client_ref.get_entity(arg)
-                        channel_id = getattr(entity, "id", None)
-                    except Exception as e:
-                        logger.warning("Could not immediately resolve entity %s: %s", arg, e)
-            db.add_supplier(username, channel_id=channel_id, markup_multiplier=DEFAULT_MULTIPLIER)
-            db.record_audit("supplier_added", None, actor_id=ADMIN_USER_ID, detail=username)
-            await event.reply(
-                f"✅ Source **{arg}** added and activated!\n"
-                f"Default multiplier: `{DEFAULT_MULTIPLIER}`",
-                buttons=_home_keyboard(),
-            )
+            await _run_add_supplier_flow(event, text)
             return
 
         if state["step"] == "edit":
@@ -1305,6 +1629,15 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             listing = db.get_listing_by_id(listing_id)
             if not listing:
                 await event.reply("❌ Listing not found.", buttons=_home_keyboard())
+                return
+            if not listing_is_editable(listing["status"]):
+                _drafts.pop(listing_id, None)
+                await event.reply(
+                    f"⚠️ Cannot edit Listing #{listing_id}: its status is now "
+                    f"`{listing['status']}`, so it is no longer editable. "
+                    f"Nothing was saved.",
+                    buttons=_home_keyboard(),
+                )
                 return
             draft = text
             _drafts[listing_id] = draft

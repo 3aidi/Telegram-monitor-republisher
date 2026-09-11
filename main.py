@@ -9,7 +9,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -143,8 +143,6 @@ def _validate_config() -> None:
         errors.append("API_HASH is missing in .env")
     if not DEST_CHANNEL:
         errors.append("DEST_CHANNEL is missing in .env")
-    if not SOURCE_CHANNELS_RAW.strip():
-        errors.append("SOURCE_CHANNELS is empty in .env")
     # CFG-1: reject unrealistic price multipliers instead of silently corrupting prices.
     if not (0 < DEFAULT_MULTIPLIER <= 5.0):
         errors.append(
@@ -169,11 +167,6 @@ def _validate_config() -> None:
         logger.warning("Configuration warning: %s", w)
 
 
-def _is_numeric_channel(value: str) -> bool:
-    """True if the value looks like a numeric Telegram channel id (e.g. -1003340459479)."""
-    return db.is_numeric_identifier(value)
-
-
 def _supplier_label(supplier: dict) -> str:
     """Human-friendly supplier label for logs: display_name when available,
     else the username, else the raw numeric id."""
@@ -190,46 +183,66 @@ def _supplier_label(supplier: dict) -> str:
     return "?"
 
 
-# ---------------------------------------------------------------------------
-# Supplier helpers
-# ---------------------------------------------------------------------------
-def sync_suppliers_from_env() -> None:
-    """Seed all SOURCE_CHANNELS into the database, handling usernames and numeric ids."""
-    for ch in SOURCE_CHANNELS:
-        if _is_numeric_channel(ch):
-            channel_id = int(ch)
-            db.add_supplier(
-                channel_username=str(channel_id),
-                channel_id=channel_id,
-                markup_multiplier=DEFAULT_MULTIPLIER,
-            )
-            logger.info(
-                "Configured source supplier by numeric id: %s (default markup: %s)",
-                channel_id,
-                DEFAULT_MULTIPLIER,
-            )
-        else:
-            username = ch.lstrip("@").lower()
-            db.add_supplier(username, markup_multiplier=DEFAULT_MULTIPLIER)
-            logger.info(
-                "Configured source supplier: @%s (default markup: %s)",
-                username,
-                DEFAULT_MULTIPLIER,
-            )
+def zero_resolved_suppliers_alert_text(active_total: int, resolved_ok: int) -> Optional[str]:
+    """Return a loud admin alert when suppliers exist but NONE resolved.
 
-
-async def resolve_supplier_entities(client: TelegramClient) -> None:
+    A bot that has configured suppliers yet zero resolvable channel ids is
+    technically running while monitoring NOTHING — a silent failure distinct from
+    a crash. active_total is the number of active supplier rows, resolved_ok the
+    number that actually carry a channel_id. Fires only when something IS
+    configured but nothing resolved (0 configured is a valid calm state).
     """
-    Resolve supplier identities at startup so events match on chat_id even when
-    a channel has no username.
+    if active_total > 0 and resolved_ok == 0:
+        return (
+            f"🚨 **0 of {active_total} suppliers resolved — the bot is running but "
+            f"MONITORING NOTHING.** Check that the account is still in the source "
+            f"channels (kicked? deleted? logged out?) or fix the sources in the "
+            f"admin bot's Sources menu."
+        )
+    return None
+
+
+async def _warn_if_zero_suppliers_resolved(
+    bot_client: Optional[TelegramClient],
+    active_total: int,
+    resolved_ok: int,
+) -> Optional[str]:
+    """Startup watchdog: log clearly and DM the admin when nothing resolved."""
+    alert_text = zero_resolved_suppliers_alert_text(active_total, resolved_ok)
+    if not alert_text:
+        return None
+    logger.error("%s", alert_text)
+    if bot_client and ADMIN_USER_ID:
+        try:
+            await bot_client.send_message(ADMIN_USER_ID, alert_text)
+        except Exception:
+            logger.exception("Could not DM admin about 0-resolved suppliers")
+    return alert_text
+
+
+async def resolve_supplier_entities(
+    client: TelegramClient, only_unresolved: bool = False
+) -> List[Dict[str, Any]]:
+    """
+    Resolve supplier identities so events match on chat_id even when a
+    channel has no username.
 
     - Username-based suppliers are resolved to numeric channel ids.
     - Numeric-id suppliers are validated against the live chat and get a friendly
       display_name (username preferred, else channel/group title). A failed lookup
       is logged LOUDLY so stale IDs (deleted channel / you left the group) are
       discovered instead of monitoring silently doing nothing.
+    - When a row that was stored without a channel_id finally resolves to one
+      already owned by a different row, the two are MERGED into that owner instead
+      of racing the UNIQUE(channel_id) constraint and creating a duplicate.
+
+    Returns the freshly-resolved rows (with their final channel_id).
     """
-    for supplier in db.list_suppliers(active_only=True):
+    rows = db.list_suppliers(active_only=True)
+    if only_unresolved:
+        rows = [s for s in rows if s.get("channel_id") is None]
+    resolved: List[Dict[str, Any]] = []
+    for supplier in rows:
         channel_id = supplier.get("channel_id")
         username = supplier.get("channel_username")
         reference = channel_id if channel_id is not None else username
@@ -248,35 +261,95 @@ async def resolve_supplier_entities(client: TelegramClient) -> None:
                     channel_id,
                 )
             else:
-                logger.warning(
+                logger.debug(
                     "Could not resolve supplier entity @%s yet (channel may be private). "
                     "Only events matched by chat_id will be processed.",
                     username,
                 )
             continue
 
-        entity_id = getattr(entity, "id", None)
-        if entity_id and channel_id is not None and entity_id != channel_id:
-            db.set_supplier_channel_id(username or str(channel_id), entity_id)
-            channel_id = entity_id
+        entity_id = db.normalize_channel_id(entity)
+        if entity_id is None:
+            continue
 
         display = getattr(entity, "username", None) or getattr(entity, "title", None)
         if display:
             db.set_supplier_display_name(
                 channel_id if channel_id is not None else username, display
             )
+
+        real_owner = db.get_supplier_by_chat(chat_id=entity_id, username=None)
+        if real_owner is not None and real_owner["id"] != supplier["id"]:
+            db.merge_supplier_rows(real_owner["id"], supplier["id"])
+            resolved.append({**real_owner, "channel_id": entity_id})
             logger.info(
-                "Resolved source %s -> %s (id %s)",
+                "Supplier %s resolved into existing row id %s (%s)",
                 _supplier_label({**supplier, "display_name": None}),
+                real_owner["id"],
                 display,
-                entity_id,
             )
-        elif entity_id:
-            logger.info(
-                "Resolved source %s -> id %s",
-                _supplier_label({**supplier, "display_name": None}),
-                entity_id,
-            )
+            continue
+
+        if channel_id is None:
+            db.set_supplier_channel_id(username, entity_id)
+            channel_id = entity_id
+        elif channel_id != entity_id:
+            db.set_supplier_channel_id(username or str(channel_id), entity_id)
+            channel_id = entity_id
+
+        resolved.append({**supplier, "channel_id": channel_id})
+        logger.info(
+            "Resolved source %s -> %s (id %s)",
+            _supplier_label({**supplier, "display_name": None}),
+            display or "?",
+            entity_id,
+        )
+    return resolved
+
+
+async def supplier_resolution_worker(
+    client: TelegramClient,
+    bot_client: Optional[TelegramClient],
+    stop_event: asyncio.Event,
+    interval: int = 300,
+) -> None:
+    """
+    Periodic self-healing for suppliers that could not be resolved yet.
+
+    A private channel added by username while the account has not joined it stays
+    unresolved (no channel_id); the sources menu shows a ⚠️ so it is never silently
+    ignored. This loop retries the resolve every `interval` seconds and DMs the
+    admin the moment a source finally resolves, so nobody quietly depends on a
+    dead source.
+    """
+    while not stop_event.is_set():
+        try:
+            resolved = await resolve_supplier_entities(client, only_unresolved=True)
+            fresh = [s for s in resolved if s.get("channel_id") is not None]
+            for s in fresh:
+                if not (bot_client and ADMIN_USER_ID):
+                    break
+                try:
+                    await bot_client.send_message(
+                        ADMIN_USER_ID,
+                        f"🟢 Self-healed source `{_supplier_label(s)}` — now monitoring "
+                        f"it again (id `{s['channel_id']}`).",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not DM admin about self-healed supplier %s",
+                        _supplier_label(s),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Supplier resolution loop crashed (will retry next tick)")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            pass
 
 
 async def resolve_chat(client: TelegramClient, supplier: dict):
@@ -1152,10 +1225,32 @@ async def main() -> None:
     _validate_config()
     db.init_db()
     try:
+        norm_result = db.normalize_supplier_channel_ids()
+        if norm_result["normalized"] or norm_result["merged"]:
+            logger.warning(
+                "Supplier channel-id normalization: re-marked %d bare id(s), "
+                "merged %d row(s) into canonical rows (legacy bare ids fixed "
+                "to -100... marked form).",
+                norm_result["normalized"],
+                norm_result["merged"],
+            )
+    except Exception:
+        logger.exception("Could not normalize legacy supplier channel ids at startup")
+    try:
         db.prune_ai_cache(AI_CACHE_TTL_HOURS)
     except Exception:
         logger.exception("Could not prune AI analysis cache at startup")
-    sync_suppliers_from_env()
+    env_seed_notice = db.validate_env_seed_config(SOURCE_CHANNELS_RAW)
+    if env_seed_notice:
+        logger.warning("%s", env_seed_notice)
+    env_seed_result = db.ensure_env_seed(SOURCE_CHANNELS, DEFAULT_MULTIPLIER)
+    logger.info(
+        "Env seeding: state=%s seeded=%s migrated=%s — .env is NOT consulted again "
+        "unless /reseed_from_env is run manually.",
+        env_seed_result["state"],
+        env_seed_result["seeded"],
+        env_seed_result.get("migrated", False),
+    )
     ai_rephraser.init_groq(GROQ_API_KEY)
 
     stop_event = asyncio.Event()
@@ -1216,7 +1311,28 @@ async def main() -> None:
             logger.exception("Unhandled error processing deleted message")
 
     await user_client.start()
-    await resolve_supplier_entities(user_client)
+    startup_resolved = await resolve_supplier_entities(user_client)
+    active_total = len(db.list_suppliers(active_only=True, db_path=db.DEFAULT_DB_PATH))
+    await _warn_if_zero_suppliers_resolved(
+        bot_client, active_total, len(startup_resolved)
+    )
+
+    try:
+        dedupe_result = await asyncio.get_running_loop().run_in_executor(
+            None, db.dedupe_suppliers
+        )
+        if dedupe_result.get("merges") and bot_client and ADMIN_USER_ID:
+            try:
+                await bot_client.send_message(
+                    ADMIN_USER_ID,
+                    f"🧹 Merged {len(dedupe_result['merges'])} duplicate supplier row(s) "
+                    f"({dedupe_result['rows_removed']} removed). No action needed — "
+                    f"listings were preserved on the surviving row.",
+                )
+            except Exception:
+                logger.exception("Could not DM admin about supplier dedupe")
+    except Exception:
+        logger.exception("Startup supplier dedupe failed")
 
     logger.info(
         "User listener connected. Monitoring %s configured suppliers, publishing to %s",
@@ -1239,6 +1355,9 @@ async def main() -> None:
     # Start background workers
     worker_task = asyncio.create_task(approved_listings_worker(user_client, stop_event, bot_client))
     health_task = asyncio.create_task(health_check_worker(stop_event))
+    resolve_task = asyncio.create_task(
+        supplier_resolution_worker(user_client, bot_client, stop_event)
+    )
     rephrase_task = asyncio.create_task(rephrase_unpublished())
     backfill_task = None
     if BACKFILL_ON_START:
@@ -1265,12 +1384,13 @@ async def main() -> None:
         stop_event.set()
         worker_task.cancel()
         health_task.cancel()
+        resolve_task.cancel()
         rephrase_task.cancel()
         if backfill_task:
             backfill_task.cancel()
         # SHUT-1: actually await the cancelled tasks so their finally-blocks and
         # DB connection check-ins complete instead of leaking as orphans.
-        pending_tasks = [worker_task, health_task, rephrase_task]
+        pending_tasks = [worker_task, health_task, resolve_task, rephrase_task]
         if backfill_task:
             pending_tasks.append(backfill_task)
         try:

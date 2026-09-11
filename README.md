@@ -106,6 +106,14 @@ API_HASH=0123456789abcdef0123456789abcdef
 DEST_CHANNEL=@your_destination_channel
 
 # Monitored Source Channels (comma-separated usernames OR numeric channel IDs)
+# ⚠️ OPTIONAL — can be left empty! A fresh deployment starts fine with 0 sources
+#    and the admin adds every channel via the admin bot's Sources menu (Add
+#    Source, or forward a message from a private channel/group).
+#    When set, it is READ ONLY ONCE — on the very first startup with an EMPTY
+#    supplier database. After that the database is the single source of truth:
+#    manage sources exclusively via the admin bot's Sources menu. Editing this
+#    list later has NO effect (and a deleted source will never silently
+#    reappear) unless /reseed_from_env is run manually.
 SOURCE_CHANNELS=@channel_one, -1003340459479
 
 # Admin Bot Token (from @BotFather)
@@ -129,6 +137,8 @@ ADDITIONAL_PLATFORMS=
 ```
 
 > **Migrating an existing database**: `db.py` auto-migrates older databases on startup (`PRAGMA user_version`). It adds the new columns, removes pre-existing duplicate rows (keeping the newest), and creates the unique index.
+>
+> **`SOURCE_CHANNELS` one-time seeding**: entirely optional — a fresh deployment can start with it empty and have the admin add every source through the bot's Sources menu. When set, it is read once on the first startup against an empty supplier database, and on a DB that already has supplier rows (e.g. your existing production DB) the bot detects non-empty supplier data and marks `.env` as "already seeded" **without** re-adding anything — previously deleted sources stay deleted and nothing is duplicated. From then on, `.env` is never consulted for suppliers again. Only `/reseed_from_env` re-reads it, deliberately. Starting with 0 suppliers logs a warning and runs normally (bot monitors nothing until sources are added).
 
 ---
 
@@ -164,7 +174,9 @@ Message your bot directly on Telegram (only authorized for `ADMIN_USER_ID`):
 | :--- | :--- | :--- |
 | `/suppliers` | List all monitored suppliers and active status | `/suppliers` |
 | `/addsupplier <channel>` | Add and activate a new channel (username or numeric ID) | `/addsupplier @kycgroupke` |
-| `/removesupplier <channel>` | Deactivate monitoring for a channel | `/removesupplier @kycgroupke` |
+| `/removesupplier <channel>` | Permanently delete a channel (history kept) | `/removesupplier @kycgroupke` |
+| `/dedupe_suppliers` | Merge duplicate supplier rows (same real channel) | `/dedupe_suppliers` |
+| `/reseed_from_env` | Manually re-import `SOURCE_CHANNELS` from `.env` once (confirm required) | `/reseed_from_env` |
 | `/rule <channel> <multiplier>` | Set channel markup multiplier | `/rule @kycgroupke 0.8` |
 | `/status` | View today's stats (processed, published, skipped breakdown) | `/status` |
 | `/pending` | Review and approve ambiguous listings | `/pending` |
