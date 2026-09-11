@@ -1,0 +1,17 @@
+.env
+.env.local
+*.session.bak_*
+deploy.zip
+*.pem
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.log
+captured_messages.jsonl
+test_monitor.db
+emoji_ids.txt
+__pycache__/
+venv/
