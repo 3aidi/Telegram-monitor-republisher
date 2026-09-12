@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -30,6 +31,13 @@ DEFAULT_MULTIPLIER = float(os.environ.get("PRICE_MULTIPLIER", "0.75"))
 # listing leaves this set (published, failed, rejected...) any in-flight admin
 # action (edit wizard, Approve tap) must be refused, not silently applied.
 EDITABLE_LISTING_STATUSES = ("pending_approval", "pending_review")
+
+# Skip digest: one aggregated DM per 10-minute window at most, only when there
+# are NEW skipped messages since the last digest marker (SKIP-1). The marker is
+# persisted in app_settings so a restart never re-alerts old skips.
+SKIP_DIGEST_MIN_INTERVAL = 10 * 60
+_skip_digest_last_sent = 0.0
+_skip_digest_task: Optional[asyncio.Task] = None
 
 
 def listing_is_editable(status: str) -> bool:
@@ -231,6 +239,104 @@ async def _build_preview_text(listing: dict) -> str:
     return preview_text
 
 
+def _repair_targets(max_posts: int = 100) -> List[dict]:
+    """Find published posts whose body still contains leaked source prices /
+    @handles / DM lines. Returns the diff of what IS published vs what a clean
+    (sanitized) rebuild would be, with entities ready to apply via edit_message."""
+    published = db.get_published_listings(limit=max_posts)
+    targets: List[dict] = []
+    for p in published:
+        listing_id = p["id"]
+        content_text = p.get("clean_text") or p.get("raw_text") or ""
+        content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
+        sanitized = parser.sanitize_body_lines(content_lines) or ["Available"]
+        our_price = p.get("our_price")
+        platform = p.get("platform_name") or p.get("game_name")
+        intent = p.get("intent") or "neutral"
+        post_number = p.get("post_number")
+
+        current_text, _ = parser.build_ai_message(
+            content_lines=content_lines,
+            our_price=our_price,
+            platform=platform,
+            contact_username=CONTACT_USERNAME,
+            intent=intent,
+            header_word=p.get("header_word"),
+            listing_seed=listing_id,
+            post_number=post_number,
+            sanitize_body=False,
+        )
+        repaired_text, entities = parser.build_ai_message(
+            content_lines=sanitized,
+            our_price=our_price,
+            platform=platform,
+            contact_username=CONTACT_USERNAME,
+            intent=intent,
+            header_word=p.get("header_word"),
+            listing_seed=listing_id,
+            post_number=post_number,
+        )
+        if repaired_text != current_text:
+            targets.append({
+                "listing_id": listing_id,
+                "post_number": post_number,
+                "published_message_id": p.get("published_message_id"),
+                "current_text": current_text,
+                "repaired_text": repaired_text,
+                "entities": entities,
+            })
+    return targets
+
+
+async def skip_digest_worker(bot: TelegramClient) -> None:
+    """Aggregate DM for skipped messages (SKIP-1): fires at most once per
+    10-minute window, only when new skips exist since the last marker, and
+    always as exactly ONE message — no per-skip spam. Immediate DMs are
+    reserved for payment-proof detections, which never land in the skips table."""
+    global _skip_digest_last_sent
+    while True:
+        try:
+            await asyncio.sleep(60)
+            if not bot.is_connected():
+                continue
+            marker = db.get_skip_digest_marker()
+            now = time.monotonic()
+            if now - _skip_digest_last_sent < SKIP_DIGEST_MIN_INTERVAL:
+                continue
+            recent = await asyncio.to_thread(db.get_skipped_listings, 1000)
+            new_skips = [k for k in recent if k["skip_id"] > marker]
+            if not new_skips:
+                continue
+            counts: Dict[str, int] = {}
+            for k in new_skips:
+                reason = k.get("reason") or "other"
+                counts[reason] = counts.get(reason, 0) + 1
+            reason_text = ", ".join(
+                f"`{r}` {c}"
+                for r, c in sorted(counts.items(), key=lambda kv: -kv[1])
+            )
+            lines = [
+                f"⏳ **{len(new_skips)} message(s) skipped** — none published. "
+                f"Breakdown: {reason_text}",
+            ]
+            for k in new_skips[:3]:
+                src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
+                preview = (k.get("raw_text") or "").strip().replace("\n", " ")[:110]
+                lines.append(f"• `{k.get('reason')}` · {src}: {preview}")
+            lines.append("Tap **🚫 Skipped** to re-review any of them.")
+            try:
+                await bot.send_message(ADMIN_USER_ID, "\n".join(lines))
+            except Exception:
+                logger.exception("Failed to send skip digest")
+                continue
+            db.set_skip_digest_marker(max(k["skip_id"] for k in new_skips))
+            _skip_digest_last_sent = now
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error in skip digest worker")
+
+
 def _listing_with_draft(listing: dict, draft: str) -> dict:
     """Copy of a listing whose content/price are taken from an admin draft."""
     updated = dict(listing)
@@ -241,13 +347,45 @@ def _listing_with_draft(listing: dict, draft: str) -> dict:
     return updated
 
 
+def _edit_prompt(listing: dict, existing_draft: Optional[str]) -> str:
+    """Prompt for the ✏️ Edit wizard, seeded with the current content so the
+    admin can copy-tweak-resend the body instead of retyping it from scratch.
+
+    The current body comes from the last draft (if any), else the listing's
+    clean_text, else its raw_text — rendered as a blockquote box that copies
+    cleanly (Telegram blockquotes are formatting, the ``>`` markers are not
+    part of the copied text)."""
+    content = (existing_draft or "").strip()
+    if not content:
+        content = (listing.get("clean_text") or "").strip()
+    if not content:
+        content = (listing.get("raw_text") or "").strip()
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if not lines:
+        body = "_(no content yet — write the body lines)_"
+    else:
+        body = "\n".join(f"> {ln}" for ln in lines)
+    price_now = listing.get("our_price")
+    price_info = f"${price_now}" if price_now else "not set yet"
+    return (
+        f"✏️ **Edit Listing #{listing['id']}**\n"
+        f"Current price for this post: `{price_info}`\n\n"
+        f"**Current content** — copy it, tweak it, then send back the FULL body:\n"
+        f">{body}\n\n"
+        f"• Price & contact are added automatically.\n"
+        f"• If your text includes a price line (e.g. `PRICE 500$`), that price "
+        f"is used instead.\n"
+        f"Then I'll show you the new preview before publishing."
+    )
+
+
 # Home reply keyboard — persistent 1-tap UI. Label reflects current pause state.
 def _home_keyboard() -> List[List[object]]:
     pause_label = "▶ All Start" if db.is_paused() else "⏸ All Stop"
     return [
         [Button.text("📊 Status", resize=True), Button.text("⏳ Pending", resize=True), Button.text("⚠️ Failed", resize=True)],
         [Button.text("📋 Sources", resize=True), Button.text(pause_label, resize=True), Button.text("❓ Help", resize=True)],
-        [Button.text("📜 Published", resize=True)],
+        [Button.text("🚫 Skipped", resize=True), Button.text("📜 Published", resize=True)],
     ]
 
 
@@ -980,6 +1118,98 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         buttons.append([Button.inline("🏠 Home", data="menu:home")])
         await event.reply("\n".join(lines), buttons=buttons, parse_mode="markdown")
 
+    @bot.on(events.NewMessage(pattern=r"^(?:/skipped|🚫 Skipped)"))
+    async def handle_skipped(event):
+        if not await check_admin(event):
+            return
+        skips = db.get_skipped_listings(limit=15)
+        if not skips:
+            await event.reply("✅ No skipped messages logged.", buttons=_home_keyboard())
+            return
+
+        lines = ["🚫 **Recently skipped** — the ones that never made it to review:\n"]
+        buttons = []
+        for i, k in enumerate(skips, 1):
+            reason = k.get("reason") or "?"
+            src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
+            ts = (k.get("timestamp") or "")[:16].replace("T", " ")
+            preview = (k.get("raw_text") or "").strip().replace("\n", " ")[:130]
+            lines.append(f"{i}. **{reason}** · {src} · {ts}\n   {preview}")
+            if k.get("listing_id"):
+                buttons.append([
+                    Button.inline(f"🔁 Re-review #{k['listing_id']}", data=f"reskip:{k['skip_id']}"),
+                ])
+        buttons.append([Button.inline("🏠 Home", data="menu:home")])
+        await event.reply("\n".join(lines), buttons=buttons, parse_mode="markdown")
+
+    @bot.on(events.NewMessage(pattern=r"^/repair(?:\s+(do|list))?"))
+    async def handle_repair(event):
+        if not await check_admin(event):
+            return
+        mode = (event.pattern_match.group(1) or "list").lower()
+        targets = _repair_targets()
+
+        if mode != "do":
+            if not targets:
+                await event.reply(
+                    "✅ No published posts need repair — all bodies are clean.",
+                    buttons=_home_keyboard(),
+                )
+                return
+            nums = ", ".join(f"#{t['post_number'] or '?'}" for t in targets)
+            lines = [
+                f"🔧 **Repair dry-run** — {len(targets)} published post(s) would be edited "
+                f"in place (leaked prices/@handles/DM lines removed):\n"
+                f"Posts: {nums}\n"
+                f"Detailed before/after for the first {min(5, len(targets))} below.\n",
+            ]
+            for t in targets[:5]:
+                lines.append(
+                    f"━━━ **Post #{t['post_number'] or '?'}** · listing #{t['listing_id']} ━━━\n"
+                    f"**now:**\n{t['current_text']}\n"
+                    f"**after:**\n{t['repaired_text']}"
+                )
+            lines.append(
+                "\nRun `/repair do` to apply to all of them. "
+                "**Review carefully — this EDITS the live channel.**"
+            )
+            await event.reply("\n\n".join(lines), buttons=_home_keyboard(), parse_mode="markdown")
+            return
+
+        if not targets:
+            await event.reply("✅ Nothing to repair.", buttons=_home_keyboard())
+            return
+        if not user_client_ref or not user_client_ref.is_connected() or not DEST_CHANNEL:
+            await event.reply(
+                "⚠️ User client not connected — can't edit the destination channel.",
+                buttons=_home_keyboard(),
+            )
+            return
+        done = 0
+        failed = 0
+        for t in targets:
+            try:
+                await publish_guard.throttle()
+                await user_client_ref.edit_message(
+                    DEST_CHANNEL,
+                    t["published_message_id"],
+                    t["repaired_text"],
+                    formatting_entities=t["entities"],
+                )
+                db.record_audit(
+                    "repair_edited", t["listing_id"], actor_id=event.sender_id,
+                    detail=f"post #{t['post_number']}",
+                )
+                done += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Repair edit failed for post %s", t.get("post_number"))
+                failed += 1
+        await event.reply(
+            f"🔧 Repair done: **{done} edited**, {failed} failed.",
+            buttons=_home_keyboard(),
+        )
     @bot.on(events.NewMessage(pattern=r"^(?:/published|📜 Published)"))
     async def handle_published(event):
         if not await check_admin(event):
@@ -1142,6 +1372,33 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         data_str = event.data.decode("utf-8")
+
+        # ---- Skipped re-review ---------------------------------------------
+        if data_str.startswith("reskip:"):
+            try:
+                skip_id = int(data_str.split(":", 1)[1])
+            except ValueError:
+                await event.answer("Invalid skip id", alert=True)
+                return
+            reopened = db.reopen_skipped(skip_id)
+            if not reopened:
+                await event.answer("Skip not found or already processed.", alert=True)
+                return
+            db.record_audit(
+                "skipped_reopen", reopened["id"], actor_id=event.sender_id,
+                detail=f"skip #{skip_id}",
+            )
+            try:
+                await event.edit(
+                    f"🔁 Re-opened as **Listing #{reopened['id']}** — now pending approval."
+                )
+            except Exception:
+                await event.answer(f"Re-opened #{reopened['id']}", alert=True)
+            listing_dict = db.get_listing_by_id(reopened["id"])
+            if listing_dict:
+                listing_dict["_review_reason"] = "skipped_reopen"
+                await send_approval_prompt(bot, ADMIN_USER_ID, listing_dict)
+            return
 
         # ---- Pure navigation -----------------------------------------------
         if data_str == "menu:home":
@@ -1379,17 +1636,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
             listing_id = listing["id"]
             _wizard_state[ADMIN_USER_ID] = {"step": "edit", "listing_id": listing_id}
-            _drafts.pop(listing_id, None)
-            price_now = listing.get("our_price")
-            price_info = f"${price_now}" if price_now else "not set yet"
             await event.edit(
-                f"✏️ **Edit Listing #{listing_id}**\n"
-                f"Current price for this post: `{price_info}`\n\n"
-                f"Send the corrected content lines as a plain message.\n"
-                f"• Price & contact are added automatically.\n"
-                f"• If your text includes a price line (e.g. `PRICE 500$`), "
-                f"that price is used instead.\n\n"
-                f"Then I'll show you the new preview before publishing.",
+                _edit_prompt(listing, _drafts.get(listing_id)),
                 buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
             )
             return
@@ -1697,7 +1945,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
 
 async def create_admin_bot_client() -> TelegramClient:
-    """Initialize and start the Telethon bot client."""
+    """Initialize and start the Telethon bot client.
+
+    This is the ONLY documented way to run the admin bot: as part of main.py
+    (unified mode) or `python main.py --manual` (manual mode). The legacy
+    `python admin_bot.py` standalone entry point was removed: without a user
+    client its approve taps could only queue listings, never publish them.
+    """
     db.init_db()
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is required in .env for admin bot")
@@ -1719,9 +1973,11 @@ async def create_admin_bot_client() -> TelegramClient:
                 BotCommand(command="status", description="📊 Today's stats report"),
                 BotCommand(command="pending", description="⏳ Pending approval listings"),
                 BotCommand(command="failed", description="⚠️ Failed publishes (DLQ)"),
+                BotCommand(command="skipped", description="🚫 Recently skipped messages"),
                 BotCommand(command="sources", description="📋 Manage monitored sources"),
                 BotCommand(command="published", description="📜 Published posts & channel links"),
                 BotCommand(command="post", description="🔢 Look up a post by its number: /post 12"),
+                BotCommand(command="repair", description="🔧 Edit leaked prices/handles out of live posts"),
                 BotCommand(command="addemoji", description="🎨 Add emoji pack: /addemoji <link>"),
                 BotCommand(command="help", description="❓ Show buttons and shortcuts"),
             ]
@@ -1729,20 +1985,10 @@ async def create_admin_bot_client() -> TelegramClient:
     except Exception as e:
         logger.warning("Could not set bot commands menu: %s", e)
 
+    # Skip digest: one aggregated DM per 10-min window when new messages were
+    # skipped (starts its own task; the marker persists across restarts).
+    global _skip_digest_task
+    _skip_digest_task = asyncio.create_task(skip_digest_worker(bot))
+
     logger.info("Admin bot started successfully.")
     return bot
-
-
-async def main():
-    """Standalone entry point for admin_bot.py."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    )
-    bot = await create_admin_bot_client()
-    logger.info("Admin bot listening for commands from ADMIN_USER_ID %s...", ADMIN_USER_ID)
-    await bot.run_until_disconnected()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

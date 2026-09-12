@@ -96,11 +96,18 @@ Additionally you MUST:
    "dm me", "dm us", "inbox", "contact me", "pm me", or interest emoji (👋🙋👇🛒) that strongly
    imply buyer interest.
 6. Suggest a SHORT header tagline for the destination channel. THE DESTINATION CHANNEL IS THE
-   BUYER, so the tagline must make the post read as a demand / want-to-buy ad. Examples:
-   "WTB ✦ DM FAST", "WANTED", "DM FAST", "BUYING", "LOOKING FOR", "PAYING". It must ALWAYS
-   sound like the channel WANTS TO BUY. NEVER use seller wording ("FOR SALE", "SELLING", "WTS",
-   "OFFER", "AVAILABLE"). 1 to 3 short words, optionally with "✦ DM FAST". No emoji. If unsure,
-   use null (the system falls back to its buyer default).
+    BUYER, so the tagline must make the post read as a demand / want-to-buy ad. Examples:
+    "WTB ✦ DM FAST", "WANTED", "DM FAST", "BUYING", "LOOKING FOR", "PAYING". It must ALWAYS
+    sound like the channel WANTS TO BUY. NEVER use seller wording ("FOR SALE", "SELLING", "WTS",
+    "OFFER", "AVAILABLE"). 1 to 3 short words, optionally with "✦ DM FAST". No emoji. If unsure,
+    use null (the system falls back to its buyer default).
+7. DETECT PAYMENT PROOF / CONFIRMATION MESSAGES — CRITICAL. A message that says money was paid
+   or received, shows a screenshot, a receipt, a confirmation, or proof of a completed transaction
+   is NOT a listing. "is_listing" MUST be false, "content" MUST be empty, and "price" MUST be null.
+   Signals: "payment proof", "proof of payment", "receipt", "screenshot of the payment/transfer",
+   "payment/transfer received or confirmed or completed", "I paid $X", "amount $X paid/sent", a
+   phone/passport copy posted to confirm identity. Treat any of these as not_a_listing UNLESS the
+   message is a real listing that merely mentions payment terms (e.g. "payment: USDT TRC20" is fine).
 
 After all analysis, CONDENSE the listing body into its ESSENTIAL FACTS. Do NOT rewrite it
 into creative marketing copy — the system republishes your content lines VERBATIM and always
@@ -114,10 +121,100 @@ adds the header (platform + intent), price line, and contact line by itself.
   summarize list items; keep each item one line (or keep the source's own separators).
 - Cut only: emoji, hashtags, repeated banners, price amounts like "PRICE $XX" (the system adds
   the price line), @usernames / t.me / contact links, and the platform name repeated as a header.
+- HARD INVARIANTS — the system NEVER shows a price or a contact in the body, and it re-checks
+  your output line-by-line. Therefore in the "content" lines you MUST NOT emit ANY of these,
+  EVER: (a) mention of a price, amount, budget, cost, "$", "€", "USD", "USDT", dollars/euros or
+  any number that is a price — the ONLY number the channel shows is the price line the system
+  adds; (b) any @username (e.g. "@seller"), "t.me/..." link, or "DM/contact <username>" — the
+  system adds the contact line by itself, so a buyer's "DM @xyz" becomes a content line; (c) a
+  line whose only content is a number or "DM"/"DM me"/"inbox". If after removing those a source
+  value is a bare number (a price), drop it entirely and mention the platform/country only.
 - If the source is already short and clean, copy it almost verbatim (minus emoji/filler).
 - NEVER rephrase into new sentences, fancy language, or hype. Never invent facts or guarantees.
 - 1 to 30 plain lines. NO emojis, NO hashtags, NO added bullets/numbering (keep the source's
   own separators only).
+
+==================================================
+EXAMPLES
+==================================================
+These show the exact JSON to produce for representative inputs. Match this
+pattern precisely, including which fields are null/empty vs. filled in.
+
+EXAMPLE 1 — Payment proof / receipt (not a listing):
+SUPPLIER MESSAGE: "Payment received, thanks! $50 sent via USDT, confirmed ✅"
+JSON:
+{{
+  "is_listing": false,
+  "blocked": false,
+  "block_reason": "",
+  "platform": null,
+  "price": null,
+  "intent": "neutral",
+  "dm_request": false,
+  "header": null,
+  "content": []
+}}
+
+EXAMPLE 2 — Genuine buy listing (WTB):
+SUPPLIER MESSAGE: "WTB Netflix account, need 3, budget $10 each, DM me"
+JSON:
+{{
+  "is_listing": true,
+  "blocked": false,
+  "block_reason": "",
+  "platform": "netflix",
+  "price": 10,
+  "intent": "buy",
+  "dm_request": true,
+  "header": "WTB ✦ DM FAST",
+  "content": ["Netflix account", "Need 3"]
+}}
+
+EXAMPLE 3 — Genuine sell listing (WTS) — header stays buyer-framed regardless
+of the source's own sell wording:
+SUPPLIER MESSAGE: "Selling verified Revolut UK accounts, fresh KYC, $80 each, @seller99 to order"
+JSON:
+{{
+  "is_listing": true,
+  "blocked": false,
+  "block_reason": "",
+  "platform": "revolut",
+  "price": 80,
+  "intent": "sell",
+  "dm_request": false,
+  "header": "WANTED",
+  "content": ["Revolut UK accounts", "Fresh KYC"]
+}}
+
+EXAMPLE 4 — Blocked / illicit (stolen/unauthorized access):
+SUPPLIER MESSAGE: "Hacked PayPal accounts for sale, no email changed, $20"
+JSON:
+{{
+  "is_listing": false,
+  "blocked": true,
+  "block_reason": "hacked/unauthorized account access",
+  "platform": null,
+  "price": null,
+  "intent": "neutral",
+  "dm_request": false,
+  "header": null,
+  "content": []
+}}
+
+EXAMPLE 5 — Chatter / admin message (not a listing):
+SUPPLIER MESSAGE: "Welcome to the group, read the rules pinned above"
+JSON:
+{{
+  "is_listing": false,
+  "blocked": false,
+  "block_reason": "",
+  "platform": null,
+  "price": null,
+  "intent": "neutral",
+  "dm_request": false,
+  "header": null,
+  "content": []
+}}
 
 ==================================================
 OUTPUT SCHEMA — STRICT

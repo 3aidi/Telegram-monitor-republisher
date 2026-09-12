@@ -172,3 +172,59 @@ def contains_blocked_keyword(text: str) -> Optional[str]:
         if m:
             return m.group(0)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Payment-proof detection — the single most dangerous miss-classification.
+# ---------------------------------------------------------------------------
+# A payment screenshot / "I paid $X, here is the proof" message is NOT a
+# listing and must NEVER be auto-published (it exposes the buyer's payment
+# details to the destination audience). These patterns are deliberately narrow:
+# they need an explicit proof/receipt/confirmed vocabulary, which real listing
+# bodies almost never contain.
+_PAYMENT_PROOF_PATTERNS = [
+    re.compile(r"\bproof\s+of\s+(?:payment|transfer|transaction|deposit)\b", re.IGNORECASE),
+    re.compile(r"\b(?:payment|transfer|transaction|deposit|wire)\s+(?:proof|receipt)\b", re.IGNORECASE),
+    re.compile(r"\bscreenshot\s+of\s+(?:the\s+)?(?:payment|bank|transaction|transfer)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:payment|transfer|wire|transaction)\s+(?:received|confirmed|completed|made|sent)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:paid|payed|sent|received|credited|transferred)\b.{0,40}"
+        r"\b(?:proof|receipt|screenshot|confirmed|completed|success)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bamount\s+of\s+\$?\s?\d[\d.,]*\s+(?:paid|sent|received|credited)\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def detect_payment_proof(text: str) -> Optional[str]:
+    """Return the matched payment-proof pattern, or None when it's a normal message."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    for pattern in _PAYMENT_PROOF_PATTERNS:
+        m = pattern.search(t)
+        if m:
+            return m.group(0)
+    return None
+
+
+def has_clear_listing_signal(text: str, price: Optional[float] = None) -> bool:
+    """Minimum bar the deterministic (AI-down) fallback demands before it is
+    allowed to auto-publish: a real price AND at least one concrete listing
+    signal (platform keyword, WTS/WTB wording, @contact, URL). Everything below
+    that bar routes to manual review instead — no blind auto-publishes."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if price is None or price <= 0:
+        return False
+    for signal in _LISTING_SIGNALS:
+        if signal.search(t):
+            return True
+    return False

@@ -394,6 +394,49 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertFalse(admin_bot.listing_is_editable("failed"))
         self.assertFalse(admin_bot.listing_is_editable(""))
 
+    def test_edit_prompt_seeds_current_content(self):
+        """The ✏️ Edit prompt is seeded with the current body as a blockquote
+        (copy-tweak-resend) instead of a blank slate."""
+        import admin_bot
+
+        listing = {
+            "id": 42,
+            "clean_text": "KYC CURVE PAY\nANY EU",
+            "our_price": 12.5,
+        }
+        prompt = admin_bot._edit_prompt(listing, None)
+        self.assertIn("Current content", prompt)
+        self.assertIn("> KYC CURVE PAY", prompt)
+        self.assertIn("> ANY EU", prompt)
+        self.assertIn("`$12.5`", prompt)
+        self.assertIn("send back the FULL body", prompt)
+
+    def test_edit_prompt_prior_draft_wins_and_no_price_note(self):
+        """Re-entering Edit keeps the last draft as context, not the DB text."""
+        import admin_bot
+
+        listing = {
+            "id": 7,
+            "clean_text": "OLD LINE FROM AI",
+            "our_price": None,
+        }
+        prompt = admin_bot._edit_prompt(listing, "MY EDITED LINE\nCHANGED")
+        self.assertIn("> MY EDITED LINE", prompt)
+        self.assertIn("> CHANGED", prompt)
+        self.assertNotIn("OLD LINE FROM AI", prompt)
+        self.assertIn("not set yet", prompt)
+
+    def test_edit_prompt_falls_back_to_raw_text_and_empty(self):
+        import admin_bot
+
+        listing = {"id": 3, "clean_text": "", "raw_text": "RAW FALLBACK BODY"}
+        prompt = admin_bot._edit_prompt(listing, None)
+        self.assertIn("> RAW FALLBACK BODY", prompt)
+
+        prompt2 = admin_bot._edit_prompt({"id": 4, "clean_text": "", "raw_text": "  "}, None)
+        self.assertIn("no content yet", prompt2)
+        self.assertNotIn("> ", prompt2)
+
     def test_normalize_channel_id_marks_bare_keeps_marked(self):
         """Every channel_id in the DB must be the marked form (-100... prefix)
         that matches what Telethon reports as event.chat_id."""
@@ -1544,6 +1587,154 @@ class TestMonitorSystem(unittest.TestCase):
             ai_rephraser._openrouter_api_key = saved_key
             ai_rephraser._openrouter_next_attempt_ts = saved_ts
             ai_rephraser.httpx = saved_httpx
+
+    # -------------------------------------------------------------
+    # SANITIZER / BODY-GUARD TESTS
+    # -------------------------------------------------------------
+    def test_sanitize_body_drops_price_and_handle_lines(self):
+        body = [
+            "WTB NEED GOOD SELLERS",
+            "KYC MEXC VIA LINK ONLY",
+            "PRICE 25$",
+            "GOOD SELLERS POLAND DM ME",
+            "DM: @ARO_KYC1",
+        ]
+        lines, ok = parser.prepare_body(body, " ".join(body))
+        self.assertTrue(ok)
+        joined = " | ".join(lines)
+        self.assertNotIn("25$", joined)
+        self.assertNotIn("@ARO_KYC1", joined)
+        self.assertIn("KYC MEXC", joined)
+
+    def test_sanitize_body_styled_digit_lines(self):
+        body = ["KYC CHATGPT", "\U0001D7ED\U0001D7EE US", "ANY EU"]
+        lines, ok = parser.prepare_body(body, " ".join(body))
+        self.assertTrue(ok)
+        self.assertEqual(lines, ["KYC CHATGPT", "ANY EU"])
+
+        body2 = ["\U0001D7ED\U0001D7F2 EUR"]
+        lines2, ok2 = parser.prepare_body(body2, " ".join(body2))
+        self.assertFalse(ok2)
+        self.assertEqual(lines2, [])
+
+        body3 = ["\U0001D7ED\U0001D7F2$", "Netflix 1 month", "EU supported"]
+        lines3, ok3 = parser.prepare_body(body3, " ".join(body3))
+        self.assertTrue(ok3)
+        self.assertEqual(lines3, ["Netflix 1 month", "EU supported"])
+
+    def test_sanitize_body_midline_price_blob_removed(self):
+        body = ["Chat Gpt \u2014 Readymade 35$_USDT", "USA   50$"]
+        lines, ok = parser.prepare_body(body, " ".join(body))
+        self.assertFalse(ok)
+        self.assertEqual(lines, ["Chat Gpt \u2014 Readymade"])
+
+    def test_prepare_body_requires_substance(self):
+        lines, ok = parser.prepare_body(["Any country"], "Any country")
+        self.assertFalse(ok)
+        self.assertEqual(lines, ["Any country"])
+
+        lines, ok = parser.prepare_body([], "")
+        self.assertFalse(ok)
+        self.assertEqual(lines, [])
+
+        lines, ok = parser.prepare_body(["1 VIVID KYC", "ANY EU"], "1 VIVID KYC ANY EU")
+        self.assertTrue(ok)
+
+    def test_build_ai_message_sanitizes_body_by_default(self):
+        msg, _entities = parser.build_ai_message(
+            content_lines=["KYC CURVE PAY", "PRICE: $30", "DM: @godf4therCO"],
+            our_price=30,
+            platform="curve",
+            contact_username="@buy",
+            intent="buy",
+        )
+        self.assertNotIn("PRICE: $30", msg)
+        self.assertNotIn("@godf4therCO", msg)
+        self.assertIn("KYC CURVE PAY", msg)
+
+    def test_build_ai_message_preserves_body_when_sanitize_false(self):
+        # /repair reconstructs the as-published text: verbatim body, no sanitizing.
+        msg, _entities = parser.build_ai_message(
+            content_lines=["KYC CURVE PAY", "PRICE: $30"],
+            our_price=30,
+            platform="curve",
+            contact_username="@buy",
+            intent="buy",
+            sanitize_body=False,
+        )
+        self.assertIn("KYC CURVE PAY", msg)
+        self.assertIn("PRICE: $30", msg)
+
+    # -------------------------------------------------------------
+    # FILTER GATE TESTS
+    # -------------------------------------------------------------
+    def test_detect_payment_proof(self):
+        self.assertTrue(filters.detect_payment_proof("proof of payment attached here"))
+        self.assertTrue(filters.detect_payment_proof("transaction received confirmed"))
+        self.assertTrue(filters.detect_payment_proof("I paid 40$ sent receipt"))
+        self.assertTrue(filters.detect_payment_proof("amount of $50 paid"))
+        self.assertIsNone(filters.detect_payment_proof("KYC CURVE PAY ANY EU"))
+        self.assertIsNone(filters.detect_payment_proof(""))
+        self.assertIsNone(filters.detect_payment_proof("   "))
+
+    def test_has_clear_listing_signal(self):
+        self.assertTrue(filters.has_clear_listing_signal("WTB Chatgpt PRICE 30$", 30))
+        self.assertTrue(filters.has_clear_listing_signal("KYC netflix 200$", 150))
+        self.assertTrue(filters.has_clear_listing_signal("DM @buyer 40", 40))
+        # Money present but no concrete platform / listing signal -> not clear.
+        self.assertFalse(filters.has_clear_listing_signal("GOOD SELLER", 50))
+        # No price -> never clear, even with a platform word.
+        self.assertFalse(filters.has_clear_listing_signal("netflix kyc available", None))
+        self.assertFalse(filters.has_clear_listing_signal("netflix kyc available", 0))
+
+    # -------------------------------------------------------------
+    # SKIP REVIEW / DIGEST TESTS
+    # -------------------------------------------------------------
+    def test_skip_review_and_reopen_flow(self):
+        sup_id = db.add_supplier("skip_review_chan", db_path=TEST_DB)
+        listing_id = db.insert_listing(
+            sup_id,
+            904477,
+            "netflix",
+            None,
+            12.5,
+            9.0,
+            "skipped_filter",
+            "some raw leaked body",
+            "clean body",
+            db_path=TEST_DB,
+        )
+        db.log_skip(sup_id, 904477, "filter", "some raw leaked body", db_path=TEST_DB)
+
+        rows = db.get_skipped_listings(limit=10, db_path=TEST_DB)
+        skip = next((r for r in rows if r["message_id"] == 904477), None)
+        self.assertIsNotNone(skip)
+        self.assertEqual(skip["listing_id"], listing_id)
+        self.assertEqual(skip["listing_status"], "skipped_filter")
+        self.assertEqual(skip["channel_username"], "skip_review_chan")
+
+        reopened = db.reopen_skipped(skip["skip_id"], db_path=TEST_DB)
+        self.assertIsNotNone(reopened)
+        self.assertEqual(reopened["status"], "pending_approval")
+
+        # Second reopen is a no-op: the listing left the skipped state.
+        self.assertIsNone(db.reopen_skipped(skip["skip_id"], db_path=TEST_DB))
+
+        with sqlite3.connect(TEST_DB) as conn:
+            conn.row_factory = sqlite3.Row
+            audit = conn.execute(
+                "SELECT * FROM audit_log WHERE listing_id = ? AND action = 'skipped_reopen'",
+                (listing_id,),
+            ).fetchone()
+            self.assertIsNotNone(audit)
+            self.assertIn(str(skip["skip_id"]), audit["detail"])
+
+    def test_skip_digest_marker(self):
+        self.assertEqual(db.get_skip_digest_marker(db_path=TEST_DB), 0)
+        db.set_skip_digest_marker(7, db_path=TEST_DB)
+        self.assertEqual(db.get_skip_digest_marker(db_path=TEST_DB), 7)
+        db.set_skip_digest_marker(3, db_path=TEST_DB)
+        self.assertEqual(db.get_skip_digest_marker(db_path=TEST_DB), 3)
 
 
 if __name__ == "__main__":

@@ -1326,6 +1326,68 @@ def get_skip_reasons_today(db_path: Optional[str] = None) -> Dict[str, int]:
         return {row["reason"]: row["cnt"] for row in rows}
 
 
+def get_skipped_listings(
+    limit: int = 10, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Most recent skipped messages, joined with their supplier (and the linked
+    listing row, when one exists) for the admin /skipped review screen."""
+    query = """
+        SELECT k.id as skip_id, k.supplier_id, k.message_id, k.reason, k.raw_text,
+               k.timestamp,
+               s.channel_username, s.display_name,
+               l.id as listing_id, l.status as listing_status
+        FROM skips k
+        LEFT JOIN suppliers s ON k.supplier_id = s.id
+        LEFT JOIN listings l ON l.supplier_id = k.supplier_id
+                            AND l.source_message_id = k.message_id
+        ORDER BY k.id DESC
+        LIMIT ?
+    """
+    with db_session(db_path) as conn:
+        rows = conn.execute(query, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def reopen_skipped(
+    skip_id: int, db_path: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Move a skipped listing back to pending_approval for a fresh review.
+
+    Returns the listing dict on success, or None when the skip has no linked
+    listing or the listing is no longer in a skipped state."""
+    with db_session(db_path) as conn:
+        row = conn.execute("SELECT * FROM skips WHERE id = ?", (skip_id,)).fetchone()
+        if not row:
+            return None
+        listing = conn.execute(
+            "SELECT * FROM listings WHERE supplier_id = ? AND source_message_id = ?",
+            (row["supplier_id"], row["message_id"]),
+        ).fetchone()
+        if not listing:
+            return None
+        if listing["status"] not in ("skipped_duplicate", "skipped_chatter", "skipped_filter", "skipped_no_content"):
+            return None
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE listings SET status = 'pending_approval', updated_at = ? WHERE id = ?",
+            (now_iso, listing["id"]),
+        )
+        listing = dict(listing)
+        listing["status"] = "pending_approval"
+    record_audit("skipped_reopen", listing["id"], detail=f"skip #{skip_id}", db_path=db_path)
+    return listing
+
+
+def get_skip_digest_marker(db_path: Optional[str] = None) -> int:
+    """Highest skips.id the admin has already been shown (skip-digest window)."""
+    return int(get_setting("skip_digest_last_id", "0", db_path=db_path) or 0)
+
+
+def set_skip_digest_marker(skip_id: int, db_path: Optional[str] = None) -> None:
+    """Advance the skip-digest marker past ``skip_id``."""
+    set_setting("skip_digest_last_id", str(int(skip_id)), db_path=db_path)
+
+
 def get_supplier_stats_today(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Per-active-supplier daily breakdown: processed / published / skipped.
 

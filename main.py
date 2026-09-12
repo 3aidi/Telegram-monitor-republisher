@@ -49,6 +49,10 @@ AI_CACHE_TTL_HOURS = float(os.environ.get("AI_CACHE_TTL_HOURS", "48") or 48)
 # How long identical content stays blocked as a duplicate: a re-post of the
 # same listing within DEDUP_HOURS is skipped (content fingerprint + price).
 DEDUP_HOURS = int(os.environ.get("DEDUP_HOURS", "48") or 48)
+# Manual mode (`python main.py --manual`): start the admin bot + user client
+# ONLY. No listener, no auto-publish, no backfill, no supplier resolution —
+# the admin reviews and publishes everything. Approvals drain the queue worker.
+MANUAL_MODE = "--manual" in sys.argv
 
 # Parse source channels list from comma-separated string
 SOURCE_CHANNELS_RAW = os.environ.get("SOURCE_CHANNELS", "")
@@ -641,6 +645,29 @@ async def _process_supplier_message(
             )
             return
 
+    # Step 1.75: payment-proof / confirmation messages are NEVER auto-published.
+    # A "I paid $X / here is the proof" message is not a listing, leaks buyer
+    # payment details, and is the #1 misclassification into the buy auto-publish
+    # path — so it is caught BEFORE the AI and routed to manual review.
+    payment_proof = filters.detect_payment_proof(raw_text)
+    if payment_proof:
+        db.update_listing_status(listing_id, "pending_approval")
+        db.record_audit(
+            "payment_proof_review", listing_id, detail=payment_proof[:200]
+        )
+        logger.warning(
+            "Listing #%s flagged as payment proof ('%s') — manual review, not published.",
+            listing_id,
+            payment_proof,
+        )
+        if bot_client and ADMIN_USER_ID:
+            listing_dict = db.get_listing_by_id(listing_id)
+            if listing_dict:
+                listing_dict["supplier_username"] = supplier.get("channel_username")
+                listing_dict["_review_reason"] = "payment_proof"
+                await admin_bot.send_approval_prompt(bot_client, ADMIN_USER_ID, listing_dict)
+        return
+
     # Step 2: AI analysis + rewriting — ONE call decides everything. Nothing
     # else gates publishing: platform/price are recorded for display only.
     analysis = await ai_rephraser.analyze_message(raw_text)
@@ -659,19 +686,27 @@ async def _process_supplier_message(
 
         # Deterministic fallback (no AI): keep real listings publishing during
         # an AI outage via the regex/emoji-strip path already used for previews.
-        # The blocked-keyword screen is the safety valve — stolen/hacked content
-        # ALWAYS still routes to manual review, never auto-published without AI.
+        # Gated HARD (FALLBACK-1): only a message with a real price + a concrete
+        # listing signal + a substantive sanitized body + no payment-proof may
+        # auto-publish. Anything weaker routes to manual review below. The
+        # blocked-keyword screen is an additional safety valve — stolen/hacked
+        # content ALWAYS still routes to manual review, never auto-published.
         risky_keyword = filters.contains_blocked_keyword(raw_text)
+        fb_content_lines = [
+            ln.strip()
+            for ln in fallback_clean_text.split("\n")
+            if ln.strip()
+        ] or ["Available"]
+        fb_lines, fb_body_ok = parser.prepare_body(fb_content_lines, raw_text)
         if (
             DETERMINISTIC_FALLBACK
             and not risky_keyword
+            and not filters.detect_payment_proof(raw_text)
+            and filters.has_clear_listing_signal(raw_text, source_price)
+            and fb_body_ok
             and not db.is_paused()
         ):
-            content_lines = [
-                ln.strip()
-                for ln in fallback_clean_text.split("\n")
-                if ln.strip()
-            ] or ["Available"]
+            content_lines = fb_lines
             post_number = db.next_post_number()
             out_text, entities = parser.build_ai_message(
                 content_lines=content_lines,
@@ -801,11 +836,24 @@ async def _process_supplier_message(
     multiplier = supplier.get("markup_multiplier") or DEFAULT_MULTIPLIER
     our_price = _price_for_dispatch(original_price, multiplier, intent)
 
-    if intent == "buy" and not db.is_paused():
-        # AI-only decision: detected as a buy demand -> rephrase + auto-publish.
+    # Sanitize the AI body now (strip leaked prices/@handles/DM lines) and gate
+    # the buy auto-publish: a buy demand only auto-publishes when it carries a
+    # resolvable platform OR price, has a substantive sanitized body, and shows
+    # no payment-proof signal. Everything else routes to manual approval.
+    body_lines, body_ok = parser.prepare_body(content_lines, ai_clean_text or raw_text)
+    buy_auto_ok = (
+        intent == "buy"
+        and not db.is_paused()
+        and (bool(platform_name) or (original_price is not None and original_price > 0))
+        and body_ok
+        and not filters.detect_payment_proof(raw_text)
+    )
+
+    if buy_auto_ok:
+        # Buy demand with a clear signal -> rephrase + auto-publish (gated).
         post_number = db.next_post_number()
         our_text, entities = parser.build_ai_message(
-            content_lines=content_lines,
+            content_lines=body_lines,
             our_price=our_price,
             platform=platform_name,
             contact_username=CONTACT_USERNAME,
@@ -849,16 +897,30 @@ async def _process_supplier_message(
             logger.exception("Failed to publish message for listing #%s", listing_id)
             await _alert_admin_on_failure(bot_client, supplier, listing_id)
     else:
-        # Not a buy signal (sell / neutral / paused) -> Mark pending approval
-        # and notify the admin. AI's word is taken as-is: no platform/price
-        # requirements on this path either.
+        # Not an auto-publishable buy signal (unsafe buy, sell, neutral, paused)
+        # -> route to manual approval with the exact reason attached.
+        gate_reason = None
+        if intent == "buy":
+            if filters.detect_payment_proof(raw_text):
+                gate_reason = "payment_proof"
+            elif not (bool(platform_name) or (original_price is not None and original_price > 0)):
+                gate_reason = "buy_gate_no_price_platform"
+            elif not body_ok:
+                gate_reason = "buy_gate_weak_body"
+            else:
+                gate_reason = "buy_gate"
         db.update_listing_status(listing_id, "pending_approval", our_price=our_price)
-        logger.info("Listing #%s marked pending_approval. Alerting admin...", listing_id)
+        logger.info(
+            "Listing #%s marked pending_approval (gate=%s). Alerting admin...",
+            listing_id,
+            gate_reason or "sell/neutral",
+        )
 
         if bot_client and ADMIN_USER_ID:
             listing_dict = db.get_listing_by_id(listing_id)
             if listing_dict:
                 listing_dict["supplier_username"] = supplier.get("channel_username")
+                listing_dict["_review_reason"] = gate_reason
                 await admin_bot.send_approval_prompt(bot_client, ADMIN_USER_ID, listing_dict)
 
 
@@ -1268,100 +1330,124 @@ async def main() -> None:
         except Exception:
             logger.exception("Failed to start integrated admin bot; continuing with user listener only.")
 
-    # Register user client event handlers
-    @user_client.on(events.NewMessage)
-    async def on_new_message(event):
-        try:
-            async def _handle_new():
-                supplier = resolve_supplier_for_event(event)
-                if supplier:
-                    await process_supplier_message(user_client, bot_client, supplier, event.message)
+    # Register user client event handlers — skipped entirely in manual mode,
+    # where ingestion / auto-publish must not run (the admin publishes only).
+    if not MANUAL_MODE:
+        @user_client.on(events.NewMessage)
+        async def on_new_message(event):
+            try:
+                async def _handle_new():
+                    supplier = resolve_supplier_for_event(event)
+                    if supplier:
+                        await process_supplier_message(user_client, bot_client, supplier, event.message)
 
-            await _run_with_floodwait_retry(
-                _handle_new,
-                f"new message {getattr(event.message, 'id', None)}",
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Unhandled error processing new message %s", getattr(event.message, "id", None))
+                await _run_with_floodwait_retry(
+                    _handle_new,
+                    f"new message {getattr(event.message, 'id', None)}",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Unhandled error processing new message %s", getattr(event.message, "id", None))
 
-    @user_client.on(events.MessageEdited)
-    async def on_message_edited(event):
-        try:
-            async def _handle_edit():
-                await process_edited_message(user_client, event)
+        @user_client.on(events.MessageEdited)
+        async def on_message_edited(event):
+            try:
+                async def _handle_edit():
+                    await process_edited_message(user_client, event)
 
-            await _run_with_floodwait_retry(
-                _handle_edit,
-                f"edited message {getattr(event.message, 'id', None)}",
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Unhandled error processing edited message %s", getattr(event.message, "id", None))
+                await _run_with_floodwait_retry(
+                    _handle_edit,
+                    f"edited message {getattr(event.message, 'id', None)}",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Unhandled error processing edited message %s", getattr(event.message, "id", None))
 
-    @user_client.on(events.MessageDeleted)
-    async def on_message_deleted(event):
-        try:
-            await process_deleted_message(event)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Unhandled error processing deleted message")
+        @user_client.on(events.MessageDeleted)
+        async def on_message_deleted(event):
+            try:
+                await process_deleted_message(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Unhandled error processing deleted message")
 
     await user_client.start()
-    startup_resolved = await resolve_supplier_entities(user_client)
-    active_total = len(db.list_suppliers(active_only=True, db_path=db.DEFAULT_DB_PATH))
-    await _warn_if_zero_suppliers_resolved(
-        bot_client, active_total, len(startup_resolved)
-    )
-
-    try:
-        dedupe_result = await asyncio.get_running_loop().run_in_executor(
-            None, db.dedupe_suppliers
+    if MANUAL_MODE:
+        # Manual mode: no supplier resolution, no ingestion, no auto-publish —
+        # just the user client + admin bot ready for approval/repair work.
+        logger.info(
+            "MANUAL MODE active: admin bot + user client online. "
+            "Ingestion/auto-publish disabled. Publishing to %s",
+            DEST_CHANNEL,
         )
-        if dedupe_result.get("merges") and bot_client and ADMIN_USER_ID:
+        if bot_client and ADMIN_USER_ID:
             try:
                 await bot_client.send_message(
                     ADMIN_USER_ID,
-                    f"🧹 Merged {len(dedupe_result['merges'])} duplicate supplier row(s) "
-                    f"({dedupe_result['rows_removed']} removed). No action needed — "
-                    f"listings were preserved on the surviving row.",
+                    "🛠 **Manual mode online.** Ingestion and auto-publish are OFF. "
+                    "Approvals publish immediately; /skipped and /repair are available.",
                 )
             except Exception:
-                logger.exception("Could not DM admin about supplier dedupe")
-    except Exception:
-        logger.exception("Startup supplier dedupe failed")
+                logger.exception("Could not send manual-mode notice")
+    else:
+        startup_resolved = await resolve_supplier_entities(user_client)
+        active_total = len(db.list_suppliers(active_only=True, db_path=db.DEFAULT_DB_PATH))
+        await _warn_if_zero_suppliers_resolved(
+            bot_client, active_total, len(startup_resolved)
+        )
 
-    logger.info(
-        "User listener connected. Monitoring %s configured suppliers, publishing to %s",
-        len(SOURCE_CHANNELS),
-        DEST_CHANNEL,
-    )
-
-    # Startup ping: an immediate DM proves the bot is online AND that it can send.
-    # Kept best-effort so a failure here never blocks the monitor.
-    if bot_client and ADMIN_USER_ID:
         try:
-            await bot_client.send_message(
-                ADMIN_USER_ID,
-                "✅ Bot is online and monitoring suppliers.",
+            dedupe_result = await asyncio.get_running_loop().run_in_executor(
+                None, db.dedupe_suppliers
             )
-            logger.info("Sent online notice to admin %s", ADMIN_USER_ID)
+            if dedupe_result.get("merges") and bot_client and ADMIN_USER_ID:
+                try:
+                    await bot_client.send_message(
+                        ADMIN_USER_ID,
+                        f"🧹 Merged {len(dedupe_result['merges'])} duplicate supplier row(s) "
+                        f"({dedupe_result['rows_removed']} removed). No action needed — "
+                        f"listings were preserved on the surviving row.",
+                    )
+                except Exception:
+                    logger.exception("Could not DM admin about supplier dedupe")
         except Exception:
-            logger.exception("Could not send startup online notice")
+            logger.exception("Startup supplier dedupe failed")
+
+        logger.info(
+            "User listener connected. Monitoring %s configured suppliers, publishing to %s",
+            len(SOURCE_CHANNELS),
+            DEST_CHANNEL,
+        )
+
+        # Startup ping: an immediate DM proves the bot is online AND that it can send.
+        # Kept best-effort so a failure here never blocks the monitor.
+        if bot_client and ADMIN_USER_ID:
+            try:
+                await bot_client.send_message(
+                    ADMIN_USER_ID,
+                    "✅ Bot is online and monitoring suppliers.",
+                )
+                logger.info("Sent online notice to admin %s", ADMIN_USER_ID)
+            except Exception:
+                logger.exception("Could not send startup online notice")
 
     # Start background workers
     worker_task = asyncio.create_task(approved_listings_worker(user_client, stop_event, bot_client))
-    health_task = asyncio.create_task(health_check_worker(stop_event))
-    resolve_task = asyncio.create_task(
-        supplier_resolution_worker(user_client, bot_client, stop_event)
-    )
-    rephrase_task = asyncio.create_task(rephrase_unpublished())
+    health_task = None
+    resolve_task = None
+    rephrase_task = None
     backfill_task = None
-    if BACKFILL_ON_START:
-        backfill_task = asyncio.create_task(run_backfill(user_client, bot_client))
+    if not MANUAL_MODE:
+        health_task = asyncio.create_task(health_check_worker(stop_event))
+        resolve_task = asyncio.create_task(
+            supplier_resolution_worker(user_client, bot_client, stop_event)
+        )
+        rephrase_task = asyncio.create_task(rephrase_unpublished())
+        if BACKFILL_ON_START:
+            backfill_task = asyncio.create_task(run_backfill(user_client, bot_client))
 
     # Reconnect loop with capped backoff
     backoff = 10
@@ -1383,14 +1469,17 @@ async def main() -> None:
         logger.info("Shutting down workers and clients...")
         stop_event.set()
         worker_task.cancel()
-        health_task.cancel()
-        resolve_task.cancel()
-        rephrase_task.cancel()
+        for task in (health_task, resolve_task, rephrase_task):
+            if task is not None:
+                task.cancel()
         if backfill_task:
             backfill_task.cancel()
         # SHUT-1: actually await the cancelled tasks so their finally-blocks and
         # DB connection check-ins complete instead of leaking as orphans.
-        pending_tasks = [worker_task, health_task, resolve_task, rephrase_task]
+        pending_tasks = [worker_task]
+        for task in (health_task, resolve_task, rephrase_task):
+            if task is not None:
+                pending_tasks.append(task)
         if backfill_task:
             pending_tasks.append(backfill_task)
         try:

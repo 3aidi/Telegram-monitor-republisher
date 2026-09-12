@@ -8,6 +8,7 @@ provides a small price parser used by the admin edit/preview flow.
 import os
 import re
 import time
+import unicodedata
 from typing import Dict, List, Optional, Tuple
 import emoji
 
@@ -232,6 +233,137 @@ def _format_price(price: float) -> str:
     return f"{float(price):g}"
 
 
+# ---------------------------------------------------------------------------
+# Body sanitizer: strip leaked source prices, supplier handles and pure DM
+# lines out of the AI-written body. The destination channel is the BUYER and
+# always carries its OWN price footer, so any price or @contact left in the
+# body is a leak of the source's economics/handles (LEAK-1). This runs on the
+# AI output as a hard backstop on top of the prompt hardening in ai_rephraser.
+# ---------------------------------------------------------------------------
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_HANDLE_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_])(@[A-Za-z0-9_]{3,})|t\.me/[A-Za-z0-9_]{3,}|https?://t\.me/",
+    re.IGNORECASE,
+)
+# Lines that are ONLY "dm me / pm / inbox", optionally wrapped in phrasing.
+_DM_ONLY_RE = re.compile(
+    r"^\s*(?:for|to|just|or|and)?\s*(?:dm|pm|inbox|message|msg|text|telegram|contact)"
+    r"\s*(?:me|us|now|fast|quick|direct)?\s*[.!:\-]*\s*$",
+    re.IGNORECASE,
+)
+# Price-led lines: "PRICE 25$", "GOOD PRICE 200", "PRICE: $30", "RATE 40".
+_PRICE_KEYWORD_RE = re.compile(
+    r"^\s*(?:price|prix|preis|budget|cost|rate|good price|best price|our price|"
+    r"top price|total|amount)\b.*\d",
+    re.IGNORECASE,
+)
+# Whole line is effectively only money: "$25", "25$", "25 USD", "EUR 40".
+_MONEY_ONLY_RE = re.compile(
+    r"^(?:[$€£]\s*\d[\d.,]*|\d[\d.,]*\s*[$€£€£]"
+    r"|\d[\d.,]*\s*(?:usd|usdt|eur|euros?|dollars?|bucks?|gbp|pounds?))$",
+    re.IGNORECASE,
+)
+# Bare short number standing alone ("50" from math-bold "𝟱𝟬" after NFKC).
+_BARE_SHORT_NUMBER_RE = re.compile(r"^\d{1,4}(?:[.,]\d+)?$")
+# AI-rewritten budget sentences that embed the source's number ("Budget is set
+# at 60 dollars for this specific requirement.").
+_BUDGET_SENTENCE_RE = re.compile(
+    r"\b(?:budget|spend|spending|willing to pay|paying)\b.*?"
+    r"\b(?:dollars?|usd|usdt|eur|euros?|[$€£]\s*\d|\d\s*[$€£])\b",
+    re.IGNORECASE,
+)
+# Short lines carrying a compact currency amount ("USA   50$").
+_SHORT_CURRENCY_LINE_RE = re.compile(
+    r"\d\s*[$€£]|\d[\d.,]*\s*(?:usd|usdt|eur|dollars?|euros?)\b", re.IGNORECASE
+)
+# Mid-line money blobs like "35$_USDT" / "50$" that follow platform words.
+_PRICE_BLOB_RE = re.compile(r"\b\d[\d.,]*\s*[$€£][A-Za-z_]*\b")
+
+# Fullwidth (０-９) and mathematical (𝟬-𝟵) digits: styled-digit pricing like
+# "𝟱𝟬" / "𝟭𝟮 US" is a strong source-price signal in these channels.
+_STYLED_DIGIT_RE = re.compile(r"[\uFF10-\uFF19\U0001D7CE-\U0001D7FF]")
+
+
+def _nfkc(text: str) -> str:
+    """Normalize fullwidth / math-bold digits to ASCII for reliable matching."""
+    return unicodedata.normalize("NFKC", text or "")
+
+
+def _is_styled_digit_price(raw: str, probe: str) -> bool:
+    """True when a line is essentially styled-digits-only (\"𝟱𝟬\", \"𝟭𝟮 US\")."""
+    if not _STYLED_DIGIT_RE.search(raw or ""):
+        return False
+    remainder = re.sub(r"\s+", " ", re.sub(r"[0-9]", "", probe)).strip(" \t.!@:;,.-")
+    return len(remainder) <= 4
+
+
+def _is_leaky_line(raw: str, probe: str, low: str) -> bool:
+    """True when a body line must not ship (leaked price, @handle, pure DM).
+
+    ``probe`` is the NFKC-folded, emoji-stripped, single-spaced line; ``raw``
+    is the original. Real email addresses are treated as content so an account
+    id like ``user@example.com`` is never dropped as a handle.
+    """
+    if _EMAIL_RE.search(low):
+        return False
+    if _is_styled_digit_price(raw, probe):
+        return True
+    if _HANDLE_RE.search(probe):
+        return True
+    if _DM_ONLY_RE.match(low):
+        return True
+    if _PRICE_KEYWORD_RE.match(low):
+        return True
+    if _MONEY_ONLY_RE.match(low):
+        return True
+    if _BARE_SHORT_NUMBER_RE.match(low):
+        return True
+    if _BUDGET_SENTENCE_RE.search(low):
+        return True
+    if _SHORT_CURRENCY_LINE_RE.search(low) and len(low) <= 24:
+        return True
+    return False
+
+
+def sanitize_body_lines(content_lines, max_lines: int = 40) -> List[str]:
+    """Drop leaked source prices, supplier @handles and pure DM lines from the
+    body, and erase mid-line money blobs. Keeps the original text of every
+    line that survives so the AI's wording stays intact."""
+    kept: List[str] = []
+    for raw_ln in content_lines or []:
+        ln = (raw_ln or "").strip()
+        if not ln:
+            continue
+        probe = re.sub(
+            r"\s+", " ", emoji.replace_emoji(_nfkc(ln), replace=" ")
+        ).strip()
+        if not probe:
+            continue
+        if _is_leaky_line(ln, probe, probe.lower()):
+            continue
+        stripped = _PRICE_BLOB_RE.sub("", ln)
+        stripped = re.sub(r"\s{2,}", " ", stripped).strip()
+        if stripped:
+            kept.append(stripped)
+        if len(kept) >= max_lines:
+            break
+    return kept
+
+
+def prepare_body(
+    content_lines: List[str], raw_text: str = ""
+) -> Tuple[List[str], bool]:
+    """Sanitize the body and decide whether it is safe to AUTO-publish.
+
+    Returns (lines, ok). ``ok`` is False when the cleaned body is too thin to
+    represent a real listing (fewer than two lines, or nothing substantive) —
+    such messages must go to admin approval instead of the auto-publish path.
+    """
+    lines = sanitize_body_lines(content_lines)
+    ok = len(lines) >= 2 and any(len(ln.strip()) >= 8 for ln in lines)
+    return lines, ok
+
+
 def build_ai_message(
     content_lines: List[str],
     our_price: Optional[float],
@@ -242,6 +374,7 @@ def build_ai_message(
     has_price: Optional[bool] = None,
     listing_seed: int = 0,
     post_number: Optional[int] = None,
+    sanitize_body: bool = True,
 ) -> Tuple[str, list]:
     """
     Build the final formatted post from AI-provided clean content lines.
@@ -258,9 +391,14 @@ def build_ai_message(
     ``header_word`` when it is buyer-framed (see sanitize_buyer_header), else a
     buyer default — "WTB ✦ DM FAST" with a price, "WANTED" without.
 
-    Returns (text, entities) — pass both to Telethon send_message().
+    Returns (text, entities) — pass both to Telethon send_message(). When
+    ``sanitize_body`` is False the body is wrapped verbatim (used only to
+    reconstruct what was actually published, for /repair diffing).
     """
-    lines = [ln.strip() for ln in content_lines if ln and ln.strip()][:40]
+    if sanitize_body:
+        lines = sanitize_body_lines(content_lines)[:40]
+    else:
+        lines = [ln.strip() for ln in content_lines if ln and ln.strip()][:40]
     if not lines:
         lines = ["Available"]
 
