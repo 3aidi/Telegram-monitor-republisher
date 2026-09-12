@@ -177,20 +177,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             """
         )
 
-        # 6. Custom emoji role mapping (role -> document_id) from user's emoji packs
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS emoji_config (
-                role TEXT PRIMARY KEY,
-                emoji_char TEXT NOT NULL,
-                document_id INTEGER NOT NULL,
-                source TEXT,
-                updated_at TEXT NOT NULL
-            );
-            """
-        )
-
-        # 7. Skip log — every filtered-away message with its reason so the daily
+        # 6. Skip log — every filtered-away message with its reason so the daily
         #    report can break skipped stats down per reason and per supplier.
         cursor.execute(
             """
@@ -206,7 +193,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             """
         )
 
-        # 8. AI analysis cache — fingerprint-keyed, so the same listing content
+        # 7. AI analysis cache — fingerprint-keyed, so the same listing content
         #    is never re-analyzed (edits, restarts, re-deliveries, rephrase sweep).
         cursor.execute(
             """
@@ -1745,42 +1732,6 @@ def validate_env_seed_config(
                 "channel/group)."
             )
     return None
-
-
-# ---------------------------------------------------------------------------
-# Custom emoji config — role -> document_id mapping from the user's emoji packs
-# ---------------------------------------------------------------------------
-def set_emoji_config(
-    role: str,
-    emoji_char: str,
-    document_id: int,
-    source: Optional[str] = None,
-    db_path: Optional[str] = None,
-) -> None:
-    """Upsert the document_id used for a message role (fire/lightning/star/...)."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    with db_session(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO emoji_config (role, emoji_char, document_id, source, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(role) DO UPDATE SET
-                emoji_char = excluded.emoji_char,
-                document_id = excluded.document_id,
-                source = excluded.source,
-                updated_at = excluded.updated_at
-            """,
-            (role, emoji_char, int(document_id), source, now_iso),
-        )
-
-
-def get_emoji_configs(db_path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    """Return {role: {role, emoji_char, document_id, source}} for all configured emoji."""
-    with db_session(db_path) as conn:
-        rows = conn.execute(
-            "SELECT role, emoji_char, document_id, source FROM emoji_config"
-        ).fetchall()
-        return {row["role"]: dict(row) for row in rows}
 
 
 # ---------------------------------------------------------------------------

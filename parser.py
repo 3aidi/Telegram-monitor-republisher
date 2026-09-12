@@ -5,29 +5,25 @@ extraction and rewriting. This module only formats the final post shell and
 provides a small price parser used by the admin edit/preview flow.
 """
 
-import os
 import re
-import time
 import unicodedata
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 import emoji
 
-import db
+import countries
 
 # ---------------------------------------------------------------------------
-# Custom emoji document IDs from the user's premium packs.
-# SkullEmoji pack  : https://t.me/addemoji/SkullEmoji
-# SlimeFontEmoji   : https://t.me/addemoji/SlimeFontEmoji
-# LedScreenEmoji   : https://t.me/addemoji/LedScreenEmoji
+# Fixed custom-emoji document IDs (hardcoded, never fetched at runtime).
+# Countries use the centralized mapping in countries.COUNTRY_EMOJI.
 # ---------------------------------------------------------------------------
 # Used as header decoration for the header line (buyer-framed, e.g. WTB)
-CE_FIRE       = 5375452661036358740   # 🔥  SkullEmoji
+CE_FIRE       = 5375452661036358740   # 🔥 header
 # Used as header decoration for the header line
-CE_LIGHTNING  = 5404652296845936873   # ⚡  LedScreenEmoji
+CE_LIGHTNING  = 5404652296845936873   # ⚡ header
 # Used on price line
-CE_MONEYBAG   = 5384105916331202592   # 🤑  SkullEmoji
+CE_MONEYBAG   = 5384105916331202592   # 🤑 price
 # Used on order/contact line
-CE_PHONE      = 5231197925178089666   # 📞  SkullEmoji
+CE_PHONE      = 5231197925178089666   # 📞 contact
 
 
 # Placeholder characters that get visually replaced by the entities above
@@ -35,47 +31,6 @@ PH_FIRE   = "🔥"
 PH_LIGHT  = "⚡"
 PH_PRICE  = "🤑"
 PH_PHONE  = "📞"
-
-# Message roles -> (default document_id, placeholder char, expected emoji).
-# The admin bot can override any role by sending emoji-pack links
-# (/addemoji); the overrides are stored in db.emoji_config and hot-picked up.
-EMOJI_ROLES: Dict[str, Tuple[int, str, str]] = {
-    "fire":      (CE_FIRE,      PH_FIRE,  "🔥"),
-    "lightning": (CE_LIGHTNING, PH_LIGHT, "⚡"),
-    "moneybag":  (CE_MONEYBAG,  PH_PRICE, "🤑"),
-    "phone":     (CE_PHONE,     PH_PHONE, "📞"),
-}
-
-# Override cache: role -> document_id. Falls back to the hardcoded defaults.
-_EMOJI_OVERRIDES: Optional[Dict[str, int]] = None
-_EMOJI_CACHE_AT = 0.0
-_EMOJI_TTL = 30.0
-# Allow tests / alternate DBs to point the emoji lookups at a specific file.
-EMOJI_DB_PATH: Optional[str] = None
-
-
-def reload_emoji_config() -> None:
-    """Drop the cached overrides so the next message build re-reads the DB."""
-    global _EMOJI_OVERRIDES, _EMOJI_CACHE_AT
-    _EMOJI_OVERRIDES = None
-    _EMOJI_CACHE_AT = 0.0
-
-
-def _ce(role: str) -> int:
-    """Document id for a role, using the DB override if set, else the default."""
-    global _EMOJI_OVERRIDES, _EMOJI_CACHE_AT
-    now = time.time()
-    if _EMOJI_OVERRIDES is None or now - _EMOJI_CACHE_AT > _EMOJI_TTL:
-        try:
-            path = EMOJI_DB_PATH or db.DEFAULT_DB_PATH
-            cfg: Dict[str, dict] = {}
-            if os.path.exists(path):
-                cfg = db.get_emoji_configs(db_path=EMOJI_DB_PATH)
-            _EMOJI_OVERRIDES = {r: cfg[r]["document_id"] for r in cfg}
-        except Exception:
-            _EMOJI_OVERRIDES = {}
-        _EMOJI_CACHE_AT = now
-    return _EMOJI_OVERRIDES.get(role, EMOJI_ROLES[role][0])
 
 
 def _make_custom_emoji_entity(offset: int, document_id: int, placeholder: str):
@@ -375,21 +330,34 @@ def build_ai_message(
     listing_seed: int = 0,
     post_number: Optional[int] = None,
     sanitize_body: bool = True,
+    source_text: Optional[str] = None,
 ) -> Tuple[str, list]:
     """
     Build the final formatted post from AI-provided clean content lines.
 
     The AI already produced clean, emoji-free body text; this function only
-    wraps it in the premium emoji shell (header / price / contact). Emoji are
-    allowed ONLY in the header and the footer (price/contact lines) — the body
-    is deliberately kept emoji-free. The header emoji rotates between the fire
-    and lightning pools, seeded by listing_seed so the admin preview always
-    matches the post that gets published. When ``post_number`` is given, a
-    small "Post #N" banner is prepended so each post is individually referenceable.
+    wraps it in the fixed emoji shell (header / country lines / footer). Emoji
+    are allowed ONLY in the header, the country lines, and the footer
+    (price/contact lines) — the body is deliberately kept emoji-free. The
+    header emoji rotates between the fire and lightning pools, seeded by
+    listing_seed so the admin preview always matches the post that gets
+    published. When ``post_number`` is given, a small "Post #N" banner is
+    prepended so each post is individually referenceable.
 
     The channel always reads as the BUYER: the header label is the AI-suggested
-    ``header_word`` when it is buyer-framed (see sanitize_buyer_header), else a
-    buyer default — "WTB ✦ DM FAST" with a price, "WANTED" without.
+    ``header_word`` when it is buyer-framed (see sanitize_buyer_header), else the
+    buyer default "WTB ✦ DM FAST". The footer always carries the static
+    "Price: DM" line — prices are never computed, rendered, or used in
+    publishing decisions here. ``our_price`` / ``has_price`` are accepted for
+    call-site compatibility but are deliberately ignored.
+
+    Every country mentioned in ``source_text`` (the raw incoming message) is
+    emitted on its own line — "Country ·" — with the fixed custom emoji from
+    countries.COUNTRY_EMOJI, in first-appearance order, deduplicated. The line
+    shows the country name exactly as the message wrote it (the first spelling
+    for repeats, so "USA and US" renders "USA"). No Unicode flag is ever used
+    and nothing is fetched at runtime. Callers without raw text can omit
+    ``source_text``; no country lines are then added.
 
     Returns (text, entities) — pass both to Telethon send_message(). When
     ``sanitize_body`` is False the body is wrapped verbatim (used only to
@@ -402,20 +370,11 @@ def build_ai_message(
     if not lines:
         lines = ["Available"]
 
-    has_price = (
-        bool(our_price is not None and our_price > 0)
-        if has_price is None
-        else bool(has_price)
-    )
-
     platform_display = platform.upper() if platform else "ACCOUNT"
-    header_word = sanitize_buyer_header(header_word) or (
-        "WTB ✦ DM FAST" if has_price else "WANTED"
-    )
+    header_word = sanitize_buyer_header(header_word) or "WTB ✦ DM FAST"
     # Header emoji rotates between fire and lightning so posts don't all share
     # one fixed decoration. Seeded deterministically per listing id (preview == published).
-    header_pool = ("fire", "lightning")
-    header_emoji = header_pool[listing_seed % len(header_pool)]
+    header_doc = CE_FIRE if listing_seed % 2 == 0 else CE_LIGHTNING
 
     parts: List[str] = []
     entities: list = []
@@ -429,7 +388,7 @@ def build_ai_message(
 
     # ── Header line
     header_text, header_entities = _build_header(
-        platform_display, header_word, _ce(header_emoji), _ce(header_emoji)
+        platform_display, header_word, header_doc, header_doc
     )
     parts.append(header_text)
     entities.extend(header_entities)
@@ -446,16 +405,24 @@ def build_ai_message(
         parts.append(line_str)
         cursor += _utf16_len(line_str)
 
+    # ── Country lines (fixed custom emoji per country, first-appearance order)
+    for name in countries.detect_countries(source_text or ""):
+        flag_line = f"{name} {countries.PH_FLAG}\n"
+        entities.append(
+            _make_custom_emoji_entity(cursor, countries.emoji_for(name), countries.PH_FLAG)
+        )
+        parts.append(flag_line)
+        cursor += _utf16_len(flag_line)
+
     # ── Divider
     parts.append(divider)
     cursor += _utf16_len(divider)
 
-    # ── Price line
-    if has_price:
-        price_str = f"{PH_PRICE} Price  : ${_format_price(our_price)}\n"
-        entities.append(_make_custom_emoji_entity(cursor, _ce("moneybag"), PH_PRICE))
-        parts.append(price_str)
-        cursor += _utf16_len(price_str)
+    # ── Price line (always the static "Price: DM" footer — prices never render)
+    price_str = f"{PH_PRICE} Price  : DM\n"
+    entities.append(_make_custom_emoji_entity(cursor, CE_MONEYBAG, PH_PRICE))
+    parts.append(price_str)
+    cursor += _utf16_len(price_str)
 
     # ── Contact line
     if contact_username:
@@ -463,7 +430,7 @@ def build_ai_message(
         if clean_contact:
             contact_placeholder = PH_PHONE
             contact_str = f"{contact_placeholder} Order  : @{clean_contact}"
-            entities.append(_make_custom_emoji_entity(cursor, _ce("phone"), contact_placeholder))
+            entities.append(_make_custom_emoji_entity(cursor, CE_PHONE, contact_placeholder))
             parts.append(contact_str)
             cursor += _utf16_len(contact_str)
 

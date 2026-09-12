@@ -8,6 +8,7 @@ import unittest
 import emoji
 
 import ai_rephraser
+import countries
 import db
 import filters
 import parser
@@ -89,17 +90,23 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(parser.apply_pricing_rule(7.0, 0.75), 6)
         self.assertEqual(parser.apply_pricing_rule(50.0, 0.75), 38)
 
-    def test_price_multiplier_applies_to_all_intents(self):
-        """The multiplier is applied to buy, sell, and neutral prices alike —
-        auto-publish is buy-only, so buy prices MUST be repriced from source
-        (source $60 must become $45 at 0.75x)."""
-        import main as main_mod
-        self.assertEqual(main_mod._price_for_dispatch(60, 0.75, "buy"), 45)
-        self.assertEqual(main_mod._price_for_dispatch(60.0, 0.75, "buy"), 45)
-        self.assertEqual(main_mod._price_for_dispatch(13.5, 0.75, "buy"), 11)
-        self.assertEqual(main_mod._price_for_dispatch(100.0, 0.75, "sell"), 75)
-        self.assertEqual(main_mod._price_for_dispatch(130.0, 1.0, "neutral"), 130)
-        self.assertEqual(main_mod._price_for_dispatch(None, 0.75, "buy"), None)
+    def test_build_ai_message_never_emits_numeric_price(self):
+        """Prices must NEVER reach rendered output: every post carries the
+        static '🤑 Price  : DM' footer and the frozen 'WTB ✦ DM FAST' header no
+        matter what price value was supplied."""
+        import re
+        for price in (None, 0, 0.0, 38, 12.5, 98, 999999, 1e9):
+            msg, _ = parser.build_ai_message(
+                content_lines=["Tuyo full access"],
+                our_price=price,
+                platform="tuyo",
+                contact_username="@buyer",
+                intent="sell",
+            )
+            self.assertIn("TUYO WTB ✦ DM FAST", msg, f"header default broken for {price}")
+            self.assertIn("🤑 Price  : DM", msg, f"static price footer missing for {price}")
+            leaked = re.findall(r"\$\s?\d|€|\b(?:USD|USDT|EUR)\b", msg)
+            self.assertEqual(leaked, [], f"numeric price leaked in output for {price}: {msg!r}")
 
     def test_price_formatting(self):
         """Whole-number prices render without '.0'; decimals preserved."""
@@ -114,8 +121,9 @@ class TestMonitorSystem(unittest.TestCase):
             contact_username="@x",
             intent="sell",
         )
-        self.assertIn("Price  : $38", msg)
-        self.assertNotIn("$38.0", msg)
+        self.assertIn("🤑 Price  : DM", msg)
+        self.assertNotIn("$38", msg)
+        self.assertNotIn("€", msg)
 
     def test_custom_emoji_entity_offsets_valid(self):
         """Every entity must point inside the final text, ascending and non-overlapping."""
@@ -136,6 +144,133 @@ class TestMonitorSystem(unittest.TestCase):
         # Header: second custom emoji sits right after "🔥 NETFLIX WTB ✦ DM FAST "
         header_prefix = parser.PH_FIRE + " NETFLIX WTB ✦ DM FAST "
         self.assertEqual(entities[1].offset, len(header_prefix.encode("utf-16-le")) // 2)
+
+    # -------------------------------------------------------------
+    # COUNTRY -> CUSTOM EMOJI TESTS
+    # -------------------------------------------------------------
+    def test_country_emoji_map_has_fixed_ids(self):
+        """The 4 ground-truth mappings supplied by the user are exact."""
+        self.assertEqual(countries.emoji_for("Egypt"), 5293992082212409502)
+        self.assertEqual(countries.emoji_for("United States"), 5294244076533600593)
+        self.assertEqual(countries.emoji_for("United Kingdom"), 5293993521026453119)
+        self.assertEqual(countries.emoji_for("Saudi Arabia"), 5294163983983463099)
+
+    def test_detect_countries_aliases_dedupe_and_order(self):
+        """Names are returned as written, deduped per country, first spelling wins."""
+        text = "USA then Egypt, and again Egypt, finally KSA and the UK"
+        self.assertEqual(countries.detect_countries(text),
+                         ["USA", "Egypt", "KSA", "UK"])
+        self.assertEqual(countries.detect_countries("America / UK / Britain"),
+                         ["America", "UK"])
+        self.assertEqual(countries.detect_countries("south korea vs north korean"),
+                         ["south korea"])
+        # Repeated countries collapse to the first spelling.
+        self.assertEqual(countries.detect_countries("USA and US"), ["USA"])
+        self.assertEqual(countries.detect_countries("UK and Britain"), ["UK"])
+        # Leading article trimmed for display.
+        self.assertEqual(countries.detect_countries("ship from THE USA and the uk"),
+                         ["USA", "uk"])
+        self.assertEqual(countries.detect_countries(""), [])
+        self.assertEqual(countries.detect_countries(None), [])
+
+    def test_detect_countries_whole_token_only(self):
+        """Two-letter aliases must not fire inside other words."""
+        self.assertEqual(countries.detect_countries("just some better used token"), [])
+        self.assertEqual(countries.detect_countries("private request"), [])
+
+    def test_detect_countries_skips_urls_and_handles(self):
+        self.assertEqual(
+            countries.detect_countries("https://ru.example.com/login @us t.me/uk"), []
+        )
+        self.assertEqual(
+            countries.detect_countries("Orders from Russia (https://x.ru/account @us)"),
+            ["Russia"],
+        )
+
+    def test_detect_countries_partial_name_compounds(self):
+        """Different territories that contain a mapped country word must not match."""
+        self.assertEqual(countries.detect_countries("cover South Sudan only"), [])
+        self.assertEqual(countries.detect_countries("DR Congo seller"), [])
+        self.assertEqual(countries.detect_countries("Northern Cyprus HQs"), [])
+
+    def test_detect_countries_own_flags_for_home_nations(self):
+        self.assertEqual(countries.detect_countries("England, Scotland, Wales"),
+                         ["England", "Scotland", "Wales"])
+        self.assertEqual(countries.emoji_for("England"), 5294410107084365278)
+        self.assertEqual(countries.emoji_for("Scotland"), 5294434665707368018)
+        self.assertEqual(countries.emoji_for("Wales"), 5294139949346476093)
+
+    def test_detect_countries_guinea_bissau_mapped_grenada_not(self):
+        """Row 74 is Guinea-Bissau (its own line); Grenada is not in the list."""
+        self.assertEqual(countries.detect_countries("Guinea-Bissau here"),
+                         ["Guinea-Bissau"])
+        self.assertEqual(countries.emoji_for("Guinea-Bissau"), 5294409819321550432)
+        self.assertEqual(countries.detect_countries("ship to Grenada"), [])
+        with self.assertRaises(KeyError):
+            countries.emoji_for("Grenada")
+
+    def test_build_ai_message_emits_country_lines(self):
+        """Each country gets its own line, showing the name as written."""
+        msg, entities = parser.build_ai_message(
+            content_lines=["Available"],
+            our_price=None,
+            platform="netflix",
+            contact_username="@buy",
+            intent="sell",
+            source_text="USA\nEgypt\nSaudi Arabia",
+        )
+        self.assertIn("USA ·", msg)
+        self.assertIn("Egypt ·", msg)
+        self.assertIn("Saudi Arabia ·", msg)
+        self.assertNotIn("United States", msg)
+        self.assertNotIn("United Kingdom", msg)
+        self.assertNotIn("🇺🇸", msg)
+        self.assertNotIn("🇪🇬", msg)
+        self.assertNotIn("🇸🇦", msg)
+        # Three country lines, each ending with the non-flag placeholder.
+        self.assertEqual(msg.count(countries.PH_FLAG), 3)
+        for line in msg.split("\n"):
+            if countries.PH_FLAG in line:
+                name = line.split(" ")[0]
+                self.assertGreater(msg.index(line), msg.index("Available"),
+                                   "country lines must come after the body")
+
+        celeb_ids = {e.document_id for e in entities}
+        for name in ("USA", "Egypt", "Saudi Arabia"):
+            self.assertIn(countries.emoji_for(name), celeb_ids,
+                          f"{name} custom emoji must be attached")
+        # Still a valid, monotonic entity layout (offsets ascend, inside text).
+        units = len(msg.encode("utf-16-le")) // 2
+        prev = -1
+        for e in entities:
+            self.assertGreater(e.offset, prev)
+            self.assertLessEqual(e.offset + e.length, units)
+            prev = e.offset
+
+    def test_build_ai_message_no_countries_when_no_source_text(self):
+        msg, entities = parser.build_ai_message(
+            content_lines=["Plain line"],
+            our_price=None,
+            platform="netflix",
+            intent="sell",
+        )
+        self.assertNotIn(countries.PH_FLAG, msg)
+        self.assertNotIn("United States", msg)
+        self.assertTrue(all(not hasattr(e, "document_id")
+                            or e.document_id not in countries.COUNTRY_EMOJI.values()
+                            for e in entities))
+
+    def test_build_ai_message_skips_unmapped_countries(self):
+        msg, entities = parser.build_ai_message(
+            content_lines=["Available"],
+            our_price=None,
+            platform="netflix",
+            intent="sell",
+            source_text="Applicable in DR Congo and South Sudan only",
+        )
+        self.assertNotIn("DR Congo", msg)
+        self.assertNotIn("South Sudan", msg)
+        self.assertNotIn(countries.PH_FLAG, msg)
 
     # -------------------------------------------------------------
     # DATABASE TESTS
@@ -408,7 +543,8 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("Current content", prompt)
         self.assertIn("> KYC CURVE PAY", prompt)
         self.assertIn("> ANY EU", prompt)
-        self.assertIn("`$12.5`", prompt)
+        self.assertNotIn("$", prompt)
+        self.assertNotIn("12.5", prompt)
         self.assertIn("send back the FULL body", prompt)
 
     def test_edit_prompt_prior_draft_wins_and_no_price_note(self):
@@ -424,7 +560,8 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("> MY EDITED LINE", prompt)
         self.assertIn("> CHANGED", prompt)
         self.assertNotIn("OLD LINE FROM AI", prompt)
-        self.assertIn("not set yet", prompt)
+        self.assertNotIn("$", prompt)
+        self.assertNotIn("not set yet", prompt)
 
     def test_edit_prompt_falls_back_to_raw_text_and_empty(self):
         import admin_bot
@@ -1161,51 +1298,6 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(newest42["detail"], "5001")
         self.assertEqual(newest43["detail"], "")
 
-    def test_emoji_config_roundtrip(self):
-        db.set_emoji_config("fire", "🔥", 1234567890, source="TestPack", db_path=TEST_DB)
-        cfg = db.get_emoji_configs(db_path=TEST_DB)
-        self.assertIn("fire", cfg)
-        self.assertEqual(cfg["fire"]["document_id"], 1234567890)
-        self.assertEqual(cfg["fire"]["source"], "TestPack")
-        db.set_emoji_config("fire", "🔥", 987654321, source="TestPack2", db_path=TEST_DB)
-        cfg = db.get_emoji_configs(db_path=TEST_DB)
-        self.assertEqual(cfg["fire"]["document_id"], 987654321)
-
-    def test_emoji_override_used_in_header(self):
-        original_path = parser.EMOJI_DB_PATH
-        parser.EMOJI_DB_PATH = TEST_DB
-        try:
-            db.set_emoji_config("fire", "🔥", 424242, source="PackX", db_path=TEST_DB)
-            parser.reload_emoji_config()
-            msg, entities = parser.build_ai_message(
-                content_lines=["Netflix 1 month"],
-                our_price=30,
-                platform="netflix",
-                contact_username="@buy",
-                intent="sell",
-            )
-            self.assertEqual(entities[0].document_id, 424242,
-                             "header emoji should use the DB override")
-            self.assertIn(parser.PH_FIRE, msg)  # placeholder text unchanged
-            # Falling back: remove the override -> default document id is used
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute("DELETE FROM emoji_config WHERE role = 'fire'")
-            conn.commit()
-            conn.close()
-            parser.reload_emoji_config()
-            msg2, entities2 = parser.build_ai_message(
-                content_lines=["Netflix 1 month"],
-                our_price=30,
-                platform="netflix",
-                contact_username="@buy",
-                intent="sell",
-            )
-            self.assertEqual(entities2[0].document_id, parser.CE_FIRE,
-                             "default id should be used when no override exists")
-        finally:
-            parser.EMOJI_DB_PATH = original_path
-            parser.reload_emoji_config()
-
     # -------------------------------------------------------------
     # AI REPHRASER TESTS
     # -------------------------------------------------------------
@@ -1301,7 +1393,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("\nSpain region\n", out)
         self.assertIn("\nIncludes Tuyo account\n", out)
         self.assertIn("\nID card + proof of address\n", out)
-        self.assertIn("🤑 Price  : $38", out)
+        self.assertIn("🤑 Price  : DM", out)
         self.assertIn("📞 Order  : @buyer", out)
         # Body must be emoji-free: no bullets, no fire/lightning/star inside.
         self.assertNotIn("⭐", out)
@@ -1320,8 +1412,8 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["line"], our_price=30, platform="x", contact_username="@b", intent="sell",
             listing_seed=0,
         )
-        self.assertEqual(e0[0].document_id, parser._ce("fire"))
-        self.assertEqual(e1[0].document_id, parser._ce("lightning"))
+        self.assertEqual(e0[0].document_id, parser.CE_FIRE)
+        self.assertEqual(e1[0].document_id, parser.CE_LIGHTNING)
         self.assertEqual(e0b[0].document_id, e0[0].document_id,
                          "same seed must pick the same emoji")
 
@@ -1421,19 +1513,22 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("header", ai_rephraser.ANALYZE_PROMPT)
 
     def test_build_ai_message_no_price_variant(self):
+        """Even with no price the static 'Price: DM' footer and the frozen buyer
+        header are present — the variant used to show 'WANTED' and skip Price."""
         out, _ = parser.build_ai_message(
             content_lines=["Tuyo full access"], our_price=None,
             platform="tuyo", contact_username="@buyer", intent="neutral",
         )
-        self.assertIn("TUYO WANTED", out)
-        self.assertNotIn("Price", out)
+        self.assertIn("TUYO WTB ✦ DM FAST", out)
+        self.assertIn("🤑 Price  : DM", out)
 
     def test_build_ai_message_knows_no_price_passed(self):
-        """When our_price is 0/None the price line is skipped."""
+        """our_price=0 still renders the static 'Price: DM' footer, never '$0'."""
         out, _ = parser.build_ai_message(
             content_lines=["Line"], our_price=0,
             platform="x", contact_username="@b", intent="sell",
         )
+        self.assertIn("🤑 Price  : DM", out)
         self.assertNotIn("$0", out)
 
     # -------------------------------------------------------------
@@ -1678,14 +1773,15 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIsNone(filters.detect_payment_proof("   "))
 
     def test_has_clear_listing_signal(self):
-        self.assertTrue(filters.has_clear_listing_signal("WTB Chatgpt PRICE 30$", 30))
-        self.assertTrue(filters.has_clear_listing_signal("KYC netflix 200$", 150))
-        self.assertTrue(filters.has_clear_listing_signal("DM @buyer 40", 40))
+        self.assertTrue(filters.has_clear_listing_signal("WTB Chatgpt PRICE 30$"))
+        self.assertTrue(filters.has_clear_listing_signal("KYC netflix 200$"))
+        self.assertTrue(filters.has_clear_listing_signal("DM @buyer 40"))
+        # A platform / listing word alone is a clear signal — price not required.
+        self.assertTrue(filters.has_clear_listing_signal("netflix kyc available"))
+        # Price-only text carries no listing signal -> not clear.
+        self.assertFalse(filters.has_clear_listing_signal("500$ USD 40 EUR pay whatever"))
         # Money present but no concrete platform / listing signal -> not clear.
-        self.assertFalse(filters.has_clear_listing_signal("GOOD SELLER", 50))
-        # No price -> never clear, even with a platform word.
-        self.assertFalse(filters.has_clear_listing_signal("netflix kyc available", None))
-        self.assertFalse(filters.has_clear_listing_signal("netflix kyc available", 0))
+        self.assertFalse(filters.has_clear_listing_signal("GOOD SELLER"))
 
     # -------------------------------------------------------------
     # SKIP REVIEW / DIGEST TESTS

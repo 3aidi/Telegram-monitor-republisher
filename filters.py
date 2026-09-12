@@ -109,6 +109,11 @@ _LISTING_SIGNALS = [
     ),
 ]
 
+# Concrete platform/listing signals ONLY (no price patterns). Used by the
+# deterministic fallback gate: a listing can auto-publish on its own merit
+# (platform keyword, WTS/WTB wording, @contact, URL) — price never matters.
+_PLATFORM_OR_LISTING_SIGNALS = _LISTING_SIGNALS[2:]
+
 
 def obvious_non_listing(text: str, max_len: int = 300) -> Optional[str]:
     """Detect clearly non-listing chatter that would otherwise burn an AI call.
@@ -214,17 +219,16 @@ def detect_payment_proof(text: str) -> Optional[str]:
     return None
 
 
-def has_clear_listing_signal(text: str, price: Optional[float] = None) -> bool:
+def has_clear_listing_signal(text: str) -> bool:
     """Minimum bar the deterministic (AI-down) fallback demands before it is
-    allowed to auto-publish: a real price AND at least one concrete listing
-    signal (platform keyword, WTS/WTB wording, @contact, URL). Everything below
-    that bar routes to manual review instead — no blind auto-publishes."""
+    allowed to auto-publish: at least one concrete listing signal (platform
+    keyword, WTS/WTB wording, @contact, URL). Prices are deliberately NOT
+    signals — pricing never influences publishing decisions. Everything below
+    the bar routes to manual review instead — no blind auto-publishes."""
     t = (text or "").strip()
     if not t:
         return False
-    if price is None or price <= 0:
-        return False
-    for signal in _LISTING_SIGNALS:
+    for signal in _PLATFORM_OR_LISTING_SIGNALS:
         if signal.search(t):
             return True
     return False

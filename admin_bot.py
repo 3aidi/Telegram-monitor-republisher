@@ -61,26 +61,17 @@ async def send_approval_prompt(
     """Send a listing to the admin with inline Approve / Reject buttons."""
     listing_id = listing["id"]
     platform = listing.get("platform_name") or listing.get("game_name") or "Unknown"
-    orig_p = listing.get("original_price")
-    our_p = listing.get("our_price")
     review_reason = listing.get("_review_reason", "")
     ai_preview = (listing.get("clean_text") or "")[:400]
     raw_preview = (listing.get("raw_text") or "")[:400]
 
     reason_label = {
-        "no_price_dm_signal": "DM/Contact Signal (No Price)",
         "unknown_platform": "Platform Not Identified",
         "ai_unavailable": "AI Unavailable — Manual Review",
         "ai_blocked_review": "⚠️ AI Flagged Content — Verify",
-        "price_out_of_bounds": "⚠️ Suspicious Price — Verify",
     }.get(review_reason, "Manual Review")
     header = f"📬 {reason_label} — Listing #{listing_id}"
-    if orig_p is not None and our_p is not None:
-        price_info = f"Original: ${parser._format_price(orig_p)}  →  Ours: ${parser._format_price(our_p)}"
-    elif orig_p is not None:
-        price_info = f"Price: ${parser._format_price(orig_p)}"
-    else:
-        price_info = "Price: not listed"
+    price_info = "Price : DM"
 
     platform_display = platform.title() if platform and platform != "Unknown" else "—"
 
@@ -162,15 +153,13 @@ async def send_published_alert(
     listing_id = listing["id"]
     post_number = listing.get("post_number")
     platform = (listing.get("platform_name") or listing.get("game_name") or "")[:60]
-    price = listing.get("our_price")
-    price_s = ("$" + str(price).rstrip("0").rstrip(".")) if price else "—"
     post_disp = f"#{post_number}" if post_number is not None else f"Listing #{listing_id}"
 
     text = (
         f"✅ **Auto-Published — Post {post_disp}**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{platform.title() if platform else 'Platform ?'}\n"
-        f"Price    : {price_s}\n"
+        f"Price    : DM\n"
         f"Supplier : {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         + (f"Find it later with `/post {post_number}`." if post_number is not None else "")
@@ -191,12 +180,9 @@ async def send_published_alert(
 def _format_listing(n: int, l: dict) -> str:
     """Single-line listing summary for /pending, /failed, /preview lists."""
     platform = l.get("platform_name") or l.get("game_name") or "?"
-    orig_p = l.get("original_price")
-    our_p = l.get("our_price")
-    price = f"${our_p}" if our_p is not None else ("$—" if orig_p is None else f"orig ${orig_p}")
     created = (l.get("created_at") or "")[:16].replace("T", " ")
     return (
-        f"{n}. **#{l['id']}** | {platform} | {price} | "
+        f"{n}. **#{l['id']}** | {platform} | DM | "
         f"{_pretty_source(l.get('supplier_username'), l.get('supplier_display_name'))}\n"
         f"   Status: `{l.get('status')}` | {created}"
     )
@@ -210,32 +196,20 @@ async def _build_preview_text(listing: dict) -> str:
     """
     content_text = listing.get("clean_text") or listing.get("raw_text") or ""
     content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
-    our_price = listing.get("our_price")
     platform = listing.get("platform_name") or listing.get("game_name")
     intent = listing.get("intent") or "neutral"
 
-    if our_price and our_price > 0:
-        preview_text, _ = parser.build_ai_message(
-            content_lines=content_lines,
-            our_price=our_price,
-            platform=platform,
-            contact_username=CONTACT_USERNAME,
-            intent=intent,
-            header_word=listing.get("header_word"),
-            listing_seed=listing["id"],
-            post_number=listing.get("post_number"),
-        )
-    else:
-        preview_text, _ = parser.build_ai_message(
-            content_lines=content_lines,
-            our_price=None,
-            platform=platform,
-            contact_username=CONTACT_USERNAME,
-            intent=intent,
-            header_word=listing.get("header_word"),
-            listing_seed=listing["id"],
-            post_number=listing.get("post_number"),
-        )
+    preview_text, _ = parser.build_ai_message(
+        content_lines=content_lines,
+        our_price=None,
+        platform=platform,
+        contact_username=CONTACT_USERNAME,
+        intent=intent,
+        header_word=listing.get("header_word"),
+        listing_seed=listing["id"],
+        post_number=listing.get("post_number"),
+        source_text=listing.get("raw_text"),
+    )
     return preview_text
 
 
@@ -250,14 +224,13 @@ def _repair_targets(max_posts: int = 100) -> List[dict]:
         content_text = p.get("clean_text") or p.get("raw_text") or ""
         content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
         sanitized = parser.sanitize_body_lines(content_lines) or ["Available"]
-        our_price = p.get("our_price")
         platform = p.get("platform_name") or p.get("game_name")
         intent = p.get("intent") or "neutral"
         post_number = p.get("post_number")
 
         current_text, _ = parser.build_ai_message(
             content_lines=content_lines,
-            our_price=our_price,
+            our_price=None,
             platform=platform,
             contact_username=CONTACT_USERNAME,
             intent=intent,
@@ -265,16 +238,18 @@ def _repair_targets(max_posts: int = 100) -> List[dict]:
             listing_seed=listing_id,
             post_number=post_number,
             sanitize_body=False,
+            source_text=p.get("raw_text"),
         )
         repaired_text, entities = parser.build_ai_message(
             content_lines=sanitized,
-            our_price=our_price,
+            our_price=None,
             platform=platform,
             contact_username=CONTACT_USERNAME,
             intent=intent,
             header_word=p.get("header_word"),
             listing_seed=listing_id,
             post_number=post_number,
+            source_text=p.get("raw_text"),
         )
         if repaired_text != current_text:
             targets.append({
@@ -338,12 +313,9 @@ async def skip_digest_worker(bot: TelegramClient) -> None:
 
 
 def _listing_with_draft(listing: dict, draft: str) -> dict:
-    """Copy of a listing whose content/price are taken from an admin draft."""
+    """Copy of a listing whose content is taken from an admin draft."""
     updated = dict(listing)
     updated["clean_text"] = draft
-    draft_price, _ = parser.extract_price(draft)
-    if draft_price and draft_price > 0:
-        updated["our_price"] = int(round(draft_price))
     return updated
 
 
@@ -365,16 +337,11 @@ def _edit_prompt(listing: dict, existing_draft: Optional[str]) -> str:
         body = "_(no content yet — write the body lines)_"
     else:
         body = "\n".join(f"> {ln}" for ln in lines)
-    price_now = listing.get("our_price")
-    price_info = f"${price_now}" if price_now else "not set yet"
     return (
         f"✏️ **Edit Listing #{listing['id']}**\n"
-        f"Current price for this post: `{price_info}`\n\n"
         f"**Current content** — copy it, tweak it, then send back the FULL body:\n"
         f">{body}\n\n"
         f"• Price & contact are added automatically.\n"
-        f"• If your text includes a price line (e.g. `PRICE 500$`), that price "
-        f"is used instead.\n"
         f"Then I'll show you the new preview before publishing."
     )
 
@@ -426,94 +393,10 @@ def _listing_action_buttons(listing_id: int, status: str) -> List[List[object]]:
     ]
 
 
-# Wizard state: sender_id -> {"step": "add" | "rule" | "edit", ...}
+# Wizard state: sender_id -> {"step": "add" | "edit", ...}
 _wizard_state: Dict[int, dict] = {}
 # Listing drafts: listing_id -> content lines typed by the admin via ✏️ Edit.
 _drafts: Dict[int, str] = {}
-
-# Matches pasted emoji-pack links like https://t.me/addemoji/SkullEmoji
-EMOJI_LINK_RE = re.compile(
-    r"(?:https?://)?(?:t\.me|telegram\.me)/addemoji/([A-Za-z0-9_]+)",
-    re.IGNORECASE,
-)
-
-EMOJI_ROLE_LABELS = {
-    "fire": "🔥 Header (WTB / WANTED)",
-    "lightning": "⚡ Header (WTB / WANTED)",
-    "moneybag": "🤑 Price line",
-    "phone": "📞 Contact line",
-}
-
-
-def _normalize_pack_shortname(text: str) -> Optional[str]:
-    """Turn a pack link or bare shortname into a shortname (e.g. 'SkullEmoji')."""
-    text = text.strip()
-    m = re.match(
-        r"(?:(?:https?://)?(?:t\.me|telegram\.me)/addemoji/)?([A-Za-z0-9_]+)$",
-        text,
-        re.IGNORECASE,
-    )
-    return m.group(1) if m else None
-
-
-def _emoji_mapping_text() -> str:
-    lines = ["Current mapping (defaults in use unless noted):"]
-    cfg = db.get_emoji_configs()
-    for role, (_, ph, _expected) in parser.EMOJI_ROLES.items():
-        label = EMOJI_ROLE_LABELS.get(role, role)
-        cur = cfg.get(role)
-        if cur:
-            lines.append(f"  • {label}: custom — from `{cur['source']}`")
-        else:
-            lines.append(f"  • {label}: default")
-    return "\n".join(lines)
-
-
-async def _apply_emoji_pack(client, short_name: str, source_label: str) -> str:
-    """Fetch an emoji pack, map its emoji onto the message roles, persist, and reload."""
-    from telethon.tl.functions.messages import GetStickerSetRequest
-    from telethon.tl.types import InputStickerSetShortName
-
-    try:
-        result = await client(GetStickerSetRequest(
-            stickerset=InputStickerSetShortName(short_name=short_name),
-            hash=0,
-        ))
-    except Exception as exc:
-        return f"❌ Could not fetch pack **{short_name}**: {exc}"
-
-    pack_map: Dict[str, int] = {}
-    for doc in result.documents:
-        for attr in doc.attributes:
-            if hasattr(attr, "alt") and attr.alt:
-                pack_map[attr.alt] = doc.id
-
-    updated: List[Tuple[str, str, int]] = []
-    skipped: List[str] = []
-    for role, (_default_id, _ph, expected) in parser.EMOJI_ROLES.items():
-        doc_id = pack_map.get(expected)
-        if doc_id:
-            db.set_emoji_config(role, expected, doc_id, source=short_name)
-            updated.append((role, expected, doc_id))
-        else:
-            skipped.append(role)
-
-    parser.reload_emoji_config()
-
-    lines = [f"✅ Pack **{short_name}** fetched ({len(result.documents)} emoji)."]
-    if updated:
-        for role, ch, doc_id in updated:
-            label = EMOJI_ROLE_LABELS.get(role, role)
-            lines.append(f"  • {label} → now uses `{ch}` (id {doc_id})")
-    if skipped:
-        lines.append("  • Not present in this pack: " + ", ".join(skipped))
-        lines.append("    (keeping current/default emoji for those)")
-    if not updated:
-        lines.append(
-            "Tip: send a pack that contains 🔥 ⚡ 🤑 📞 (or add more packs — "
-            "every matching role is upgraded automatically)."
-        )
-    return "\n".join(lines)
 
 
 def _pretty_source(username: Optional[str], display_name: Optional[str] = None) -> str:
@@ -615,14 +498,12 @@ async def _edit_supplier_menu(event, s: dict) -> None:
         await event.edit(
             f"{icon} **{handle}**\n"
             f"{status_line}"
-            f"Markup: `{s['markup_multiplier']}`\n"
             f"ID: `{s['channel_id'] or 'unresolved'}`\n\n"
             f"What would you like to do?",
             buttons=[
                 [Button.inline(toggle_label, data=f"suptoggle:{sid}")],
-                [Button.inline("⚙️ Set Multiplier", data=f"suprule:{sid}")],
                 [Button.inline("🗑 Delete Permanently", data=f"supdel:{sid}")],
-                [Button.inline("⬅️ Back", data="menu:home")],
+                [Button.inline("⬅️ Back", data="menu:sources")],
             ],
         )
     except Exception:
@@ -682,8 +563,7 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
             )
         else:
             await event.reply(
-                f"✅ **Source added by forward**: `{display}` (ID `{channel_id}`)\n"
-                f"Default multiplier: `{DEFAULT_MULTIPLIER}`",
+                f"✅ **Source added by forward**: `{display}` (ID `{channel_id}`)",
                 buttons=_home_keyboard(),
             )
         return
@@ -725,8 +605,7 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
             detail=f"{text} -> {display} (id {entity_id})",
         )
         await event.reply(
-            f"✅ **Source added**: `{display}` (ID `{entity_id}`)\n"
-            f"Default multiplier: `{DEFAULT_MULTIPLIER}`",
+            f"✅ **Source added**: `{display}` (ID `{entity_id}`)",
             buttons=_home_keyboard(),
         )
         return
@@ -761,8 +640,7 @@ def _sources_menu_text(suppliers: List[dict]) -> str:
             status_tag = " "
         lines.append(
             f"{icon} **{_pretty_source(s.get('channel_username'), s.get('display_name'))}**"
-            f"{status_tag}(ID: `{s['channel_id'] or '—'}`) "
-            f"· markup `{s['markup_multiplier']}`"
+            f"{status_tag}(ID: `{s['channel_id'] or '—'}`)"
         )
     if has_unresolved:
         lines.append(
@@ -781,9 +659,148 @@ def _sources_buttons(suppliers: List[dict]) -> List[List[object]]:
         buttons.append([Button.inline(label, data=f"sup:{s['id']}")])
     buttons.append([
         Button.inline("➕ Add Source", data="supadd"),
-        Button.inline("⬅️ Back", data="menu:sources"),
+        Button.inline("⬅️ Back", data="menu:home"),
     ])
     return buttons
+
+
+def _home_button_row() -> List[List[object]]:
+    """Inline "back to Home" row used by every section rendered from the Home menu."""
+    return [[Button.inline("🏠 Home", data="menu:home")]]
+
+
+def _home_text() -> str:
+    return "🏠 **Home** — tap a button below."
+
+
+def _home_inline_keyboard() -> List[List[object]]:
+    """Inline navigation for the Home landing message (mirrors the reply keyboard)."""
+    pause_label = "▶ All Start" if db.is_paused() else "⏸ All Stop"
+    return [
+        [
+            Button.inline("📊 Status", data="home:status"),
+            Button.inline("⏳ Pending", data="home:pending"),
+            Button.inline("⚠️ Failed", data="home:failed"),
+        ],
+        [
+            Button.inline("📋 Sources", data="menu:sources"),
+            Button.inline(pause_label, data="home:toggle"),
+            Button.inline("❓ Help", data="home:help"),
+        ],
+        [
+            Button.inline("🚫 Skipped", data="home:skipped"),
+            Button.inline("📜 Published", data="home:published"),
+        ],
+    ]
+
+
+def _help_text() -> str:
+    return (
+        "🤖 **Telegram Monitor Admin Bot**\n\n"
+        "Everything is one tap — no commands to remember:\n"
+        "• **📊 Status** — today's report\n"
+        "• **⏳ Pending** — approve / preview / edit new listings\n"
+        "• **⚠️ Failed** — retry failed publishes\n"
+        "• **📋 Sources** — add, manage, remove sources\n"
+        "• **📜 Published** — every post with its **#Post number** + channel & source links\n"
+        "• **🔢 /post 12** — jump straight to post #12\n"
+        "• **⏸ All Stop / ▶ All Start** — pause or resume publishing\n\n"
+        "Slash shortcuts still work if you prefer typing them."
+    )
+
+
+def _status_report_text() -> str:
+    stats = db.get_today_stats()
+
+    supplier_lines = []
+    for s in stats["supplier_breakdown"]:
+        handle = _pretty_source(s.get("channel_username"), s.get("supplier_display_name"))
+        supplier_lines.append(
+            f"• {handle} — processed `{s['processed']}` / "
+            f"published `{s['published']}` / skipped `{s['skipped']}`"
+        )
+    if not supplier_lines:
+        supplier_lines = ["• None"]
+    supplier_text = "\n".join(supplier_lines)
+
+    reason_lines = [f"• {r}: `{c}`" for r, c in stats["skip_reasons"].items()]
+    if not reason_lines:
+        reason_lines = ["• None"]
+    reason_text = "\n".join(reason_lines)
+
+    msg = (
+        "📊 **Today's Activity Report**\n\n"
+        f"• Active Suppliers: `{stats['active_suppliers']}`\n"
+        f"• Total Processed: `{stats['total_processed']}`\n"
+        f"• Published: `{stats['published']}`\n"
+        f"• Pending Approval: `{stats['pending']}`\n"
+        f"• Total Skipped: `{stats['total_skipped']}`\n"
+        f"• Errors: `{stats['errors']}`\n\n"
+        f"**By Supplier**\n{supplier_text}\n\n"
+        f"**Skip Breakdown**\n{reason_text}"
+    )
+    if db.is_paused():
+        msg = "⏸ **PAUSED — publishing is stopped**\n\n" + msg
+    return msg
+
+
+def _failed_digest(failed: List[dict]) -> Tuple[str, List[List[object]]]:
+    lines = ["⚠️ **Failed Listings (DLQ)** — tap an action below:\n"]
+    for i, l in enumerate(failed, 1):
+        lines.append(_format_listing(i, l))
+        error = l.get("last_error")
+        if error:
+            lines.append(f"   └ Last error: `{(error or '')[:120]}`")
+    buttons = []
+    for l in failed:
+        buttons.append([
+            Button.inline(f"👁️ #{l['id']} Preview", data=f"preview:{l['id']}"),
+            Button.inline(f"🔁 #{l['id']} Retry", data=f"retry:{l['id']}"),
+        ])
+    buttons.extend(_home_button_row())
+    return "\n".join(lines), buttons
+
+
+def _skipped_digest(skips: List[dict]) -> Tuple[str, List[List[object]]]:
+    lines = ["🚫 **Recently skipped** — the ones that never made it to review:\n"]
+    buttons = []
+    for i, k in enumerate(skips, 1):
+        reason = k.get("reason") or "?"
+        src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
+        ts = (k.get("timestamp") or "")[:16].replace("T", " ")
+        preview = (k.get("raw_text") or "").strip().replace("\n", " ")[:130]
+        lines.append(f"{i}. **{reason}** · {src} · {ts}\n   {preview}")
+        if k.get("listing_id"):
+            buttons.append([
+                Button.inline(f"🔁 Re-review #{k['listing_id']}", data=f"reskip:{k['skip_id']}"),
+            ])
+    buttons.extend(_home_button_row())
+    return "\n".join(lines), buttons
+
+
+def _published_digest(rows: List[dict]) -> Tuple[str, List[List[object]]]:
+    lines = ["📜 **Published posts** — each has a **#Post number** to reference it:\n"]
+    buttons = []
+    for i, p in enumerate(rows):
+        platform = (p.get("platform_name") or p.get("game_name") or "?").title()
+        supplier = p.get("supplier_username")
+        supplier_chat = p.get("supplier_channel_id")
+        src_disp = _pretty_source(supplier, p.get("supplier_display_name"))
+        if not src_disp or src_disp == "?":
+            src_disp = f"channel {supplier_chat}"
+        created = (p.get("published_at") or p.get("created_at") or "")[:10]
+        post_num = p.get("post_number")
+        num_disp = f"#{post_num}" if post_num is not None else "—"
+        label = platform if platform != "?" else "Listing"
+        src_url = _source_url(p)
+        entry = f"**{num_disp}** · {label} — {src_disp} · {created}"
+        if src_url:
+            lines.append(f"{i + 1}. {entry}")
+            buttons.append([Button.url(f"🔢 {num_disp} 📥 {label}", src_url)])
+        else:
+            lines.append(f"{i + 1}. {entry}")
+    buttons.extend(_home_button_row())
+    return "\n".join(lines), buttons
 
 
 def setup_admin_handlers(bot: TelegramClient) -> None:
@@ -806,19 +823,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
     async def handle_start(event):
         if not await check_admin(event):
             return
-        msg = (
-            "🤖 **Telegram Monitor Admin Bot**\n\n"
-            "Everything is one tap — no commands to remember:\n"
-            "• **📊 Status** — today's report\n"
-            "• **⏳ Pending** — approve / preview / edit new listings\n"
-            "• **⚠️ Failed** — retry failed publishes\n"
-            "• **📋 Sources** — add, manage, remove sources\n"
-            "• **📜 Published** — every post with its **#Post number** + channel & source links\n"
-            "• **🔢 /post 12** — jump straight to post #12\n"
-            "• **⏸ All Stop / ▶ All Start** — pause or resume publishing\n\n"
-            "Slash shortcuts still work if you prefer typing them."
-        )
-        await event.reply(msg, buttons=_home_keyboard())
+        await event.reply(_help_text(), buttons=_home_keyboard())
 
     @bot.on(events.NewMessage(pattern=r"^(?:/suppliers|/sources|📋 Sources)"))
     async def handle_suppliers(event):
@@ -852,62 +857,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             buttons=_home_keyboard(),
             parse_mode="markdown",
         )
-
-    @bot.on(events.NewMessage(pattern=r"^/addemoji(?:\s+(.+))?$"))
-    async def handle_add_emoji(event):
-        if not await check_admin(event):
-            return
-        arg = (event.pattern_match.group(1) or "").strip()
-        if not arg:
-            await event.reply(
-                "🎨 **Emoji packs**\n\n"
-                "Send any emoji-pack link, e.g. `https://t.me/addemoji/SkullEmoji`, "
-                "or just paste the link directly — no command needed.\n"
-                "I'll fetch the pack and upgrade the matching roles "
-                "(🔥 ⚡ 🤑 📞 ⭐) automatically. Send as many packs as you like.\n\n"
-                + _emoji_mapping_text(),
-                buttons=_home_keyboard(),
-                parse_mode="markdown",
-            )
-            return
-        short_name = _normalize_pack_shortname(arg)
-        if not short_name:
-            await event.reply(
-                "Couldn't read a pack name from that. Send a link like `t.me/addemoji/Name`.",
-                buttons=_home_keyboard(),
-            )
-            return
-        client = user_client_ref if user_client_ref and user_client_ref.is_connected() else bot
-        await event.reply("⏳ Fetching pack...", buttons=_home_keyboard())
-        summary = await _apply_emoji_pack(client, short_name, "command")
-        db.record_audit("addemoji", None, actor_id=event.sender_id, detail=short_name)
-        await event.reply(summary, buttons=_home_keyboard(), parse_mode="markdown")
-
-    @bot.on(events.NewMessage())
-    async def handle_pack_link(event):
-        if not await check_admin(event):
-            return
-        if not event.text:
-            return
-        if getattr(event.message, "fwd_from", None):
-            return
-        if event.text.strip().startswith("/"):
-            return
-        m = EMOJI_LINK_RE.search(event.text)
-        if not m:
-            return
-        short_name = m.group(1)
-        client = user_client_ref if user_client_ref and user_client_ref.is_connected() else bot
-        await event.reply("⏳ Fetching pack...", buttons=_home_keyboard())
-        summary = await _apply_emoji_pack(client, short_name, "link")
-        db.record_audit("addemoji", None, actor_id=event.sender_id, detail=short_name)
-        await event.reply(summary, buttons=_home_keyboard(), parse_mode="markdown")
-
-    @bot.on(events.NewMessage(pattern=r"^(?:/emojistatus|🎨 Emoji)"))
-    async def handle_emoji_status(event):
-        if not await check_admin(event):
-            return
-        await event.reply(_emoji_mapping_text(), buttons=_home_keyboard(), parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/addsupplier(?:\s+(.+))?"))
     async def handle_add_supplier(event):
@@ -992,7 +941,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             "⚠️ **Re-import SOURCE_CHANNELS from .env?**\n\n"
             f"Currently in .env: {preview}\n\n"
             "This is the deliberate escape hatch only:\n"
-            "• Adds/refreshes every channel listed in .env (custom multipliers are preserved).\n"
+            "• Adds/refreshes every channel listed in .env.\n"
             "• Does **NOT** delete anything — channels removed from .env are not removed here.\n"
             "• After this, .env is ignored again on future restarts.",
             buttons=[
@@ -1001,83 +950,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             ],
         )
 
-    @bot.on(events.NewMessage(pattern=r"^/rule(?:\s+(.+))?"))
-    async def handle_rule(event):
-        if not await check_admin(event):
-            return
-        raw = (event.pattern_match.group(1) or "").strip()
-        parts = raw.split()
-        if len(parts) != 2:
-            await event.reply(
-                "Usage: `/rule <channel_username> <multiplier>`\nExample: `/rule @kycgroupke 0.70`",
-                buttons=_home_keyboard(),
-            )
-            return
-
-        channel_user, mult_str = parts[0].lstrip("@"), parts[1]
-        try:
-            mult = float(mult_str)
-            if mult <= 0 or mult > 5.0:
-                await event.reply(
-                    "Multiplier should be a realistic positive number (e.g. 0.75).",
-                    buttons=_home_keyboard(),
-                )
-                return
-        except ValueError:
-            await event.reply(
-                "Invalid multiplier format. Please provide a decimal number (e.g. 0.75).",
-                buttons=_home_keyboard(),
-            )
-            return
-
-        ok = db.set_supplier_rule(channel_user, mult)
-        if ok:
-            await event.reply(
-                f"✅ Markup multiplier for **@{channel_user}** set to `{mult}`.",
-                buttons=_home_keyboard(),
-            )
-        else:
-            await event.reply(
-                f"❌ Supplier **@{channel_user}** not found.",
-                buttons=_home_keyboard(),
-            )
-
     @bot.on(events.NewMessage(pattern=r"^(?:/status|📊 Status)"))
     async def handle_status(event):
         if not await check_admin(event):
             return
-        stats = db.get_today_stats()
-
-        supplier_lines = []
-        for s in stats["supplier_breakdown"]:
-            handle = _pretty_source(s.get("channel_username"), s.get("supplier_display_name"))
-            supplier_lines.append(
-                f"• {handle} — processed `{s['processed']}` / "
-                f"published `{s['published']}` / skipped `{s['skipped']}`"
-            )
-        if not supplier_lines:
-            supplier_lines = ["• None"]
-        supplier_text = "\n".join(supplier_lines)
-
-        reason_lines = [f"• {r}: `{c}`" for r, c in stats["skip_reasons"].items()]
-        if not reason_lines:
-            reason_lines = ["• None"]
-        reason_text = "\n".join(reason_lines)
-
-        msg = (
-            "📊 **Today's Activity Report**\n\n"
-            f"• Active Suppliers: `{stats['active_suppliers']}`\n"
-            f"• Total Processed: `{stats['total_processed']}`\n"
-            f"• Published: `{stats['published']}`\n"
-            f"• Pending Approval: `{stats['pending']}`\n"
-            f"• Total Skipped: `{stats['total_skipped']}`\n"
-            f"• Errors: `{stats['errors']}`\n\n"
-            f"**By Supplier**\n{supplier_text}\n\n"
-            f"**Skip Breakdown**\n{reason_text}"
-        )
-        if db.is_paused():
-            msg = "⏸ **PAUSED — publishing is stopped**\n\n" + msg
-        await event.reply(msg, buttons=_home_keyboard())
+        await event.reply(_status_report_text(), buttons=_home_keyboard())
 
     @bot.on(events.NewMessage(pattern=r"^(?:/pending|⏳ Pending)"))
     async def handle_pending(event):
@@ -1103,20 +980,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await event.reply("✅ No failed publishes in the queue.", buttons=_home_keyboard())
             return
 
-        lines = ["⚠️ **Failed Listings (DLQ)** — tap an action below:\n"]
-        for i, l in enumerate(failed, 1):
-            lines.append(_format_listing(i, l))
-            error = l.get("last_error")
-            if error:
-                lines.append(f"   └ Last error: `{(error or '')[:120]}`")
-        buttons = []
-        for l in failed:
-            buttons.append([
-                Button.inline(f"👁️ #{l['id']} Preview", data=f"preview:{l['id']}"),
-                Button.inline(f"🔁 #{l['id']} Retry", data=f"retry:{l['id']}"),
-            ])
-        buttons.append([Button.inline("🏠 Home", data="menu:home")])
-        await event.reply("\n".join(lines), buttons=buttons, parse_mode="markdown")
+        text, buttons = _failed_digest(failed)
+        await event.reply(text, buttons=buttons, parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^(?:/skipped|🚫 Skipped)"))
     async def handle_skipped(event):
@@ -1127,20 +992,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await event.reply("✅ No skipped messages logged.", buttons=_home_keyboard())
             return
 
-        lines = ["🚫 **Recently skipped** — the ones that never made it to review:\n"]
-        buttons = []
-        for i, k in enumerate(skips, 1):
-            reason = k.get("reason") or "?"
-            src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
-            ts = (k.get("timestamp") or "")[:16].replace("T", " ")
-            preview = (k.get("raw_text") or "").strip().replace("\n", " ")[:130]
-            lines.append(f"{i}. **{reason}** · {src} · {ts}\n   {preview}")
-            if k.get("listing_id"):
-                buttons.append([
-                    Button.inline(f"🔁 Re-review #{k['listing_id']}", data=f"reskip:{k['skip_id']}"),
-                ])
-        buttons.append([Button.inline("🏠 Home", data="menu:home")])
-        await event.reply("\n".join(lines), buttons=buttons, parse_mode="markdown")
+        text, buttons = _skipped_digest(skips)
+        await event.reply(text, buttons=buttons, parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/repair(?:\s+(do|list))?"))
     async def handle_repair(event):
@@ -1219,32 +1072,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await event.reply("📜 No published posts yet.", buttons=_home_keyboard())
             return
 
-        lines = ["📜 **Published posts** — each has a **#Post number** to reference it:\n"]
-        buttons = []
-        for i, p in enumerate(rows):
-            platform = (p.get("platform_name") or p.get("game_name") or "?").title()
-            price = p.get("our_price")
-            price_s = "$" + str(price).rstrip("0").rstrip(".") if price else ""
-            supplier = p.get("supplier_username")
-            supplier_chat = p.get("supplier_channel_id")
-            src_disp = _pretty_source(supplier, p.get("supplier_display_name"))
-            if not src_disp or src_disp == "?":
-                src_disp = f"channel {supplier_chat}"
-            created = (p.get("published_at") or p.get("created_at") or "")[:10]
-            post_num = p.get("post_number")
-            num_disp = f"#{post_num}" if post_num is not None else "—"
-            label = platform if platform != "?" else "Listing"
-            if price_s:
-                label = f"{platform} · {price_s}"
-            src_url = _source_url(p)
-            entry = f"**{num_disp}** · {label} — {src_disp} · {created}"
-            if src_url:
-                lines.append(f"{i + 1}. {entry}")
-                buttons.append([Button.url(f"🔢 {num_disp} 📥 {label}", src_url)])
-            else:
-                lines.append(f"{i + 1}. {entry}")
-        buttons.append([Button.inline("🏠 Home", data="menu:home")])
-        await event.reply("\n".join(lines), buttons=buttons, parse_mode="markdown")
+        text, buttons = _published_digest(rows)
+        await event.reply(text, buttons=buttons, parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/post(?:[ \t]+(\d+))?"))
     async def handle_post(event):
@@ -1267,8 +1096,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
         platform = (post.get("platform_name") or post.get("game_name") or "?").title()
-        price = post.get("our_price")
-        price_s = ("$" + str(price).rstrip("0").rstrip(".")) if price else "—"
         supplier = post.get("supplier_username")
         supplier_chat = post.get("supplier_channel_id")
         src_disp = _pretty_source(supplier, post.get("supplier_display_name"))
@@ -1279,7 +1106,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             f"🔢 **Post #{arg}**",
             "━━━━━━━━━━━━━━━━━━━━",
             f"Platform : {platform}",
-            f"Price    : {price_s}",
+            f"Price    : DM",
             f"Supplier : {src_disp}",
             f"Published: {published}",
             f"Listing  : `#{post.get('id')}`",
@@ -1403,11 +1230,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         # ---- Pure navigation -----------------------------------------------
         if data_str == "menu:home":
             await event.answer("🏠 Home")
-            await event.client.send_message(
-                ADMIN_USER_ID,
-                "🏠 **Home** — tap a button below.",
-                buttons=_home_keyboard(),
-            )
+            try:
+                await event.edit(_home_text(), buttons=_home_inline_keyboard())
+            except Exception:
+                await event.answer("Home", alert=True)
             return
 
         if data_str == "menu:sources":
@@ -1419,6 +1245,105 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await event.edit(text, buttons=_sources_buttons(suppliers), parse_mode=None)
             except Exception:
                 await event.answer("Sources refreshed", alert=True)
+            return
+
+        if data_str.startswith("home:"):
+            home_action = data_str.split(":", 1)[1]
+            if home_action == "status":
+                try:
+                    await event.edit(_status_report_text(), buttons=_home_button_row())
+                except Exception:
+                    await event.answer("Status", alert=True)
+                return
+            if home_action == "pending":
+                pending = db.get_pending_listings(limit=5)
+                if not pending:
+                    try:
+                        await event.edit(
+                            "✅ No listings pending approval right now.",
+                            buttons=_home_button_row(),
+                        )
+                    except Exception:
+                        await event.answer("Pending", alert=True)
+                    return
+                try:
+                    await event.edit(
+                        f"Found {len(pending)} listing(s) pending review:",
+                        buttons=_home_button_row(),
+                    )
+                except Exception:
+                    pass
+                for l in pending:
+                    await send_approval_prompt(bot, ADMIN_USER_ID, l)
+                return
+            if home_action == "failed":
+                failed = db.get_failed_listings(limit=10)
+                if not failed:
+                    try:
+                        await event.edit(
+                            "✅ No failed publishes in the queue.",
+                            buttons=_home_button_row(),
+                        )
+                    except Exception:
+                        await event.answer("Failed", alert=True)
+                    return
+                text, buttons = _failed_digest(failed)
+                try:
+                    await event.edit(text, buttons=buttons, parse_mode="markdown")
+                except Exception:
+                    await event.answer("Failed", alert=True)
+                return
+            if home_action == "help":
+                try:
+                    await event.edit(_help_text(), buttons=_home_button_row())
+                except Exception:
+                    await event.answer("Help", alert=True)
+                return
+            if home_action == "toggle":
+                paused = db.is_paused()
+                db.set_paused(not paused)
+                await event.answer(
+                    "⏸ Publishing paused" if not paused else "▶ Publishing resumed"
+                )
+                try:
+                    await event.edit(_home_text(), buttons=_home_inline_keyboard())
+                except Exception:
+                    await event.answer("Toggled", alert=True)
+                return
+            if home_action == "skipped":
+                skips = db.get_skipped_listings(limit=15)
+                if not skips:
+                    try:
+                        await event.edit(
+                            "✅ No skipped messages logged.",
+                            buttons=_home_button_row(),
+                        )
+                    except Exception:
+                        await event.answer("Skipped", alert=True)
+                    return
+                text, buttons = _skipped_digest(skips)
+                try:
+                    await event.edit(text, buttons=buttons, parse_mode="markdown")
+                except Exception:
+                    await event.answer("Skipped", alert=True)
+                return
+            if home_action == "published":
+                rows = db.get_published_listings(limit=10)
+                if not rows:
+                    try:
+                        await event.edit(
+                            "📜 No published posts yet.",
+                            buttons=_home_button_row(),
+                        )
+                    except Exception:
+                        await event.answer("Published", alert=True)
+                    return
+                text, buttons = _published_digest(rows)
+                try:
+                    await event.edit(text, buttons=buttons, parse_mode="markdown")
+                except Exception:
+                    await event.answer("Published", alert=True)
+                return
             return
 
         if data_str == "wiz:cancel":
@@ -1463,26 +1388,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             if refreshed:
                 await _edit_supplier_menu(event, refreshed)
-            return
-
-        suprule_match = re.match(r"^suprule:(\d+)$", data_str)
-        if suprule_match:
-            sid = int(suprule_match.group(1))
-            s = next(
-                (x for x in db.list_suppliers(active_only=False) if x["id"] == sid),
-                None,
-            )
-            if not s:
-                await event.answer("Source not found.", alert=True)
-                return
-            _wizard_state[ADMIN_USER_ID] = {"step": "rule", "supplier_id": sid}
-            handle = _pretty_source(s.get("channel_username"), s.get("display_name"))
-            await event.edit(
-                f"✏️ **Set multiplier for {handle}**\n"
-                f"Current: `{s['markup_multiplier']}`\n\n"
-                f"Send the new multiplier as a single reply, e.g. `0.80`.",
-                buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
-            )
             return
 
         supdel_match = re.match(r"^supdel:(\d+)$", data_str)
@@ -1714,20 +1619,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     pass
                 return
 
-            # A draft (from ✏️ Edit) replaces the source content, and its price
-            # line becomes the listing price if present.
+            # A draft (from ✏️ Edit) replaces the source content.
             draft = _drafts.pop(listing_id, None)
             content_text = draft or listing.get("clean_text") or listing.get("raw_text") or ""
             content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
-            our_price = listing.get("our_price")
             platform_name = listing.get("platform_name") or listing.get("game_name")
             intent = listing.get("intent") or "neutral"
-            if draft:
-                draft_price, _ = parser.extract_price(draft)
-                if draft_price and draft_price > 0:
-                    our_price = int(round(draft_price))
-                    db.update_listing_fields(listing_id, our_price=our_price)
-                    listing = {**listing, "our_price": our_price}
 
             await event.answer("Processing...")
             if db.is_paused():
@@ -1740,13 +1637,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             post_number = db.next_post_number()
             republished_text, entities = parser.build_ai_message(
                 content_lines=content_lines,
-                our_price=our_price if (our_price is not None and our_price > 0) else None,
+                our_price=None,
                 platform=platform_name,
                 contact_username=CONTACT_USERNAME,
                 intent=intent,
                 header_word=listing.get("header_word"),
                 listing_seed=listing_id,
                 post_number=post_number,
+                source_text=listing.get("raw_text"),
             )
 
             if user_client_ref and user_client_ref.is_connected() and DEST_CHANNEL:
@@ -1781,7 +1679,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     db.update_listing_status(
                         listing_id=listing_id,
                         status="published",
-                        our_price=our_price,
                         published_message_id=published_msg_id,
                         post_number=post_number,
                     )
@@ -1804,13 +1701,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     except Exception:
                         logger.exception("Could not record published state for listing #%s", listing_id)
 
-                price_display = f"${parser._format_price(our_price)}" if our_price is not None else "No price (manual)"
                 try:
                     confirmation = (
                         f"✅ **Listing #{listing_id} Published!**\n"
                         f"📌 **Post #{post_number}**\n"
                         f"Channel: {DEST_CHANNEL}\n"
-                        f"Price: `{price_display}`"
+                        f"Price: `DM`"
                     )
                     await event.edit(confirmation)
                 except Exception:
@@ -1833,8 +1729,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
     @bot.on(events.NewMessage())
     async def handle_wizard_input(event):
-        """Fallback: complete Add Source / Set Multiplier wizards by plain-text reply
-        or by forwarding a message from the channel (add-source wizard)."""
+        """Fallback: complete the Add Source wizard by plain-text reply
+        or by forwarding a message from the channel."""
         if not await check_admin(event):
             return
         state = _wizard_state.get(ADMIN_USER_ID)
@@ -1854,9 +1750,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         text = text.strip()
         if text.startswith("/"):
-            return
-        # Pasting an emoji-pack link must never be consumed by a wizard
-        if EMOJI_LINK_RE.search(text):
             return
         # Menu taps must not be swallowed while a wizard is waiting
         if text in ("📊 Status", "⏳ Pending", "⚠️ Failed", "📋 Sources",
@@ -1898,48 +1791,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     buttons=_home_keyboard(),
                 )
                 return
-            price_note = ""
-            draft_price, _ = parser.extract_price(draft)
-            if draft_price and draft_price > 0:
-                price_note = f"\nPrice taken from your text: `${int(round(draft_price))}`"
             await event.reply(
                 f"✏️ **Draft for Listing #{listing_id}** — review below, "
-                f"then Approve or Edit again.{price_note}\n"
+                f"then Approve or Edit again.\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"{preview_text}",
                 buttons=_listing_action_buttons(listing_id, listing["status"]),
                 parse_mode="markdown",
-            )
-            return
-
-        if state["step"] == "rule":
-            sid = state.get("supplier_id")
-            s = next(
-                (x for x in db.list_suppliers(active_only=False) if x["id"] == sid),
-                None,
-            )
-            if not s:
-                await event.reply("❌ Source not found.", buttons=_home_keyboard())
-                return
-            try:
-                mult = float(text)
-                if mult <= 0 or mult > 5.0:
-                    await event.reply(
-                        "Multiplier should be a realistic positive number (e.g. 0.75).",
-                        buttons=_home_keyboard(),
-                    )
-                    return
-            except ValueError:
-                await event.reply(
-                    "Invalid multiplier. Send a decimal number, e.g. `0.80`.",
-                    buttons=_home_keyboard(),
-                )
-                return
-            db.set_supplier_rule(s["channel_username"], mult)
-            db.record_audit("supplier_rule", None, actor_id=ADMIN_USER_ID, detail=str(mult))
-            await event.reply(
-                f"✅ Markup multiplier for **{_pretty_source(s.get('channel_username'), s.get('display_name'))}** set to `{mult}`.",
-                buttons=_home_keyboard(),
             )
             return
 
@@ -1978,7 +1836,6 @@ async def create_admin_bot_client() -> TelegramClient:
                 BotCommand(command="published", description="📜 Published posts & channel links"),
                 BotCommand(command="post", description="🔢 Look up a post by its number: /post 12"),
                 BotCommand(command="repair", description="🔧 Edit leaked prices/handles out of live posts"),
-                BotCommand(command="addemoji", description="🎨 Add emoji pack: /addemoji <link>"),
                 BotCommand(command="help", description="❓ Show buttons and shortcuts"),
             ]
         ))

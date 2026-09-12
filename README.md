@@ -1,6 +1,6 @@
 # Telegram Channel Monitor & Auto-Republisher (Financial, Crypto & Streaming Accounts)
 
-An automated, robust Telegram channel monitor and republisher for digital accounts and subscriptions (Netflix, Spotify, Bybit, Crypto.com, Binance, Buddybank, Wise, Revolut, Hetzner, etc.). It monitors a network of supplier channels, cleans and filters listings, recalculates pricing with a configurable multiplier, flags stolen/cracked accounts, removes emojis, and republishes clean formatted listings to your destination channel with your contact handle for buyer direct messages.
+An automated, robust Telegram channel monitor and republisher for digital accounts and subscriptions (Netflix, Spotify, Bybit, Crypto.com, Binance, Buddybank, Wise, Revolut, Hetzner, etc.). It monitors a network of supplier channels, cleans and filters listings, flags stolen/cracked accounts, removes emojis, and republishes clean formatted listings to your destination channel — each post ends with a static **Price: DM** footer (prices are never recalculated or published) plus your contact handle for buyer direct messages.
 
 ---
 
@@ -16,32 +16,30 @@ An automated, robust Telegram channel monitor and republisher for digital accoun
    - **Customizable**: Easily add additional platforms via `ADDITIONAL_PLATFORMS` in `.env`.
 4. **Robust Price Parsing**:
    - Handles thousands separators (`$1,200` → 1200), suffix currencies (`1,200$`), decimal-comma prices (`12,50€` → 12.50), and `price:`/`rate:` prefixes.
-   - Falls back to the raw message text so prices placed next to emoji badges are not missed.
+   - Prices are used ONLY to build dedup fingerprints — they never appear on the destination channel (every post ends with the static **Price: DM** footer) and never gate publishing.
 5. **Intent Detection**:
    - Detects buy/sell intent: `WTB`, `want to buy`, `wts`, `for sale`, `fs`, `selling`, `buying`, `need`, `available`, etc.
-   - Listsings without a price but with a DM/contact signal are routed to manual review.
+   - Buy demands auto-publish when they gate cleanly; anything ambiguous routes to manual review.
 6. **Stolen / Hacked Account Keyword Blocklist**:
    - Rejects listings with keywords indicating illicit access (`hacked`, `cracked login`, `no email`, `stolen`, `dump`, `no recovery info changed`).
    - Logs matched keywords to SQLite for audit.
 7. **Idempotent Storage & Deduplication**:
    - A unique index on `(supplier_id, source_message_id)` guarantees no source message is ever processed twice.
    - Fingerprint-based 48-hour duplicate detection using `(platform, rounded price, normalized text)`.
-8. **Configurable Pricing Rule**:
-   - Per-channel multiplier stored in SQLite, or default global multiplier from `.env` (e.g. `0.75` for a 25% discount or custom markup).
-9. **Contact / DM Footer**:
+8. **Contact / DM Footer**:
    - Adds `📞 Order : @username` to the footer of every republished post so buyers can contact you directly.
-10. **Admin Approval Bot**:
+9. **Admin Approval Bot**:
     - Inline `[Approve]` and `[Reject]` buttons for ambiguous listings.
     - Failed-publish queue (DLQ) with `/failed` and `/retry <id>`.
     - `/preview <id>` shows the exact formatted post before publishing.
-11. **Publish Reliability**:
+10. **Publish Reliability**:
     - Retry with exponential backoff, automatic FloodWait sleep, and destination throttling.
     - After retries are exhausted a listing moves to the `failed` queue (visible to the admin bot) instead of being silently stuck.
     - Approved listings are never double-published (`published_message_id IS NULL` guard).
-12. **Message Edit & Deletion Handling**:
+11. **Message Edit & Deletion Handling**:
     - Source message edits update the published post in real-time (with a no-op guard).
     - Source message deletions are safely logged while keeping published posts intact for manual review.
-13. **Error Recovery & Logging**:
+12. **Error Recovery & Logging**:
     - Auto-reconnect loop with capped backoff.
     - Console output + rotating log file (`monitor.log`, 5MB max, 5 backups).
     - Full `audit_log` table for actions (auto-publish, admin approve/reject/retry, edits, blocklist rejections).
@@ -125,9 +123,6 @@ ADMIN_USER_ID=123456789
 # Contact handle for buyers to DM you
 CONTACT_USERNAME=@your_username
 
-# Default pricing multiplier (0.75 = 75% of original price)
-PRICE_MULTIPLIER=0.75
-
 # Optional extras:
 ADDITIONAL_PLATFORMS=
 # DB_PATH=monitor.db
@@ -177,7 +172,6 @@ Message your bot directly on Telegram (only authorized for `ADMIN_USER_ID`):
 | `/removesupplier <channel>` | Permanently delete a channel (history kept) | `/removesupplier @kycgroupke` |
 | `/dedupe_suppliers` | Merge duplicate supplier rows (same real channel) | `/dedupe_suppliers` |
 | `/reseed_from_env` | Manually re-import `SOURCE_CHANNELS` from `.env` once (confirm required) | `/reseed_from_env` |
-| `/rule <channel> <multiplier>` | Set channel markup multiplier | `/rule @kycgroupke 0.8` |
 | `/status` | View today's stats (processed, published, skipped breakdown) | `/status` |
 | `/pending` | Review and approve ambiguous listings | `/pending` |
 | `/failed` | List failed publishes (DLQ) with error details | `/failed` |
@@ -186,7 +180,7 @@ Message your bot directly on Telegram (only authorized for `ADMIN_USER_ID`):
 
 ### Ambiguous Listing Approval Flow
 
-When a source message contains a valid platform and price but lacks an explicit WTB/FS keyword:
+When a source message reads as a legitimate listing but can't be auto-published safely (ambiguous body, payment-proof signal, AI unavailable, or AI flags it):
 
 1. The listing is saved with status `pending_approval`.
 2. The Admin Bot sends an alert to your Telegram with post details.

@@ -486,19 +486,6 @@ async def _alert_admin_on_published(
 _processing_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
 
 
-def _price_for_dispatch(original_price, multiplier: float, intent: str):
-    """Final price shown in the destination post.
-
-    The supplier multiplier is applied to EVERY dispatched price —
-    buy, sell, or neutral — so the destination channel prices are always
-    repriced from the source (e.g. source $100 -> $75 at 0.75x).
-    """
-    if original_price is None:
-        return None
-    price = float(original_price)
-    return parser.apply_pricing_rule(price, multiplier)
-
-
 def _get_processing_lock(supplier_id: int, source_msg_id: int) -> asyncio.Lock:
     key = (supplier_id, source_msg_id)
     lock = _processing_locks.get(key)
@@ -673,21 +660,17 @@ async def _process_supplier_message(
     analysis = await ai_rephraser.analyze_message(raw_text)
 
     if analysis is None:
-        # AI unavailable / failed. Record the regex-extracted price (and the
-        # multiplier-applied price) so previews still show a real price.
-        multiplier = supplier.get("markup_multiplier") or DEFAULT_MULTIPLIER
-        fallback_our_price = _price_for_dispatch(source_price, multiplier, "neutral")
+        # AI unavailable / failed. Record the neutral intent (the regex price is
+        # used only for the dedup fingerprint, never for publishing).
         db.update_listing_fields(
             listing_id,
-            original_price=source_price,
-            our_price=fallback_our_price,
             intent="neutral",
         )
 
         # Deterministic fallback (no AI): keep real listings publishing during
         # an AI outage via the regex/emoji-strip path already used for previews.
-        # Gated HARD (FALLBACK-1): only a message with a real price + a concrete
-        # listing signal + a substantive sanitized body + no payment-proof may
+        # Gated HARD (FALLBACK-1): only a message with a concrete listing
+        # signal + a substantive sanitized body + no payment-proof may
         # auto-publish. Anything weaker routes to manual review below. The
         # blocked-keyword screen is an additional safety valve — stolen/hacked
         # content ALWAYS still routes to manual review, never auto-published.
@@ -702,7 +685,7 @@ async def _process_supplier_message(
             DETERMINISTIC_FALLBACK
             and not risky_keyword
             and not filters.detect_payment_proof(raw_text)
-            and filters.has_clear_listing_signal(raw_text, source_price)
+            and filters.has_clear_listing_signal(raw_text)
             and fb_body_ok
             and not db.is_paused()
         ):
@@ -710,20 +693,20 @@ async def _process_supplier_message(
             post_number = db.next_post_number()
             out_text, entities = parser.build_ai_message(
                 content_lines=content_lines,
-                our_price=fallback_our_price,
+                our_price=None,
                 platform=None,
                 contact_username=CONTACT_USERNAME,
                 intent="neutral",
                 header_word=None,
                 listing_seed=listing_id,
                 post_number=post_number,
+                source_text=raw_text,
             )
             try:
                 published_msg_id = await publish_to_destination(client, out_text, entities)
                 db.update_listing_status(
                     listing_id=listing_id,
                     status="published",
-                    our_price=fallback_our_price,
                     published_message_id=published_msg_id,
                     post_number=post_number,
                 )
@@ -814,53 +797,47 @@ async def _process_supplier_message(
         return
 
     platform_name = analysis.get("platform")
-    original_price = analysis.get("price")
     intent = analysis.get("intent") or "neutral"
     content_lines = analysis.get("content") or []
     ai_clean_text = "\n".join(content_lines) if content_lines else fallback_clean_text
 
     # Persist the AI-rewritten body so the worker / admin preview reuse it as-is.
-    # platform/price are informational only — they do NOT gate publishing.
+    # platform is informational only — it does NOT gate publishing.
     db.update_listing_fields(
         listing_id,
         platform_name=platform_name,
-        original_price=original_price,
         intent=intent,
         header_word=analysis.get("header"),
     )
     if ai_clean_text:
         db.update_listing_content(listing_id, clean_text=ai_clean_text)
 
-    # Calculate pricing based on supplier multiplier (None-safe; published as
-    # the "Available" variant when there is no price).
-    multiplier = supplier.get("markup_multiplier") or DEFAULT_MULTIPLIER
-    our_price = _price_for_dispatch(original_price, multiplier, intent)
-
     # Sanitize the AI body now (strip leaked prices/@handles/DM lines) and gate
-    # the buy auto-publish: a buy demand only auto-publishes when it carries a
-    # resolvable platform OR price, has a substantive sanitized body, and shows
-    # no payment-proof signal. Everything else routes to manual approval.
+    # the buy auto-publish: a buy demand auto-publishes when it has a
+    # substantive sanitized body and shows no payment-proof signal — prices and
+    # platforms are never part of the decision. Everything else routes to manual
+    # approval.
     body_lines, body_ok = parser.prepare_body(content_lines, ai_clean_text or raw_text)
     buy_auto_ok = (
         intent == "buy"
         and not db.is_paused()
-        and (bool(platform_name) or (original_price is not None and original_price > 0))
         and body_ok
         and not filters.detect_payment_proof(raw_text)
     )
 
     if buy_auto_ok:
-        # Buy demand with a clear signal -> rephrase + auto-publish (gated).
+        # Buy demand -> rephrase + auto-publish (gated).
         post_number = db.next_post_number()
         our_text, entities = parser.build_ai_message(
             content_lines=body_lines,
-            our_price=our_price,
+            our_price=None,
             platform=platform_name,
             contact_username=CONTACT_USERNAME,
             intent=intent,
             header_word=analysis.get("header"),
             listing_seed=listing_id,
             post_number=post_number,
+            source_text=raw_text,
         )
 
         try:
@@ -868,18 +845,16 @@ async def _process_supplier_message(
             db.update_listing_status(
                 listing_id=listing_id,
                 status="published",
-                our_price=our_price,
                 published_message_id=published_msg_id,
                 post_number=post_number,
             )
             db.record_audit("published_auto", listing_id, detail=published_msg_id)
             logger.info(
-                "Published listing #%s -> %s (msg_id: %s, post #%s, price: %s)",
+                "Published listing #%s -> %s (msg_id: %s, post #%s)",
                 listing_id,
                 DEST_CHANNEL,
                 published_msg_id,
                 post_number,
-                our_price,
             )
             await _alert_admin_on_published(bot_client, supplier, listing_id)
         except PublishError as exc:
@@ -903,13 +878,11 @@ async def _process_supplier_message(
         if intent == "buy":
             if filters.detect_payment_proof(raw_text):
                 gate_reason = "payment_proof"
-            elif not (bool(platform_name) or (original_price is not None and original_price > 0)):
-                gate_reason = "buy_gate_no_price_platform"
             elif not body_ok:
                 gate_reason = "buy_gate_weak_body"
             else:
                 gate_reason = "buy_gate"
-        db.update_listing_status(listing_id, "pending_approval", our_price=our_price)
+        db.update_listing_status(listing_id, "pending_approval")
         logger.info(
             "Listing #%s marked pending_approval (gate=%s). Alerting admin...",
             listing_id,
@@ -968,31 +941,29 @@ async def process_edited_message(client: TelegramClient, event) -> None:
         return
 
     platform_name = analysis.get("platform")
-    original_price = analysis.get("price")
     intent = analysis.get("intent") or "neutral"
     content_lines = analysis.get("content") or []
     ai_clean_text = "\n".join(content_lines) if content_lines else parser.strip_all_emoji(raw_text)
     header_word = analysis.get("header")
 
     # AI-only decision: update the destination post from whatever the analysis
-    # returns, even without a platform or price (price None -> "Available" variant).
-    multiplier = supplier.get("markup_multiplier") or DEFAULT_MULTIPLIER
-    our_price = _price_for_dispatch(original_price, multiplier, intent)
+    # returns (the footer price is always the static "Price: DM" line).
 
     # No-op guard: skip edit if nothing meaningfully changed.
-    if ai_clean_text == existing.get("clean_text") and existing.get("our_price") == our_price:
+    if ai_clean_text == existing.get("clean_text"):
         logger.debug("Edit on source msg %s is a no-op; skipping", source_msg_id)
         return
 
     updated_text, entities = parser.build_ai_message(
         content_lines=content_lines,
-        our_price=our_price,
+        our_price=None,
         platform=platform_name,
         contact_username=CONTACT_USERNAME,
         intent=intent,
         header_word=header_word,
         listing_seed=existing["id"],
         post_number=existing.get("post_number"),
+        source_text=raw_text,
     )
 
     published_msg_id = existing["published_message_id"]
@@ -1004,15 +975,12 @@ async def process_edited_message(client: TelegramClient, event) -> None:
         db.update_listing_fields(
             listing_id=existing["id"],
             platform_name=platform_name,
-            original_price=original_price,
-            our_price=our_price,
             intent=intent,
             header_word=header_word,
         )
         db.update_listing_content(
             listing_id=existing["id"],
             clean_text=ai_clean_text,
-            our_price=our_price,
             rank_tier=None,
         )
         # TEL-3: refresh the dedup fingerprint from the edited raw text so a
@@ -1075,33 +1043,20 @@ async def approved_listings_worker(
                 # for listings captured before AI was available).
                 content_text = listing.get("clean_text") or listing.get("raw_text") or ""
                 content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
-                our_price = listing.get("our_price")
                 intent = listing.get("intent") or "neutral"
                 post_number = await asyncio.to_thread(db.next_post_number)
 
-                if our_price is None or our_price <= 0:
-                    # No price listed: publish the AVAILABLE variant instead of "$0".
-                    out_text, entities = parser.build_ai_message(
-                        content_lines=content_lines,
-                        our_price=None,
-                        platform=listing.get("platform_name"),
-                        contact_username=CONTACT_USERNAME,
-                        intent=intent,
-                        header_word=listing.get("header_word"),
-                        listing_seed=listing_id,
-                        post_number=post_number,
-                    )
-                else:
-                    out_text, entities = parser.build_ai_message(
-                        content_lines=content_lines,
-                        our_price=our_price,
-                        platform=listing.get("platform_name"),
-                        contact_username=CONTACT_USERNAME,
-                        intent=intent,
-                        header_word=listing.get("header_word"),
-                        listing_seed=listing_id,
-                        post_number=post_number,
-                    )
+                out_text, entities = parser.build_ai_message(
+                    content_lines=content_lines,
+                    our_price=None,
+                    platform=listing.get("platform_name"),
+                    contact_username=CONTACT_USERNAME,
+                    intent=intent,
+                    header_word=listing.get("header_word"),
+                    listing_seed=listing_id,
+                    post_number=post_number,
+                    source_text=listing.get("raw_text"),
+                )
 
                 published_msg_id = None
                 try:
@@ -1263,7 +1218,6 @@ async def rephrase_unpublished() -> None:
         db.update_listing_fields(
             listing_id,
             platform_name=analysis.get("platform"),
-            original_price=analysis.get("price"),
             intent=analysis.get("intent"),
         )
         db.update_listing_content(listing_id, clean_text=ai_clean_text)
