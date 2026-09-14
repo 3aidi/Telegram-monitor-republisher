@@ -11,7 +11,7 @@ import logging
 import os
 import time
 import types
-from typing import List, Optional
+from typing import Optional
 
 import db
 import parser

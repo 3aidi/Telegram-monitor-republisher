@@ -1,0 +1,7 @@
+# Telegram Channel Monitor & Auto-Republisher
+# Pinned to the versions the bot is tested against (python 3.x).
+Telethon==1.44.0
+python-dotenv==1.2.3
+groq==1.7.0
+httpx==0.28.1
+emoji==2.15.0

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -32,10 +33,14 @@ DEFAULT_MULTIPLIER = float(os.environ.get("PRICE_MULTIPLIER", "0.75"))
 # action (edit wizard, Approve tap) must be refused, not silently applied.
 EDITABLE_LISTING_STATUSES = ("pending_approval", "pending_review")
 
-# Skip digest: one aggregated DM per 10-minute window at most, only when there
-# are NEW skipped messages since the last digest marker (SKIP-1). The marker is
-# persisted in app_settings so a restart never re-alerts old skips.
+# Skip digest: at most once per 10-minute window, only when there are NEW
+# skipped messages since the last digest marker (SKIP-1). Each newly-skipped
+# message goes out as ONE send_published_alert-style card (with its own
+# Re-review + source-link buttons), capped per window so a burst of skips never
+# floods the admin. The marker is persisted in app_settings so a restart never
+# re-alerts old skips.
 SKIP_DIGEST_MIN_INTERVAL = 10 * 60
+SKIP_DIGEST_MAX_CARDS = 10
 _skip_digest_last_sent = 0.0
 _skip_digest_task: Optional[asyncio.Task] = None
 
@@ -167,8 +172,14 @@ async def send_published_alert(
 
     buttons = []
     src_url = _source_url(listing)
-    if src_url:
-        buttons.append([Button.url("📥 View in source channel", src_url)])
+    dest_url = _destination_url(listing)
+    if src_url or dest_url:
+        row = []
+        if src_url:
+            row.append(Button.url("📥 View in source channel", src_url))
+        if dest_url:
+            row.append(Button.url("📝 View in my channel", dest_url))
+        buttons.append(row)
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
@@ -263,11 +274,46 @@ def _repair_targets(max_posts: int = 100) -> List[dict]:
     return targets
 
 
+def _skip_notification(k: dict) -> Tuple[str, List[List[object]]]:
+    """One send_published_alert-style card for a single skipped message.
+
+    Mirrors the published-alert layout (header + divider + Supplier/Reason +
+    snippet + divider) so skipped notifications read like their published
+    counterparts. Each card carries its own Re-review button and a source-link
+    button when the supplier's channel resolves to a t.me URL.
+    """
+    reason = (k.get("reason") or "unknown").replace("_", " ")
+    header = f"⏳ **Skipped — {reason}**"
+    src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
+    snippet = (k.get("raw_text") or "").strip().replace("\n", " ")[:240]
+    text = (
+        f"{header}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Supplier : {src}\n"
+        f"Reason   : {reason}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{snippet}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Nothing was published for this message."
+    )
+    buttons = [[Button.inline("🔁 Re-review", data=f"reskip:{k['skip_id']}")]]
+    src_url = _source_url({
+        "supplier_username": k.get("channel_username"),
+        "supplier_channel_id": None,
+        "source_message_id": k.get("message_id"),
+    })
+    if src_url:
+        buttons[0].append(Button.url("📥 View in source channel", src_url))
+    return text, buttons
+
+
 async def skip_digest_worker(bot: TelegramClient) -> None:
-    """Aggregate DM for skipped messages (SKIP-1): fires at most once per
-    10-minute window, only when new skips exist since the last marker, and
-    always as exactly ONE message — no per-skip spam. Immediate DMs are
-    reserved for payment-proof detections, which never land in the skips table."""
+    """Per-skip DM cards for skipped messages (SKIP-1): fires at most once per
+    10-minute window, only when new skips exist since the last marker, sending
+    ONE send_published_alert-style card per newly-skipped message (capped by
+    SKIP_DIGEST_MAX_CARDS) so each card carries its own Re-review + source-link
+    buttons. Immediate DMs are reserved for payment-proof detections, which
+    never land in the skips table."""
     global _skip_digest_last_sent
     while True:
         try:
@@ -282,28 +328,17 @@ async def skip_digest_worker(bot: TelegramClient) -> None:
             new_skips = [k for k in recent if k["skip_id"] > marker]
             if not new_skips:
                 continue
-            counts: Dict[str, int] = {}
-            for k in new_skips:
-                reason = k.get("reason") or "other"
-                counts[reason] = counts.get(reason, 0) + 1
-            reason_text = ", ".join(
-                f"`{r}` {c}"
-                for r, c in sorted(counts.items(), key=lambda kv: -kv[1])
-            )
-            lines = [
-                f"⏳ **{len(new_skips)} message(s) skipped** — none published. "
-                f"Breakdown: {reason_text}",
-            ]
-            for k in new_skips[:3]:
-                src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
-                preview = (k.get("raw_text") or "").strip().replace("\n", " ")[:110]
-                lines.append(f"• `{k.get('reason')}` · {src}: {preview}")
-            lines.append("Tap **🚫 Skipped** to re-review any of them.")
-            try:
-                await bot.send_message(ADMIN_USER_ID, "\n".join(lines))
-            except Exception:
-                logger.exception("Failed to send skip digest")
-                continue
+            for k in new_skips[:SKIP_DIGEST_MAX_CARDS]:
+                text, buttons = _skip_notification(k)
+                try:
+                    await bot.send_message(
+                        ADMIN_USER_ID, text, buttons=buttons, parse_mode="markdown"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to send skip notification for skip #%s", k["skip_id"]
+                    )
+                    continue
             db.set_skip_digest_marker(max(k["skip_id"] for k in new_skips))
             _skip_digest_last_sent = now
         except asyncio.CancelledError:
@@ -346,13 +381,13 @@ def _edit_prompt(listing: dict, existing_draft: Optional[str]) -> str:
     )
 
 
-# Home reply keyboard — persistent 1-tap UI. Label reflects current pause state.
+# Home reply keyboard — persistent 1-tap UI. Labels reflect current state.
 def _home_keyboard() -> List[List[object]]:
     pause_label = "▶ All Start" if db.is_paused() else "⏸ All Stop"
     return [
         [Button.text("📊 Status", resize=True), Button.text("⏳ Pending", resize=True), Button.text("⚠️ Failed", resize=True)],
         [Button.text("📋 Sources", resize=True), Button.text(pause_label, resize=True), Button.text("❓ Help", resize=True)],
-        [Button.text("🚫 Skipped", resize=True), Button.text("📜 Published", resize=True)],
+        [Button.text("🚫 Skipped", resize=True), Button.text("📜 Published", resize=True), Button.text(_asleep_label(), resize=True)],
     ]
 
 
@@ -377,6 +412,48 @@ def _source_url(listing: dict) -> Optional[str]:
     if not ref_str.startswith("@") and not ref_str.startswith("-100"):
         ref_str = f"@{ref_str}"
     return _tgram_chat_link(ref_str, listing.get("source_message_id"))
+
+
+def _destination_url(listing: dict) -> Optional[str]:
+    """Link back to the republished post in the destination channel."""
+    if not listing.get("published_message_id"):
+        return None
+    ref = (DEST_CHANNEL or "").strip()
+    if not ref:
+        return None
+    if not ref.startswith("@") and not ref.startswith("-100"):
+        ref = f"@{ref}"
+    return _tgram_chat_link(ref, listing.get("published_message_id"))
+
+
+def _asleep_label() -> str:
+    """Label for the 'I'm Asleep' toggle button (mirrors the pause label)."""
+    return "☀️ I'm Awake" if db.is_buyer_asleep() else "😴 I'm Asleep"
+
+
+async def _message_delete_send(
+    event,
+    text: str,
+    buttons=None,
+    parse_mode: str = "markdown",
+) -> None:
+    """Delete the tapped message and send a fresh one in its place.
+
+    Keeps the admin chat clean: menu/section navigation and button actions stop
+    editing-in-place (which left every old screen sitting in the chat forever)
+    and instead replace the tapped message with a fresh one. Both steps are
+    best-effort; a deleted source or blocked send degrades gracefully.
+    """
+    try:
+        await event.delete()
+    except Exception:
+        pass
+    try:
+        await event.client.send_message(
+            ADMIN_USER_ID, text, buttons=buttons, parse_mode=parse_mode
+        )
+    except Exception:
+        logger.exception("Failed to send fresh message after delete-and-refresh")
 
 
 def _listing_action_buttons(listing_id: int, status: str) -> List[List[object]]:
@@ -494,20 +571,18 @@ async def _edit_supplier_menu(event, s: dict) -> None:
         )
     else:
         status_line = f"Status: `{'Active' if s['active'] else 'Paused'}`\n"
-    try:
-        await event.edit(
-            f"{icon} **{handle}**\n"
-            f"{status_line}"
-            f"ID: `{s['channel_id'] or 'unresolved'}`\n\n"
-            f"What would you like to do?",
-            buttons=[
-                [Button.inline(toggle_label, data=f"suptoggle:{sid}")],
-                [Button.inline("🗑 Delete Permanently", data=f"supdel:{sid}")],
-                [Button.inline("⬅️ Back", data="menu:sources")],
-            ],
-        )
-    except Exception:
-        await event.answer("Menu updated", alert=True)
+    await _message_delete_send(
+        event,
+        f"{icon} **{handle}**\n"
+        f"{status_line}"
+        f"ID: `{s['channel_id'] or 'unresolved'}`\n\n"
+        f"What would you like to do?",
+        buttons=[
+            [Button.inline(toggle_label, data=f"suptoggle:{sid}")],
+            [Button.inline("🗑 Delete Permanently", data=f"supdel:{sid}")],
+            [Button.inline("⬅️ Back", data="menu:sources")],
+        ],
+    )
 
 
 async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
@@ -628,27 +703,8 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
 
 def _sources_menu_text(suppliers: List[dict]) -> str:
     if not suppliers:
-        return "📋 **Monitored Sources:**\n\nNo sources configured yet."
-    lines = ["📋 **Monitored Sources:**\n"]
-    has_unresolved = False
-    for s in suppliers:
-        icon = _source_status_icon(s)
-        if not s.get("channel_id"):
-            has_unresolved = True
-            status_tag = " ⚠️*unresolved* "
-        else:
-            status_tag = " "
-        lines.append(
-            f"{icon} **{_pretty_source(s.get('channel_username'), s.get('display_name'))}**"
-            f"{status_tag}(ID: `{s['channel_id'] or '—'}`)"
-        )
-    if has_unresolved:
-        lines.append(
-            "\n_⚠️ Unresolved sources are **not** being listened to yet. Re-add them "
-            "by the correct username/ID, or forward a message from the channel — "
-            "or wait for the auto-retry worker to ping you._"
-        )
-    return "\n".join(lines)
+        return "No sources configured yet."
+    return "Tap a source below to manage it."
 
 
 def _sources_buttons(suppliers: List[dict]) -> List[List[object]]:
@@ -691,6 +747,9 @@ def _home_inline_keyboard() -> List[List[object]]:
             Button.inline("🚫 Skipped", data="home:skipped"),
             Button.inline("📜 Published", data="home:published"),
         ],
+        [
+            Button.inline(_asleep_label(), data="home:asleep"),
+        ],
     ]
 
 
@@ -704,7 +763,8 @@ def _help_text() -> str:
         "• **📋 Sources** — add, manage, remove sources\n"
         "• **📜 Published** — every post with its **#Post number** + channel & source links\n"
         "• **🔢 /post 12** — jump straight to post #12\n"
-        "• **⏸ All Stop / ▶ All Start** — pause or resume publishing\n\n"
+        "• **⏸ All Stop / ▶ All Start** — pause or resume AUTOMATIC publishing only. "
+        "Manual Approve taps still publish immediately.\n\n"
         "Slash shortcuts still work if you prefer typing them."
     )
 
@@ -740,7 +800,7 @@ def _status_report_text() -> str:
         f"**Skip Breakdown**\n{reason_text}"
     )
     if db.is_paused():
-        msg = "⏸ **PAUSED — publishing is stopped**\n\n" + msg
+        msg = "⏸ **PAUSED — automatic publishing is stopped**\n(manual Approve taps still publish)\n\n" + msg
     return msg
 
 
@@ -761,46 +821,108 @@ def _failed_digest(failed: List[dict]) -> Tuple[str, List[List[object]]]:
     return "\n".join(lines), buttons
 
 
+def _relative_time(iso_ts: Optional[str]) -> str:
+    """Compact human age for a skip timestamp ('2h ago'), '' when unknown.
+
+    Stdlib only; naive timestamps are assumed UTC (skips are stored aware via
+    datetime.now(timezone.utc).isoformat())."""
+    if not iso_ts:
+        return ""
+    try:
+        ts = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    secs = int(max((datetime.now(timezone.utc) - ts).total_seconds(), 0))
+    if secs < 60:
+        return "just now"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m ago"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    if days < 7:
+        return f"{days}d ago"
+    return f"{days // 7}w ago"
+
+
+# Per-reason icon map for the /skipped screen: reasons are scannable without
+# reading text. Every reason produced by the codebase (filters.py constants +
+# main.py's log_skip call sites) is covered; unknown/legacy rows get a neutral
+# fallback. Keep in sync with filters.REASON_* and main.py log_skip callers.
+SKIP_REASON_ICONS = {
+    "duplicate": "🔁",      # fingerprint duplicate within DEDUP_HOURS
+    "not_a_listing": "💬",  # AI judged the message as not a listing
+    "chatter": "🗨️",        # obvious chatter: rule posts, welcomes, pins
+    "no_content": "⬜",     # empty / whitespace-only body
+    "self_echo": "🔄",      # our own destination output looped back to a source
+}
+
+
+def _skip_reason_icon(reason: Optional[str]) -> str:
+    """Distinct icon per skip reason ('📄' for anything unmapped)."""
+    return SKIP_REASON_ICONS.get((reason or "").strip(), "📄")
+
+
 def _skipped_digest(skips: List[dict]) -> Tuple[str, List[List[object]]]:
-    lines = ["🚫 **Recently skipped** — the ones that never made it to review:\n"]
+    """Buttons-only recent-skips list.
+
+    The body is intentionally empty (a single em-dash placeholder): the "Skipped"
+    context already reads from the button that opened the screen, and each
+    Re-review button label carries a reason icon + reason + supplier + age
+    ('🔁 duplicate · @kycgroupke · 2h ago') so you can pick the right one at a
+    glance instead of reading a wall. Skips with no linked listing can't be
+    reopened, so those drop to a one-line count instead of a dead text entry."""
+    reopenable = [k for k in skips if k.get("listing_id")]
     buttons = []
-    for i, k in enumerate(skips, 1):
-        reason = k.get("reason") or "?"
+    for k in reopenable:
+        reason = (k.get("reason") or "unknown").replace("_", " ")
         src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
-        ts = (k.get("timestamp") or "")[:16].replace("T", " ")
-        preview = (k.get("raw_text") or "").strip().replace("\n", " ")[:130]
-        lines.append(f"{i}. **{reason}** · {src} · {ts}\n   {preview}")
-        if k.get("listing_id"):
-            buttons.append([
-                Button.inline(f"🔁 Re-review #{k['listing_id']}", data=f"reskip:{k['skip_id']}"),
-            ])
+        age = _relative_time(k.get("timestamp"))
+        label = f"{_skip_reason_icon(k.get('reason'))} {reason} · {src}"
+        if age:
+            label += f" · {age}"
+        buttons.append([Button.inline(label, data=f"reskip:{k['skip_id']}")])
+    if reopenable:
+        text = "—"
+        dropped = len(skips) - len(reopenable)
+        if dropped:
+            text += f"\n_({dropped} more recent skip(s) not re-reviewable — no listing linked.)_"
+    else:
+        text = "**Skipped** — none of the recent skips can be re-opened."
     buttons.extend(_home_button_row())
-    return "\n".join(lines), buttons
+    return text, buttons
 
 
 def _published_digest(rows: List[dict]) -> Tuple[str, List[List[object]]]:
-    lines = ["📜 **Published posts** — each has a **#Post number** to reference it:\n"]
+    """Buttons-only published list: per post ONE row of two no-emoji URL buttons.
+
+    Button A links the post's #number to the published post in our channel;
+    Button B links the source group/channel name to the original source post.
+    No text lines: the button labels carry all the meaning."""
+    text = "📜 **Published posts** — tap a button to open a post:\n"
     buttons = []
-    for i, p in enumerate(rows):
-        platform = (p.get("platform_name") or p.get("game_name") or "?").title()
-        supplier = p.get("supplier_username")
-        supplier_chat = p.get("supplier_channel_id")
-        src_disp = _pretty_source(supplier, p.get("supplier_display_name"))
-        if not src_disp or src_disp == "?":
-            src_disp = f"channel {supplier_chat}"
-        created = (p.get("published_at") or p.get("created_at") or "")[:10]
+    for p in rows:
         post_num = p.get("post_number")
-        num_disp = f"#{post_num}" if post_num is not None else "—"
-        label = platform if platform != "?" else "Listing"
+        num_disp = f"#{post_num}" if post_num is not None else f"Listing {p.get('id')}"
+        src_disp = _pretty_source(p.get("supplier_username"), p.get("supplier_display_name"))
+        if not src_disp or src_disp == "?":
+            platform = (p.get("platform_name") or p.get("game_name") or "").title()
+            src_disp = platform or "Source"
         src_url = _source_url(p)
-        entry = f"**{num_disp}** · {label} — {src_disp} · {created}"
+        dest_url = _destination_url(p)
+        row = []
+        if dest_url:
+            row.append(Button.url(num_disp, dest_url))
         if src_url:
-            lines.append(f"{i + 1}. {entry}")
-            buttons.append([Button.url(f"🔢 {num_disp} 📥 {label}", src_url)])
-        else:
-            lines.append(f"{i + 1}. {entry}")
+            row.append(Button.url(src_disp, src_url))
+        if row:
+            buttons.append(row)
     buttons.extend(_home_button_row())
-    return "\n".join(lines), buttons
+    return text, buttons
 
 
 def setup_admin_handlers(bot: TelegramClient) -> None:
@@ -852,11 +974,28 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         db.set_paused(not paused)
         state_label = "⏸ **Paused**" if not paused else "▶ **Resumed**"
         await event.reply(
-            f"{state_label}. New listings are still captured and shown here for review, "
-            f"but nothing will be published.",
+            f"{state_label}. New listings are still captured and shown here for review. "
+            f"Automatic publishing is {'stopped' if not paused else 'running'} — "
+            f"but manual **Approve** taps always publish immediately.",
             buttons=_home_keyboard(),
             parse_mode="markdown",
         )
+
+    @bot.on(events.NewMessage(pattern=r"^(?:😴 I'm Asleep|☀️ I'm Awake)$"))
+    async def handle_asleep_toggle(event):
+        if not await check_admin(event):
+            return
+        asleep = db.is_buyer_asleep()
+        db.set_buyer_asleep(not asleep)
+        if not asleep:
+            state_label = (
+                "😴 **Asleep** — every new post now carries the footer\n"
+                "`Buyer away, back shortly`\n"
+                "Use the button again to switch it back off."
+            )
+        else:
+            state_label = "☀️ **Awake** — posts go out with their normal footer again."
+        await event.reply(state_label, buttons=_home_keyboard(), parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/addsupplier(?:\s+(.+))?"))
     async def handle_add_supplier(event):
@@ -1215,12 +1354,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 "skipped_reopen", reopened["id"], actor_id=event.sender_id,
                 detail=f"skip #{skip_id}",
             )
+            # Delete the tapped message — whether it's one of the new per-skip
+            # cards or the aggregated /skipped list (that whole list goes away,
+            # which is the accepted tradeoff for never leaving stale screens).
             try:
-                await event.edit(
-                    f"🔁 Re-opened as **Listing #{reopened['id']}** — now pending approval."
-                )
+                await event.delete()
             except Exception:
-                await event.answer(f"Re-opened #{reopened['id']}", alert=True)
+                pass
             listing_dict = db.get_listing_by_id(reopened["id"])
             if listing_dict:
                 listing_dict["_review_reason"] = "skipped_reopen"
@@ -1230,10 +1370,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         # ---- Pure navigation -----------------------------------------------
         if data_str == "menu:home":
             await event.answer("🏠 Home")
-            try:
-                await event.edit(_home_text(), buttons=_home_inline_keyboard())
-            except Exception:
-                await event.answer("Home", alert=True)
+            await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
             return
 
         if data_str == "menu:sources":
@@ -1241,117 +1378,96 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             text = _sources_menu_text(suppliers)
             if not suppliers:
                 text += "\nTap **➕ Add Source** to configure your first one."
-            try:
-                await event.edit(text, buttons=_sources_buttons(suppliers), parse_mode=None)
-            except Exception:
-                await event.answer("Sources refreshed", alert=True)
+            await _message_delete_send(event, text, buttons=_sources_buttons(suppliers), parse_mode=None)
             return
 
         if data_str.startswith("home:"):
             home_action = data_str.split(":", 1)[1]
             if home_action == "status":
-                try:
-                    await event.edit(_status_report_text(), buttons=_home_button_row())
-                except Exception:
-                    await event.answer("Status", alert=True)
+                await _message_delete_send(event, _status_report_text(), buttons=_home_button_row())
                 return
             if home_action == "pending":
                 pending = db.get_pending_listings(limit=5)
                 if not pending:
-                    try:
-                        await event.edit(
-                            "✅ No listings pending approval right now.",
-                            buttons=_home_button_row(),
-                        )
-                    except Exception:
-                        await event.answer("Pending", alert=True)
-                    return
-                try:
-                    await event.edit(
-                        f"Found {len(pending)} listing(s) pending review:",
+                    await _message_delete_send(
+                        event,
+                        "✅ No listings pending approval right now.",
                         buttons=_home_button_row(),
                     )
-                except Exception:
-                    pass
+                    return
+                await _message_delete_send(
+                    event,
+                    f"Found {len(pending)} listing(s) pending review:",
+                    buttons=_home_button_row(),
+                )
                 for l in pending:
                     await send_approval_prompt(bot, ADMIN_USER_ID, l)
                 return
             if home_action == "failed":
                 failed = db.get_failed_listings(limit=10)
                 if not failed:
-                    try:
-                        await event.edit(
-                            "✅ No failed publishes in the queue.",
-                            buttons=_home_button_row(),
-                        )
-                    except Exception:
-                        await event.answer("Failed", alert=True)
+                    await _message_delete_send(
+                        event,
+                        "✅ No failed publishes in the queue.",
+                        buttons=_home_button_row(),
+                    )
                     return
                 text, buttons = _failed_digest(failed)
-                try:
-                    await event.edit(text, buttons=buttons, parse_mode="markdown")
-                except Exception:
-                    await event.answer("Failed", alert=True)
+                await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
             if home_action == "help":
-                try:
-                    await event.edit(_help_text(), buttons=_home_button_row())
-                except Exception:
-                    await event.answer("Help", alert=True)
+                await _message_delete_send(event, _help_text(), buttons=_home_button_row())
                 return
             if home_action == "toggle":
                 paused = db.is_paused()
                 db.set_paused(not paused)
                 await event.answer(
-                    "⏸ Publishing paused" if not paused else "▶ Publishing resumed"
+                    "⏸ Automatic publishing paused" if not paused else "▶ Automatic publishing resumed"
                 )
-                try:
-                    await event.edit(_home_text(), buttons=_home_inline_keyboard())
-                except Exception:
-                    await event.answer("Toggled", alert=True)
+                await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
+                return
+            if home_action == "asleep":
+                asleep = db.is_buyer_asleep()
+                db.set_buyer_asleep(not asleep)
+                await event.answer(
+                    "😴 Asleep — footer added to new posts" if not asleep
+                    else "☀️ Awake — footer removed"
+                )
+                await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
                 return
             if home_action == "skipped":
                 skips = db.get_skipped_listings(limit=15)
                 if not skips:
-                    try:
-                        await event.edit(
-                            "✅ No skipped messages logged.",
-                            buttons=_home_button_row(),
-                        )
-                    except Exception:
-                        await event.answer("Skipped", alert=True)
+                    await _message_delete_send(
+                        event,
+                        "✅ No skipped messages logged.",
+                        buttons=_home_button_row(),
+                    )
                     return
                 text, buttons = _skipped_digest(skips)
-                try:
-                    await event.edit(text, buttons=buttons, parse_mode="markdown")
-                except Exception:
-                    await event.answer("Skipped", alert=True)
+                await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
             if home_action == "published":
                 rows = db.get_published_listings(limit=10)
                 if not rows:
-                    try:
-                        await event.edit(
-                            "📜 No published posts yet.",
-                            buttons=_home_button_row(),
-                        )
-                    except Exception:
-                        await event.answer("Published", alert=True)
+                    await _message_delete_send(
+                        event,
+                        "📜 No published posts yet.",
+                        buttons=_home_button_row(),
+                    )
                     return
                 text, buttons = _published_digest(rows)
-                try:
-                    await event.edit(text, buttons=buttons, parse_mode="markdown")
-                except Exception:
-                    await event.answer("Published", alert=True)
+                await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
             return
 
         if data_str == "wiz:cancel":
             _wizard_state.pop(ADMIN_USER_ID, None)
+            await event.answer("Cancelled")
             try:
-                await event.edit("❌ Cancelled.", buttons=None)
+                await event.delete()
             except Exception:
-                await event.answer("Cancelled", alert=True)
+                pass
             return
 
         # ---- Suppliers submenu ---------------------------------------------
@@ -1398,7 +1514,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await event.answer("Source not found.", alert=True)
                 return
             handle = _pretty_source(s.get("channel_username"), s.get("display_name"))
-            await event.edit(
+            await _message_delete_send(
+                event,
                 f"🗑 **Delete {handle} permanently?**\n"
                 f"This removes the source completely and stops monitoring it.\n"
                 f"Existing listings & history stay (their source link becomes '—').\n"
@@ -1422,13 +1539,19 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 "supplier_deleted", None, actor_id=ADMIN_USER_ID, detail=str(sid)
             )
             try:
-                await event.edit(
+                await event.delete()
+            except Exception:
+                pass
+            try:
+                await event.client.send_message(
+                    ADMIN_USER_ID,
                     f"🗑 **Source permanently deleted.**\n"
                     f"{_pretty_source(s.get('channel_username'), s.get('display_name'))} "
-                    f"is gone from the list. History is kept."
+                    f"is gone from the list. History is kept.",
+                    parse_mode="markdown",
                 )
             except Exception:
-                await event.answer("Deleted permanently.", alert=True)
+                pass
             suppliers = db.list_suppliers(active_only=False)
             await event.client.send_message(
                 ADMIN_USER_ID,
@@ -1448,12 +1571,21 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 db.record_audit(
                     "env_reseed", None, actor_id=ADMIN_USER_ID, detail=f"re-seeded {n} supplier(s)"
                 )
-                await event.edit(
-                    f"✅ Re-imported {n} channel(s) from SOURCE_CHANNELS.\n"
-                    "The one-time seed marker is set again — .env won't be consulted "
-                    "on future restarts.",
-                    buttons=_home_keyboard(),
-                )
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                try:
+                    await event.client.send_message(
+                        ADMIN_USER_ID,
+                        f"✅ Re-imported {n} channel(s) from SOURCE_CHANNELS.\n"
+                        "The one-time seed marker is set again — .env won't be consulted "
+                        "on future restarts.",
+                        buttons=_home_keyboard(),
+                        parse_mode="markdown",
+                    )
+                except Exception:
+                    pass
             except Exception:
                 logger.exception("reseed_from_env failed")
                 await event.answer("Re-seed failed — check the logs.", alert=True)
@@ -1475,20 +1607,27 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 "supplier_added_unresolved", sid, actor_id=ADMIN_USER_ID, detail=raw
             )
             try:
-                await event.edit(
+                await event.delete()
+            except Exception:
+                pass
+            try:
+                await event.client.send_message(
+                    ADMIN_USER_ID,
                     f"✅ Source **@{username}** stored as **unresolved**.\n"
                     f"I'll retry resolving it in the background and ping you the moment "
                     f"monitoring actually starts for it.\n\n"
                     f"Faster: forward any message **from that channel** and I'll add it instantly.",
                     buttons=_home_keyboard(),
+                    parse_mode="markdown",
                 )
             except Exception:
-                await event.answer("Saved as unresolved.", alert=True)
+                pass
             return
 
         if data_str == "supadd":
             _wizard_state[ADMIN_USER_ID] = {"step": "add"}
-            await event.edit(
+            await _message_delete_send(
+                event,
                 "✏️ **Add a source** — any of these work:\n"
                 "• Channel username: `@kycgroupke`\n"
                 "• Numeric ID: `-1001234567890`\n"
@@ -1496,6 +1635,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 "chats with no username (I'll grab its exact ID automatically).\n\n"
                 "Send any of the above now.",
                 buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
+                parse_mode="markdown",
             )
             return
 
@@ -1516,9 +1656,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 logger.exception("Failed to build preview for listing #%s", listing_id)
                 await event.answer("Could not build preview for this listing.", alert=True)
                 return
-            # Send a fresh message instead of editing the prompt in place:
-            # Telethon edits of the prompt text are rejected by Telegram for long
-            # posts ("invalid entity bounds"), which made the button look dead.
+            # Delete the tapped prompt card; the preview is the new anchor message.
+            try:
+                await event.delete()
+            except Exception:
+                pass
             await event.client.send_message(
                 ADMIN_USER_ID,
                 f"📄 **Preview of Listing #{listing_id}**\n"
@@ -1541,10 +1683,23 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
             listing_id = listing["id"]
             _wizard_state[ADMIN_USER_ID] = {"step": "edit", "listing_id": listing_id}
-            await event.edit(
-                _edit_prompt(listing, _drafts.get(listing_id)),
-                buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
-            )
+            # Delete the tapped prompt; the wizard prompt below becomes the new anchor.
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            try:
+                sent = await event.client.send_message(
+                    ADMIN_USER_ID,
+                    _edit_prompt(listing, _drafts.get(listing_id)),
+                    buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
+                    parse_mode="markdown",
+                )
+                prompt_id = getattr(sent, "id", None)
+                if prompt_id:
+                    _wizard_state[ADMIN_USER_ID]["prompt_message_id"] = prompt_id
+            except Exception:
+                logger.exception("Failed to send edit prompt for listing #%s", listing_id)
             return
 
         match = re.match(r"^(approve|reject|retry):(\d+)$", data_str)
@@ -1568,7 +1723,17 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             db.record_audit("requeue", listing_id, actor_id=event.sender_id)
             if ok:
                 try:
-                    await event.edit(f"🔁 Listing #{listing_id} re-queued for publishing.")
+                    await event.delete()
+                except Exception:
+                    pass
+                try:
+                    await event.client.send_message(
+                        ADMIN_USER_ID,
+                        f"🔁 Listing #{listing_id} re-queued for publishing. "
+                        f"The republisher will pick it up shortly.",
+                        buttons=_home_keyboard(),
+                        parse_mode="markdown",
+                    )
                 except Exception:
                     await event.answer(f"Re-queued #{listing_id}", alert=True)
             else:
@@ -1587,10 +1752,20 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             _drafts.pop(listing_id, None)
             db.update_listing_status(listing_id, "rejected")
             db.record_audit("rejected", listing_id, actor_id=event.sender_id)
+            await event.answer("❌ Rejected")
             try:
-                await event.edit(f"❌ Listing #{listing_id} rejected and dismissed.")
+                await event.delete()
             except Exception:
-                await event.answer(f"❌ Rejected #{listing_id}", alert=True)
+                pass
+            try:
+                await event.client.send_message(
+                    ADMIN_USER_ID,
+                    f"❌ Listing #{listing_id} rejected and dismissed.",
+                    buttons=_home_keyboard(),
+                    parse_mode="markdown",
+                )
+            except Exception:
+                pass
             return
 
         if action == "approve":
@@ -1607,16 +1782,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     f"(status: {fresh['status']}). Draft discarded — nothing was published.",
                     alert=True,
                 )
-                try:
-                    await event.edit(
-                        f"⚠️ **Listing #{listing_id} was NOT published.**\n"
-                        f"Status is now `{fresh['status']}`, so the draft you were "
-                        f"editing was discarded.\n"
-                        f"Check the Pending list for its current state.",
-                        buttons=_home_keyboard(),
-                    )
-                except Exception:
-                    pass
+                await _message_delete_send(
+                    event,
+                    f"⚠️ **Listing #{listing_id} was NOT published.**\n"
+                    f"Status is now `{fresh['status']}`, so the draft you were "
+                    f"editing was discarded.\n"
+                    f"Check the Pending list for its current state.",
+                    buttons=_home_keyboard(),
+                )
                 return
 
             # A draft (from ✏️ Edit) replaces the source content.
@@ -1627,12 +1800,15 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             intent = listing.get("intent") or "neutral"
 
             await event.answer("Processing...")
-            if db.is_paused():
-                await event.edit(
-                    f"⏸ **Paused** — publishing is stopped.\n"
-                    f"Tap **▶ All Start** to resume, then approve again."
-                )
-                return
+            # Approve is a deliberate one-at-a-time human decision: it always
+            # publishes immediately, even while "All Stop" is on. Pausing only
+            # gates AUTOMATIC publishing (auto-publish paths in main.py).
+            # The tap was consumed: delete the prompt so no stale screen lingers,
+            # then any confirmation below is a fresh message, never an in-place edit.
+            try:
+                await event.delete()
+            except Exception:
+                pass
 
             post_number = db.next_post_number()
             republished_text, entities = parser.build_ai_message(
@@ -1666,9 +1842,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         "approved_queued", listing_id, actor_id=event.sender_id, detail=str(e)[:200]
                     )
                     try:
-                        await event.edit(
+                        await event.client.send_message(
+                            ADMIN_USER_ID,
                             f"⚠️ Listing #{listing_id} approved but send failed.\n"
-                            f"Queued for retry. Error: {e}"
+                            f"Queued for retry. Error: {e}",
+                            buttons=_home_keyboard(),
+                            parse_mode="markdown",
                         )
                     except Exception:
                         pass
@@ -1708,7 +1887,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         f"Channel: {DEST_CHANNEL}\n"
                         f"Price: `DM`"
                     )
-                    await event.edit(confirmation)
+                    await event.client.send_message(
+                        ADMIN_USER_ID, confirmation, parse_mode="markdown",
+                    )
                 except Exception:
                     pass
                 return
@@ -1719,10 +1900,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     detail="queued for worker publish",
                 )
                 try:
-                    await event.edit(
+                    await event.client.send_message(
+                        ADMIN_USER_ID,
                         f"✅ Listing #{listing_id} marked approved.\n"
                         f"Will be dispatched to {DEST_CHANNEL} by the republisher.\n"
-                        f"(User listener not connected — sent via the worker queue.)"
+                        f"(User listener not connected — sent via the worker queue.)",
+                        buttons=_home_keyboard(),
+                        parse_mode="markdown",
                     )
                 except Exception:
                     pass
@@ -1753,12 +1937,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         # Menu taps must not be swallowed while a wizard is waiting
         if text in ("📊 Status", "⏳ Pending", "⚠️ Failed", "📋 Sources",
-                    "⏸ All Stop", "▶ All Start", "❓ Help", "📜 Published"):
+                    "⏸ All Stop", "▶ All Start", "❓ Help", "📜 Published",
+                    "😴 I'm Asleep", "☀️ I'm Awake"):
             _wizard_state.pop(ADMIN_USER_ID, None)
             return
 
         if not state:
             return
+        prompt_message_id = state.get("prompt_message_id")
         _wizard_state.pop(ADMIN_USER_ID, None)
 
         if state["step"] == "add":
@@ -1791,6 +1977,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     buttons=_home_keyboard(),
                 )
                 return
+            # The "send your draft" prompt is spent — delete it so the chat shows
+            # only the draft preview, then the Approve/Edit buttons on it.
+            if prompt_message_id:
+                try:
+                    await bot.delete_messages(ADMIN_USER_ID, [prompt_message_id])
+                except Exception:
+                    pass
             await event.reply(
                 f"✏️ **Draft for Listing #{listing_id}** — review below, "
                 f"then Approve or Edit again.\n"
@@ -1842,8 +2035,8 @@ async def create_admin_bot_client() -> TelegramClient:
     except Exception as e:
         logger.warning("Could not set bot commands menu: %s", e)
 
-    # Skip digest: one aggregated DM per 10-min window when new messages were
-    # skipped (starts its own task; the marker persists across restarts).
+    # Skip digest: at most once per window, one card per newly-skipped message
+    # (capped at SKIP_DIGEST_MAX_CARDS); the marker persists across restarts.
     global _skip_digest_task
     _skip_digest_task = asyncio.create_task(skip_digest_worker(bot))
 

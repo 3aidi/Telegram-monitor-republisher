@@ -1593,13 +1593,46 @@ def get_setting(key: str, default: Optional[str] = None, db_path: Optional[str] 
 
 
 def is_paused(db_path: Optional[str] = None) -> bool:
-    """True when publishing is paused via the admin 'All Stop' switch."""
+    """True when AUTOMATIC publishing is paused via the admin 'All Stop' switch.
+
+    Manual admin Approve is unaffected: approval always publishes immediately.
+    """
     return get_setting("paused", "0", db_path=db_path) == "1"
 
 
 def set_paused(paused: bool, db_path: Optional[str] = None) -> None:
-    """Set the pause switch ('1' pauses all publishing, '0' resumes)."""
+    """Set the pause switch ('1' pauses AUTOMATIC publishing, '0' resumes).
+
+    Only gates the bot's own auto-publish paths; manual Approve still publishes.
+    """
     set_setting("paused", "1" if paused else "0", db_path=db_path)
+
+
+def is_buyer_asleep(db_path: Optional[str] = None) -> bool:
+    """True when the 'I'm Asleep' toggle is ON (appends a short out-of-office
+    footer to every published post; see BUYER_ASLEEP_FOOTER / buy_asleep_footer)."""
+    return get_setting("buyer_asleep", "0", db_path=db_path) == "1"
+
+
+def set_buyer_asleep(asleep: bool, db_path: Optional[str] = None) -> None:
+    """Set the 'I'm Asleep' toggle ('1' appends the footer, '0' hides it)."""
+    set_setting("buyer_asleep", "1" if asleep else "0", db_path=db_path)
+
+
+def get_buyer_asleep_footer(db_path: Optional[str] = None) -> str:
+    """Footer line appended to published posts while the buyer is 'asleep'.
+
+    Resolved per-render: app_settings key 'buyer_asleep_footer' (settable via
+    the admin bot) wins, then the BUYER_ASLEEP_FOOTER env var, then the built-in
+    default 'Buyer away, back shortly'.
+    """
+    custom = get_setting("buyer_asleep_footer", None, db_path=db_path)
+    if custom and custom.strip():
+        return custom.strip()
+    env = os.environ.get("BUYER_ASLEEP_FOOTER", "").strip()
+    if env:
+        return env
+    return "Buyer away, back shortly"
 
 
 # ---------------------------------------------------------------------------

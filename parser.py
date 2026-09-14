@@ -5,6 +5,7 @@ extraction and rewriting. This module only formats the final post shell and
 provides a small price parser used by the admin edit/preview flow.
 """
 
+import os
 import re
 import unicodedata
 from typing import List, Optional, Tuple
@@ -34,7 +35,18 @@ PH_PHONE  = "📞"
 
 
 def _make_custom_emoji_entity(offset: int, document_id: int, placeholder: str):
-    """Create a MessageEntityCustomEmoji at the given UTF-16 offset."""
+    """Create a MessageEntityCustomEmoji with the SAME offset/length semantics
+    Telegram requires: both are measured in UTF-16 code units, and the entity
+    must wrap EXACTLY ONE regular emoji equal to the custom document's
+    ``documentAttributeCustomEmoji.alt``.
+
+    ``offset`` must already be an absolute UTF-16 code-unit position (compute it
+    with ``_utf16_len(text_before)``, never Python's ``len``). ``length`` is
+    derived here from the placeholder's own UTF-16 size, so multi-code-unit
+    anchors (🔥=2, 🇵🇱=4, 🏴󠁧󠁢󠁳󠁣󠁴󠁿=14) are always right. This ONE helper is the
+    only place entities are built, so the two systems (header/price/contact
+    role-emoji and country flags) can never drift out of sync.
+    """
     # Import here to avoid circular imports at module level
     from telethon.tl.types import MessageEntityCustomEmoji
     # Custom emoji length = length of the placeholder character in UTF-16 code units
@@ -297,6 +309,13 @@ def sanitize_body_lines(content_lines, max_lines: int = 40) -> List[str]:
         if _is_leaky_line(ln, probe, probe.lower()):
             continue
         stripped = _PRICE_BLOB_RE.sub("", ln)
+        # Strip literal markdown-bold syntax ("**ESTY KYC**") and lone single
+        # asterisks used the same way. THE published-post send passes
+        # formatting_entities WITHOUT parse_mode, so Telethon never interprets
+        # "**" as bold — without this, asterisks would leak into the post as
+        # literal characters. This runs in the ONE shared sanitizer each render
+        # path goes through (auto-publish, approve, preview, /repair).
+        stripped = stripped.replace("**", "").replace("*", "")
         stripped = re.sub(r"\s{2,}", " ", stripped).strip()
         if stripped:
             kept.append(stripped)
@@ -317,6 +336,31 @@ def prepare_body(
     lines = sanitize_body_lines(content_lines)
     ok = len(lines) >= 2 and any(len(ln.strip()) >= 8 for ln in lines)
     return lines, ok
+
+
+def _asleep_footer_line() -> Optional[str]:
+    """Return the buyer-asleep footer line, or None when the toggle is OFF.
+
+    ``build_ai_message`` is the ONE place every published post is rendered
+    (auto worker, admin approve, preview, /repair), so this single hook keeps
+    every path consistent. ``db`` is imported lazily and every failure degrades
+    to no footer, keeping parser a leaf module that runs standalone (unit tests,
+    tooling). A missing default DB is never created here either — the line is
+    skipped instead of side-effecting a new ``monitor.db`` file.
+    """
+    try:
+        import db
+    except Exception:
+        return None
+    if not os.path.exists(db.DEFAULT_DB_PATH):
+        return None
+    try:
+        if not db.is_buyer_asleep():
+            return None
+        footer = db.get_buyer_asleep_footer() or "Buyer away, back shortly"
+        return footer.strip()
+    except Exception:
+        return None
 
 
 def build_ai_message(
@@ -351,13 +395,17 @@ def build_ai_message(
     publishing decisions here. ``our_price`` / ``has_price`` are accepted for
     call-site compatibility but are deliberately ignored.
 
-    Every country mentioned in ``source_text`` (the raw incoming message) is
-    emitted on its own line — "Country ·" — with the fixed custom emoji from
-    countries.COUNTRY_EMOJI, in first-appearance order, deduplicated. The line
-    shows the country name exactly as the message wrote it (the first spelling
-    for repeats, so "USA and US" renders "USA"). No Unicode flag is ever used
-    and nothing is fetched at runtime. Callers without raw text can omit
-    ``source_text``; no country lines are then added.
+    Every country mentioned in the body is flagged on its OWN line where it
+    appears: the country's real flag emoji (e.g. 🇵🇱 — the exact
+    ``documentAttributeCustomEmoji.alt`` glyph) is appended after the country
+    name on that same line and wrapped by a MessageEntityCustomEmoji entity.
+    Telegram renders the custom emoji only over that exact glyph, so the anchor
+    is never a generic placeholder. Countries in ``source_text`` that the body
+    does not already mention get a generated country line below the body, so no
+    country goes unflagged and none is ever duplicated. Callers without raw
+    text can omit ``source_text``; source-derived extras are then skipped.
+    All entity offsets/lengths are UTF-16 code units (see
+    _make_custom_emoji_entity).
 
     Returns (text, entities) — pass both to Telethon send_message(). When
     ``sanitize_body`` is False the body is wrapped verbatim (used only to
@@ -387,11 +435,16 @@ def build_ai_message(
         cursor += _utf16_len(post_num_line)
 
     # ── Header line
+    # _build_header returns offsets LOCAL to the header substring; rebase them
+    # onto the absolute UTF-16 cursor so a preceding post-number banner (or any
+    # future prefix) can never shift the flame entities out of place.
     header_text, header_entities = _build_header(
         platform_display, header_word, header_doc, header_doc
     )
-    parts.append(header_text)
+    for header_entity in header_entities:
+        header_entity.offset += cursor
     entities.extend(header_entities)
+    parts.append(header_text)
     cursor += _utf16_len(header_text)
 
     # ── Divider
@@ -399,20 +452,46 @@ def build_ai_message(
     parts.append(divider)
     cursor += _utf16_len(divider)
 
-    # ── Content lines (emoji-free body: emoji allowed only in header/footer)
-    for ln in lines:
-        line_str = f"{ln}\n"
+    # ── Content lines (emoji-free body: emoji allowed only in header/footer).
+    # Country flags are attached HERE, after sanitization: a body line that
+    # mentions a country gets that country's custom flag appended to the SAME
+    # line. The anchor is the country's real alt emoji (e.g. 🇵🇱), which is
+    # exactly what the custom document's alt contains — Telegram renders the
+    # custom emoji only over that exact glyph. Because flags are appended to the
+    # final text AFTER sanitize_body_lines ran, the body emoji-strip can never
+    # touch them (see countries.flag_body_lines).
+    flagged_lines, body_countries = countries.flag_body_lines(lines)
+    for line_text, flags in flagged_lines:
+        line_str = f"{line_text}\n"
         parts.append(line_str)
+        pos = 0
+        for alt, doc_id in flags:
+            idx = line_text.find(alt, pos)
+            if idx < 0:  # generated lines always carry their anchor; be safe
+                continue
+            entities.append(
+                _make_custom_emoji_entity(
+                    cursor + _utf16_len(line_text[:idx]), doc_id, alt
+                )
+            )
+            pos = idx + len(alt)
         cursor += _utf16_len(line_str)
 
-    # ── Country lines (fixed custom emoji per country, first-appearance order)
+    # ── Extra country lines: countries from the RAW source message that the
+    # body does NOT already mention. A country already represented in a body
+    # line is skipped here — that single check is what stops the "NO POLAND /
+    # POLAND 🇵🇱" duplicate from ever leaking into a published post.
     for name in countries.detect_countries(source_text or ""):
-        flag_line = f"{name} {countries.PH_FLAG}\n"
-        entities.append(
-            _make_custom_emoji_entity(cursor, countries.emoji_for(name), countries.PH_FLAG)
-        )
-        parts.append(flag_line)
-        cursor += _utf16_len(flag_line)
+        if countries.canonical_of(name) in body_countries:
+            continue
+        flag = countries.flag_for(name)
+        if flag is None:  # unmapped / unknown anchor — never guess a flag
+            continue
+        alt, doc_id = flag
+        leader = f"{name}  "
+        parts.append(leader + alt + "\n")
+        entities.append(_make_custom_emoji_entity(cursor + _utf16_len(leader), doc_id, alt))
+        cursor += _utf16_len(leader) + _utf16_len(alt) + 1
 
     # ── Divider
     parts.append(divider)
@@ -433,5 +512,15 @@ def build_ai_message(
             entities.append(_make_custom_emoji_entity(cursor, CE_PHONE, contact_placeholder))
             parts.append(contact_str)
             cursor += _utf16_len(contact_str)
+
+    # ── Buyer-asleep footer (only while the 'I'm Asleep' toggle is ON)
+    asleep_footer = _asleep_footer_line()
+    if asleep_footer:
+        if parts and not parts[-1].endswith("\n"):
+            parts.append("\n")
+            cursor += _utf16_len("\n")
+        asleep_str = f"{asleep_footer}\n"
+        parts.append(asleep_str)
+        cursor += _utf16_len(asleep_str)
 
     return "".join(parts), entities

@@ -16,6 +16,19 @@ import parser
 TEST_DB = "test_monitor.db"
 
 
+def _utf16_to_char(text: str, utf16_offset: int) -> int:
+    """Python char index whose UTF-16 code-unit offset == utf16_offset.
+
+    A single source of truth for verifying that every MessageEntityCustomEmoji
+    offset/length (which Telegram measures in UTF-16 code units) points at the
+    exact anchor emoji inside the final message string.
+    """
+    for i in range(len(text) + 1):
+        if len(text[:i].encode("utf-16-le")) // 2 >= utf16_offset:
+            return i
+    return len(text)
+
+
 class TestMonitorSystem(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -196,7 +209,9 @@ class TestMonitorSystem(unittest.TestCase):
     def test_detect_countries_own_flags_for_home_nations(self):
         self.assertEqual(countries.detect_countries("England, Scotland, Wales"),
                          ["England", "Scotland", "Wales"])
-        self.assertEqual(countries.emoji_for("England"), 5294410107084365278)
+        # Per requirement, England resolves to the GB flag; Scotland/Wales keep
+        # their own pack entries.
+        self.assertEqual(countries.emoji_for("England"), countries.emoji_for("United Kingdom"))
         self.assertEqual(countries.emoji_for("Scotland"), 5294434665707368018)
         self.assertEqual(countries.emoji_for("Wales"), 5294139949346476093)
 
@@ -210,7 +225,8 @@ class TestMonitorSystem(unittest.TestCase):
             countries.emoji_for("Grenada")
 
     def test_build_ai_message_emits_country_lines(self):
-        """Each country gets its own line, showing the name as written."""
+        """Each country gets its own line, showing the name as written and
+        carrying the real flag emoji that its custom document's alt matches."""
         msg, entities = parser.build_ai_message(
             content_lines=["Available"],
             our_price=None,
@@ -219,21 +235,19 @@ class TestMonitorSystem(unittest.TestCase):
             intent="sell",
             source_text="USA\nEgypt\nSaudi Arabia",
         )
-        self.assertIn("USA ·", msg)
-        self.assertIn("Egypt ·", msg)
-        self.assertIn("Saudi Arabia ·", msg)
+        self.assertIn("USA  🇺🇸", msg)
+        self.assertIn("Egypt  🇪🇬", msg)
+        self.assertIn("Saudi Arabia  🇸🇦", msg)
         self.assertNotIn("United States", msg)
         self.assertNotIn("United Kingdom", msg)
-        self.assertNotIn("🇺🇸", msg)
-        self.assertNotIn("🇪🇬", msg)
-        self.assertNotIn("🇸🇦", msg)
-        # Three country lines, each ending with the non-flag placeholder.
-        self.assertEqual(msg.count(countries.PH_FLAG), 3)
-        for line in msg.split("\n"):
-            if countries.PH_FLAG in line:
-                name = line.split(" ")[0]
-                self.assertGreater(msg.index(line), msg.index("Available"),
-                                   "country lines must come after the body")
+        # Three country lines, each ending with its real flag anchor.
+        flag_lines = [ln for ln in msg.split("\n")
+                      if ln.strip().endswith(tuple(countries.alt_for(c) for c in
+                                                   ("United States", "Egypt", "Saudi Arabia")))]
+        self.assertEqual(len(flag_lines), 3)
+        for line in flag_lines:
+            self.assertGreater(msg.index(line), msg.index("Available"),
+                               "country lines must come after the body")
 
         celeb_ids = {e.document_id for e in entities}
         for name in ("USA", "Egypt", "Saudi Arabia"):
@@ -254,7 +268,6 @@ class TestMonitorSystem(unittest.TestCase):
             platform="netflix",
             intent="sell",
         )
-        self.assertNotIn(countries.PH_FLAG, msg)
         self.assertNotIn("United States", msg)
         self.assertTrue(all(not hasattr(e, "document_id")
                             or e.document_id not in countries.COUNTRY_EMOJI.values()
@@ -270,7 +283,284 @@ class TestMonitorSystem(unittest.TestCase):
         )
         self.assertNotIn("DR Congo", msg)
         self.assertNotIn("South Sudan", msg)
-        self.assertNotIn(countries.PH_FLAG, msg)
+        self.assertEqual(entities, [e for e in entities
+                                    if e.document_id not in countries.COUNTRY_EMOJI.values()])
+
+    # -------------------------------------------------------------
+    # PART 1 REGRESSION: no duplicate/garbled country lines
+    # -------------------------------------------------------------
+    def test_country_flags_on_body_lines_no_duplicate(self):
+        """PRESERVE COMPLETE LISTS body + separate flag lines must not double
+        a country ('NO POLAND' must not also emit a generated 'POLAND  🇵🇱' line)."""
+        msg, entities = parser.build_ai_message(
+            content_lines=["KYC BY LINK", "ANY EUROPE", "NO POLAND"],
+            our_price=None,
+            platform="bybit",
+            contact_username="@b",
+            intent="sell",
+            source_text="KYC BY LINK ANY EUROPE NO POLAND",
+        )
+        lines = [ln.strip() for ln in msg.split("\n")]
+        # The flag lands on the body line that already says the country…
+        self.assertIn("NO POLAND  🇵🇱", lines)
+        self.assertIn("ANY EUROPE  🇪🇺", lines)
+        # …a non-country line stays plain (no flag, no leftover placeholder)…
+        self.assertIn("KYC BY LINK", lines)
+        # …and NO standalone generated 'POLAND  🇵🇱' line exists (single mention).
+        self.assertEqual(len([ln for ln in lines if ln == "POLAND  🇵🇱"]), 0)
+        self.assertEqual(len([ln for ln in lines if ln == "NO POLAND  🇵🇱"]), 1)
+        # Flag entities are REALLY attached (EU + Poland custom emoji).
+        doc_ids = {e.document_id for e in entities}
+        self.assertIn(countries.emoji_for("European Union"), doc_ids)
+        self.assertIn(countries.emoji_for("Poland"), doc_ids)
+
+    # -------------------------------------------------------------
+    # PART 2: custom flag render on country lines
+    # -------------------------------------------------------------
+    def test_country_flags_multi_country_body_line_split(self):
+        """\"UK, USA and Germany\" splits into one flag-carrying line per country."""
+        msg, entities = parser.build_ai_message(
+            content_lines=["UK, USA and Germany"],
+            our_price=None,
+            platform="netflix",
+            contact_username="@b",
+            intent="sell",
+        )
+        lines = [ln.strip() for ln in msg.split("\n")]
+        self.assertIn("UK  🇬🇧", lines)
+        self.assertIn("USA  🇺🇸", lines)
+        self.assertIn("Germany  🇩🇪", lines)
+        self.assertNotIn("UK, USA and Germany", lines)
+        doc_ids = {e.document_id for e in entities}
+        for name in ("United Kingdom", "United States", "Germany"):
+            self.assertIn(countries.emoji_for(name), doc_ids)
+
+    def test_country_flags_unmapped_countries_bare(self):
+        """A country with no flag mapping stays plain text — never a wrong flag."""
+        flagged, covered = countries.flag_body_lines(["ship to Grenada"])
+        line, ids = flagged[0]
+        self.assertEqual(line, "ship to Grenada")
+        self.assertEqual(ids, [])
+        self.assertNotIn("Grenada", covered)
+        # End-to-end: build never appends anything for an unmapped mention.
+        msg, _entities = parser.build_ai_message(
+            content_lines=["ship to Grenada"],
+            our_price=None,
+            platform="netflix",
+            contact_username="@b",
+            intent="sell",
+            source_text="ship to Grenada",
+        )
+        self.assertIn("ship to Grenada", msg)
+        self.assertNotIn("🇬🇩", msg)
+
+    def test_country_aliases_resolve_to_correct_flags(self):
+        """Requirement 2 aliases resolve to the right flag entries."""
+        self.assertEqual(countries.emoji_for("EU"), countries.emoji_for("European Union"))
+        self.assertEqual(countries.emoji_for("Europe"), countries.emoji_for("European Union"))
+        self.assertEqual(countries.emoji_for("europe"), countries.emoji_for("European Union"))
+        self.assertEqual(countries.emoji_for("USA"), countries.emoji_for("United States"))
+        self.assertEqual(countries.emoji_for("US"), countries.emoji_for("United States"))
+        self.assertEqual(countries.emoji_for("UK"), countries.emoji_for("United Kingdom"))
+        self.assertEqual(countries.emoji_for("Great Britain"), countries.emoji_for("United Kingdom"))
+        self.assertEqual(countries.emoji_for("England"), countries.emoji_for("United Kingdom"))
+        # detect/flag a 'Europe' alias so the EU flag lands on the line.
+        flagged, covered = countries.flag_body_lines(["ANY EUROPE"])
+        self.assertEqual(covered, {"European Union"})
+        self.assertEqual(
+            flagged[0][1],
+            [(countries.alt_for("European Union"), countries.emoji_for("European Union"))],
+        )
+
+    def test_flags2024_decodes_unicode_to_country(self):
+        """Raw dump rows are turned into a name -> id map by decoding each
+        flag's regional-indicator code points — never hand-typed names."""
+        self.assertEqual(countries.iso2_from_flag_emoji("🇪🇺"), "EU")
+        self.assertEqual(countries.iso2_from_flag_emoji("🇺🇸"), "US")
+        self.assertEqual(countries.iso2_from_flag_emoji("🇬🇧"), "GB")
+        self.assertEqual(countries.name_from_flag_emoji("🇪🇺"), "European Union")
+        self.assertEqual(countries.name_from_flag_emoji("🇩🇪"), "Germany")
+        self.assertEqual(countries.name_from_flag_emoji("🇫🇷"), "France")
+        # Subdivision flags (England) and unknown glyphs.
+        self.assertEqual(countries.name_from_flag_emoji("🏴󠁧󠁢󠁥󠁮󠁧󠁿"), "England")
+        self.assertIsNone(countries.name_from_flag_emoji("🚩"))
+
+    def test_flags2024_dump_parser_skips_unknown_rows(self):
+        """Malformed/unknown rows are reported and dropped — never guessed."""
+        dump = (
+            "1)🇪🇺 [1234567890123456789]\n"
+            "2)🇫🇷 [2234567890123456789]\n"
+            "3)🚩 [3234567890123456789]\n"
+            "garbage line without brackets\n"
+        )
+        mapping, errors = countries.build_flags2024_mapping(dump)
+        self.assertEqual(mapping["European Union"], 1234567890123456789)
+        self.assertEqual(mapping["France"], 2234567890123456789)
+        self.assertNotIn("🚩", mapping)
+        self.assertEqual(len(errors), 2)  # unknown flag + unparsable row
+        # A parsed dump can REPLACE the active map (pack switch) on request.
+        swapped = {k: countries.COUNTRY_EMOJI[k] for k in ("European Union", "France")}
+        for name, doc in mapping.items():
+            swapped[name] = doc
+        self.assertNotEqual(swapped["European Union"], countries.emoji_for("EU"))
+        # The dump's own glyph also becomes the alt anchor for each row.
+        alts = countries.build_flags2024_alts(dump)
+        self.assertEqual(alts["European Union"], "🇪🇺")
+        self.assertEqual(alts["France"], "🇫🇷")
+
+    def test_flag_anchor_is_real_matching_emoji(self):
+        """Every flag anchors on the country's EXACT alt emoji (never a generic
+        placeholder), and each entity's length equals that emoji's UTF-16 size."""
+        for alias, canonical in [("EU", "European Union"), ("USA", "United States"),
+                                 ("Germany", "Germany"), ("England", "United Kingdom"),
+                                 ("Scotland", "Scotland"), ("Wales", "Wales")]:
+            alt = countries.alt_for(alias)
+            self.assertTrue(emoji.is_emoji(alt), f"{alias} anchor must be an emoji")
+            self.assertEqual(parser._utf16_len(alt), len(alt.encode("utf-16-le")) // 2)
+            self.assertEqual(countries.name_from_flag_emoji(alt), canonical)
+        # Multi-code-unit anchors: 🇵🇱 = 4 UTF-16 units, Scotland's tag flag = 14.
+        self.assertEqual(parser._utf16_len(countries.alt_for("Poland")), 4)
+        self.assertEqual(parser._utf16_len(countries.alt_for("Scotland")), 14)
+
+    def test_flag_offset_math_survives_multibyte_emoji_prefix(self):
+        """UTF-16 offsets must survive non-BMP emoji BEFORE the flag — the exact
+        ordering that broke in production (🔥🔥 header, country flags, 💀 order
+        line). A Python-len() computation would be off by 2 for every flag here;
+        the shared helper uses real UTF-16 length."""
+        text = "🔥🔥 NETFLIX\nNO POLAND 🇵🇱\nANY EUROPE 🇪🇺\n💀 Price  : DM\n"
+        poland = countries.alt_for("Poland")
+        eu = countries.alt_for("European Union")
+        entities = [
+            parser._make_custom_emoji_entity(0, parser.CE_FIRE, parser.PH_FIRE),
+            parser._make_custom_emoji_entity(
+                parser._utf16_len(text[:text.index(poland)]),
+                countries.emoji_for("Poland"), poland),
+            parser._make_custom_emoji_entity(
+                parser._utf16_len(text[:text.index(eu)]),
+                countries.emoji_for("European Union"), eu),
+        ]
+        for e, anchor in zip(entities, (parser.PH_FIRE, poland, eu)):
+            start = _utf16_to_char(text, e.offset)
+            end = _utf16_to_char(text, e.offset + e.length)
+            self.assertEqual(text[start:end], anchor,
+                             "entity must wrap its exact alt emoji")
+            self.assertEqual(e.offset, len(text[:start].encode("utf-16-le")) // 2)
+            self.assertEqual(e.length, len(anchor.encode("utf-16-le")) // 2)
+        # PROOF the bug class: Python len() before 🇵🇱 is NOT its UTF-16 offset.
+        py_prefix = len(text[:text.index(poland)])
+        u16_prefix = len(text[:text.index(poland)].encode("utf-16-le")) // 2
+        self.assertNotEqual(py_prefix, u16_prefix)  # two non-BMP flames skew it
+        self.assertEqual(entities[1].offset, u16_prefix)
+
+    def test_custom_emoji_entities_utf16_aligned(self):
+        """INTEGRATION: with a non-BMP post-number banner BEFORE the header and
+        country flags BETWEEN header+filters, every entity must still be UTF-16
+        aligned against the real message text (offset+lengte units as Telegram
+        counts them)."""
+        msg, entities = parser.build_ai_message(
+            content_lines=["KYC BY LINK", "ANY EUROPE", "NO POLAND", "UK and USA"],
+            our_price=None,
+            platform="bybit",
+            contact_username="@b",
+            intent="sell",
+            post_number=17,
+            source_text="KYC BY LINK ANY EUROPE NO POLAND UK and USA",
+        )
+        units = len(msg.encode("utf-16-le")) // 2
+        prev_end = 0
+        for e in entities:
+            start = _utf16_to_char(msg, e.offset)
+            end = _utf16_to_char(msg, e.offset + e.length)
+            anchored = msg[start:end]
+            # UTF-16 units: offset == encoded length of everything before it…
+            self.assertEqual(e.offset, len(msg[:start].encode("utf-16-le")) // 2,
+                             f"entity {e} offset is not UTF-16 aligned")
+            # …each entity wraps exactly one emoji of matching length…
+            self.assertGreaterEqual(len(anchored), 1)
+            self.assertEqual(e.length, len(anchored.encode("utf-16-le")) // 2)
+            # …all in-bounds and non-overlapping.
+            self.assertGreaterEqual(e.offset, prev_end)
+            self.assertLessEqual(e.offset + e.length, units)
+            prev_end = e.offset + e.length
+        # The ‼ header flames must be rebased past the 🗂 banner prefix.
+        header_prefix = msg[:msg.index(parser.PH_FIRE)]
+        self.assertEqual(entities[0].offset, parser._utf16_len(header_prefix))
+        self.assertIn("NO POLAND  🇵🇱", msg)
+        self.assertIn("ANY EUROPE  🇪🇺", msg)
+
+    def test_sanitizer_never_strips_inserted_flag_anchors(self):
+        """Flag glyphs are real emoji; they reach the post only because they
+        are attached AFTER sanitization, and survive the leak-lint untouched."""
+        self.assertTrue(emoji.is_emoji(countries.alt_for("Poland")))
+        # The emoji-free-body invariant (strip_all_emoji) WOULD remove a flag
+        # that leaked into AI content — hence flags are appended post-sanitize.
+        self.assertEqual(parser.strip_all_emoji("NO POLAND 🇵🇱"), "NO POLAND")
+        # sanitize_body_lines keeps the original line text verbatim…
+        kept = parser.sanitize_body_lines(["NO POLAND 🇵🇱", "ANY EUROPE 🇪🇺 ..."])
+        self.assertEqual(kept, ["NO POLAND 🇵🇱", "ANY EUROPE 🇪🇺 ..."])
+        # …and flag_body_lines / build_ai_message attach the anchors post-sanitize
+        # in the final render, so every published post carries the real glyphs.
+        flagged, covered = countries.flag_body_lines(["NO POLAND"])
+        line, flags = flagged[0]
+        self.assertEqual(line, "NO POLAND  🇵🇱")
+        self.assertEqual(flags, [("🇵🇱", countries.emoji_for("Poland"))])
+        self.assertEqual(covered, {"Poland"})
+
+    def test_country_flag_line_clean_format_two_spaces(self):
+        """A flag line is exactly '<Country>  <flag>' — no visible anchor /
+        placeholder leftovers (_, ·, zero-width) ever appear in the text."""
+        banned = {"_", "·", "—", "\u200b", "\u200e", "\u200f"}
+        # In-body flag attachment (single + bare-list split + prose + extras).
+        lines, covered = countries.flag_body_lines(
+            ["NO POLAND", "UK, USA and Germany", "ship to Spain and Italy"])
+        for text, _flags in lines:
+            self.assertFalse(any(ch in banned for ch in text),
+                             f"leftover placeholder char in {text!r}")
+        self.assertIn("NO POLAND  🇵🇱", [t for t, _ in lines])
+        self.assertIn("UK  🇬🇧", [t for t, _ in lines])
+        self.assertIn("USA  🇺🇸", [t for t, _ in lines])
+        self.assertIn("Germany  🇩🇪", [t for t, _ in lines])
+        # Extras path (from raw source text) uses the same two-space format.
+        msg, entities = parser.build_ai_message(
+            content_lines=["Available"],
+            our_price=None,
+            platform="netflix",
+            contact_username="@b",
+            intent="sell",
+            source_text="Lithuania\nAustralia",
+        )
+        self.assertIn("Lithuania  🇱🇹", msg)
+        self.assertIn("Australia  🇦🇺", msg)
+        self.assertFalse(any(ch in banned for ch in msg))
+        # Every flag entity must sit EXACTLY on its flag emoji, right after the
+        # two separating spaces — no offset drift that would leave stray chars.
+        for e in [e for e in entities if e.document_id in countries.COUNTRY_EMOJI.values()]:
+            start = _utf16_to_char(msg, e.offset)
+            self.assertEqual(msg[start - 2:start], "  ",
+                             "flag entity must start right after exactly two spaces")
+
+    def test_markdown_bold_stripped_from_body(self):
+        """Literal '**'/'*' markdown leaks from sources must be stripped to plain
+        text by the SHARED sanitizer — every render path runs this one pass; the
+        published-post send uses formatting_entities WITHOUT parse_mode so
+        Telethon never parses '**' as bold."""
+        # The sanitizer
+        self.assertEqual(
+            parser.sanitize_body_lines(["**ESTY KYC**", "*single*", "***bold***",
+                                        "mixed **bold** here", "this stays"]),
+            ["ESTY KYC", "single", "bold", "mixed bold here", "this stays"],
+        )
+        # Through the full render (auto-publish / approve / preview all use this).
+        out, _ = parser.build_ai_message(
+            content_lines=["**ESTY KYC**", "Full access now"],
+            our_price=None,
+            platform="bybit",
+            contact_username="@b",
+            intent="sell",
+        )
+        self.assertIn("\nESTY KYC\n", out)
+        self.assertNotIn("*", out)
+        self.assertIn("\nFull access now\n", out)
 
     # -------------------------------------------------------------
     # DATABASE TESTS
@@ -1141,6 +1431,428 @@ class TestMonitorSystem(unittest.TestCase):
         db.set_paused(False, db_path=TEST_DB)
         self.assertFalse(db.is_paused(db_path=TEST_DB))
 
+    def test_buy_auto_publish_gate_respects_pause(self):
+        """'All Stop' must gate the buy-intent auto-publish; manual Approve is separate."""
+        import main as main_mod
+        # Unpaused + full conditions -> auto-publish.
+        self.assertTrue(main_mod.buy_auto_publish_ok(
+            intent="buy", paused=False, body_ok=True, has_payment_proof=None,
+        ))
+        # Paused -> NEVER auto-publishes; routes to manual approval instead.
+        self.assertFalse(main_mod.buy_auto_publish_ok(
+            intent="buy", paused=True, body_ok=True, has_payment_proof=None,
+        ))
+        # Unpaused, the other gates still route to manual review.
+        self.assertFalse(main_mod.buy_auto_publish_ok(
+            intent="buy", paused=False, body_ok=False, has_payment_proof=None,
+        ))
+        self.assertFalse(main_mod.buy_auto_publish_ok(
+            intent="buy", paused=False, body_ok=True, has_payment_proof="paid $40 receipt",
+        ))
+        self.assertFalse(main_mod.buy_auto_publish_ok(
+            intent="sell", paused=False, body_ok=True, has_payment_proof=None,
+        ))
+
+    def test_deterministic_fallback_gate_respects_pause(self):
+        """'All Stop' must gate the deterministic AI-down fallback auto-publish."""
+        import main as main_mod
+        old = main_mod.DETERMINISTIC_FALLBACK
+        main_mod.DETERMINISTIC_FALLBACK = True
+        try:
+            self.assertTrue(main_mod.deterministic_fallback_publish_ok(
+                paused=False, risky_keyword=None, has_payment_proof=None,
+                has_clear_signal=True, body_ok=True,
+            ))
+            # Paused -> fallback listing routes to manual review, never auto-publishes.
+            self.assertFalse(main_mod.deterministic_fallback_publish_ok(
+                paused=True, risky_keyword=None, has_payment_proof=None,
+                has_clear_signal=True, body_ok=True,
+            ))
+            # Unpaused, the safety valves still route to manual review.
+            self.assertFalse(main_mod.deterministic_fallback_publish_ok(
+                paused=False, risky_keyword="hacked", has_payment_proof=None,
+                has_clear_signal=True, body_ok=True,
+            ))
+            self.assertFalse(main_mod.deterministic_fallback_publish_ok(
+                paused=False, risky_keyword=None, has_payment_proof="receipt shown",
+                has_clear_signal=True, body_ok=True,
+            ))
+            self.assertFalse(main_mod.deterministic_fallback_publish_ok(
+                paused=False, risky_keyword=None, has_payment_proof=None,
+                has_clear_signal=False, body_ok=True,
+            ))
+        finally:
+            main_mod.DETERMINISTIC_FALLBACK = old
+
+    def test_approved_listings_drain_ignores_pause(self):
+        """Approved-but-unpublished listings drain even while 'All Stop' is on."""
+        db.set_paused(True, db_path=TEST_DB)
+        try:
+            sup_id = db.add_supplier("@pause_drain", channel_id=-100777, db_path=TEST_DB)
+            listing_id = db.insert_listing(
+                supplier_id=sup_id, source_message_id=9960, game_name=None, rank_tier=None,
+                original_price=50.0, our_price=40.0, status="approved",
+                raw_text="WTS Netflix $50", clean_text="WTS Netflix $50", db_path=TEST_DB,
+            )
+            # The drain query feeds the worker: paused or not, approved rows surface.
+            approved = db.get_approved_listings_to_publish(limit=10, db_path=TEST_DB)
+            self.assertTrue(any(l["id"] == listing_id for l in approved))
+            # The queue-drain worker itself must not skip on the pause switch.
+            import inspect
+            import main as main_mod
+            worker_src = inspect.getsource(main_mod.approved_listings_worker)
+            self.assertNotIn("is_paused", worker_src)
+        finally:
+            db.set_paused(False, db_path=TEST_DB)
+
+    def test_approve_callback_never_blocked_by_pause(self):
+        """Manual Approve must never be refused by the pause switch."""
+        import inspect
+        import admin_bot
+        handlers = inspect.getsource(admin_bot.setup_admin_handlers)
+        # The old paused-refusal ("resume first, then approve again") is gone.
+        self.assertNotIn("to resume, then approve again", handlers)
+        # And the approve flow still publishes immediately when the status allows.
+        self.assertIn("Processing...", handlers)
+
+    def test_pause_help_text_clarifies_manual_approve_unaffected(self):
+        """Help and pause messages must say pausing only affects automatic publishing."""
+        import admin_bot
+        help_text = admin_bot._help_text()
+        self.assertIn("AUTOMATIC publishing", help_text)
+        self.assertIn("Manual Approve taps still publish immediately", help_text)
+
+    # -------------------------------------------------------------
+    # "I'm ASLEEP" TOGGLE + FOOTER (UX item 4)
+    # -------------------------------------------------------------
+    def test_asleep_toggle(self):
+        """The asleep switch round-trips through app_settings like the pause switch."""
+        db.set_buyer_asleep(False, db_path=TEST_DB)
+        self.assertFalse(db.is_buyer_asleep(db_path=TEST_DB))
+        db.set_buyer_asleep(True, db_path=TEST_DB)
+        self.assertTrue(db.is_buyer_asleep(db_path=TEST_DB))
+        db.set_buyer_asleep(False, db_path=TEST_DB)
+        self.assertFalse(db.is_buyer_asleep(db_path=TEST_DB))
+
+    def test_buyer_asleep_footer_resolution(self):
+        """Footer resolution: app_settings > BUYER_ASLEEP_FOOTER env > default."""
+        old_env = os.environ.get("BUYER_ASLEEP_FOOTER")
+        try:
+            self.assertEqual(
+                db.get_buyer_asleep_footer(db_path=TEST_DB),
+                "Buyer away, back shortly",
+            )
+            db.set_setting("buyer_asleep_footer", "Back now", db_path=TEST_DB)
+            self.assertEqual(db.get_buyer_asleep_footer(db_path=TEST_DB), "Back now")
+            db.set_setting("buyer_asleep_footer", "", db_path=TEST_DB)
+
+            os.environ["BUYER_ASLEEP_FOOTER"] = "Will reply later"
+            self.assertEqual(db.get_buyer_asleep_footer(db_path=TEST_DB), "Will reply later")
+            os.environ["BUYER_ASLEEP_FOOTER"] = "   "
+            self.assertEqual(
+                db.get_buyer_asleep_footer(db_path=TEST_DB),
+                "Buyer away, back shortly",
+            )
+        finally:
+            if old_env is None:
+                os.environ.pop("BUYER_ASLEEP_FOOTER", None)
+            else:
+                os.environ["BUYER_ASLEEP_FOOTER"] = old_env
+            db.set_setting("buyer_asleep_footer", "", db_path=TEST_DB)
+
+    def test_build_ai_message_appends_asleep_footer(self):
+        """While the toggle is ON the footer is appended to EVERY render path;
+        toggled OFF it never appears. Uses a fresh temp DB so the default
+        monitor.db is never touched by the render."""
+        path = self._fresh_db("asleep_footer_test.db")
+        old_default = db.DEFAULT_DB_PATH
+        try:
+            db.DEFAULT_DB_PATH = path
+            db.set_buyer_asleep(False, db_path=path)
+            msg_off, _ = parser.build_ai_message(
+                content_lines=["Bybit full kyc"],
+                our_price=None,
+                platform="bybit",
+                contact_username="@buyer",
+                intent="buy",
+            )
+            self.assertNotIn("Buyer away, back shortly", msg_off)
+
+            db.set_buyer_asleep(True, db_path=path)
+            db.set_setting("buyer_asleep_footer", "Back soon", db_path=path)
+            msg_on, entities = parser.build_ai_message(
+                content_lines=["Bybit full kyc"],
+                our_price=None,
+                platform="bybit",
+                contact_username="@buyer",
+                intent="buy",
+            )
+            self.assertIn("Back soon", msg_on)
+            self.assertTrue(msg_on.rstrip().endswith("Back soon"), msg_on)
+            for e in entities:  # footer is plain text; entities still land in-bounds
+                self.assertLess(e.offset, parser._utf16_len(msg_on))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+
+    def test_asleep_label_helper(self):
+        """The home button label mirrors the current awake/asleep state."""
+        import admin_bot  # loads .env (load_dotenv) — imported lazily so the
+        # no-key AI tests above run against a clean environment first.
+
+        old_default = db.DEFAULT_DB_PATH
+        try:
+            db.DEFAULT_DB_PATH = TEST_DB
+            db.set_buyer_asleep(False, db_path=TEST_DB)
+            self.assertEqual(admin_bot._asleep_label(), "😴 I'm Asleep")
+            db.set_buyer_asleep(True, db_path=TEST_DB)
+            self.assertEqual(admin_bot._asleep_label(), "☀️ I'm Awake")
+            db.set_buyer_asleep(False, db_path=TEST_DB)
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+
+    # -------------------------------------------------------------
+    # UX ITEM 2/5/1 — destination + published digest + skip cards
+    # -------------------------------------------------------------
+    def test_destination_url_helper(self):
+        """_destination_url links to the republished post, and None until a
+        published_message_id exists / DEST_CHANNEL is set."""
+        import admin_bot
+
+        old = admin_bot.DEST_CHANNEL
+        try:
+            admin_bot.DEST_CHANNEL = "@mychannel"
+            self.assertEqual(
+                admin_bot._destination_url({"published_message_id": 77}),
+                "https://t.me/mychannel/77",
+            )
+            self.assertIsNone(admin_bot._destination_url({"post_number": 3}))
+            admin_bot.DEST_CHANNEL = "-1001234567890"
+            self.assertEqual(
+                admin_bot._destination_url({"published_message_id": 77}),
+                "https://t.me/c/1234567890/77",
+            )
+            admin_bot.DEST_CHANNEL = ""
+            self.assertIsNone(admin_bot._destination_url({"published_message_id": 77}))
+        finally:
+            admin_bot.DEST_CHANNEL = old
+
+    def test_skip_notification_render(self):
+        """One skip renders as a send_published_alert-style card with a
+        Re-review button and (when resolvable) a source-channel link."""
+        import admin_bot
+
+        text, buttons = admin_bot._skip_notification({
+            "skip_id": 42,
+            "channel_username": "kycgroupke",
+            "message_id": 9001,
+            "reason": "duplicate",
+            "raw_text": "WTS Bybit account $100",
+        })
+        self.assertIn("⏳ **Skipped — duplicate**", text)
+        self.assertIn("━━━━━━━━━━━━━━━━━━━━", text)
+        self.assertIn("Supplier : @kycgroupke", text)
+        self.assertEqual(len(buttons), 1, "one row of buttons")
+        row = buttons[0]
+        self.assertTrue(any(getattr(b, "text", "") == "🔁 Re-review" for b in row))
+        urls = [getattr(b, "url", None) for b in row]
+        self.assertIn("https://t.me/kycgroupke/9001", urls)
+
+    def test_published_digest_buttons_only(self):
+        """/published is buttons-only: no per-post text lines; each post is one
+        row of two URL buttons (#N -> our channel, source name -> source) with
+        no emoji in the labels."""
+        import admin_bot
+
+        rows = [
+            {
+                "id": 1, "source_message_id": 100, "published_message_id": 200,
+                "post_number": 7, "platform_name": "bybit",
+                "supplier_username": "kycgroupke", "supplier_display_name": None,
+            },
+            {
+                "id": 2, "source_message_id": 101, "published_message_id": None,
+                "post_number": None, "platform_name": None,
+                "supplier_username": "anon_src", "supplier_display_name": None,
+            },
+        ]
+        old = admin_bot.DEST_CHANNEL
+        try:
+            admin_bot.DEST_CHANNEL = "@mychannel"
+            text, buttons = admin_bot._published_digest(rows)
+        finally:
+            admin_bot.DEST_CHANNEL = old
+        self.assertNotIn("·", text)
+        self.assertEqual(text.count("\n"), 1, "header line only")
+        self.assertEqual(len(buttons), 3, "two post rows + home row")
+
+        row1 = buttons[0]
+        self.assertTrue(any(getattr(b, "text", None) == "#7" for b in row1))
+        urls1 = [getattr(b, "url", None) for b in row1]
+        self.assertIn("https://t.me/mychannel/200", urls1)
+        self.assertIn("https://t.me/kycgroupke/100", urls1)
+
+        row2 = buttons[1]
+        self.assertEqual(len(row2), 1, "no dest link without published_message_id")
+        self.assertEqual(
+            getattr(row2[0], "url", None), "https://t.me/anon_src/101"
+        )
+
+        for row_btn in buttons:
+            for b in row_btn:
+                label = getattr(b, "text", "")
+                if label.startswith("🏠"):
+                    continue  # home row is exempt
+                first = label[0]
+                self.assertEqual(first, first.strip() and first, f"emoji/space-led label {label!r}")
+
+    def test_relative_time_helper(self):
+        """_relative_time formats an ISO timestamp as a compact age."""
+        import admin_bot
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        self.assertEqual(admin_bot._relative_time(""), "")
+        self.assertEqual(admin_bot._relative_time("not-a-date"), "")
+        self.assertEqual(admin_bot._relative_time((now).isoformat()), "just now")
+        self.assertEqual(admin_bot._relative_time((now).replace(tzinfo=None).isoformat()), "just now")
+        self.assertEqual(admin_bot._relative_time((now - timedelta(minutes=2)).isoformat()), "2m ago")
+        self.assertEqual(admin_bot._relative_time((now - timedelta(hours=5)).isoformat()), "5h ago")
+        self.assertEqual(admin_bot._relative_time((now - timedelta(days=3)).isoformat()), "3d ago")
+        self.assertEqual(admin_bot._relative_time((now - timedelta(days=10)).isoformat()), "1w ago")
+        # Future/clock-skew timestamps clamp to "just now" instead of negative ages.
+        self.assertEqual(admin_bot._relative_time((now + timedelta(hours=1)).isoformat()), "just now")
+
+    def test_sources_menu_text_minimal(self):
+        """The Sources screen is buttons-first: no emoji header, no bold
+        per-supplier lines, no numeric IDs in the body."""
+        import admin_bot
+
+        text = admin_bot._sources_menu_text([
+            {"channel_username": "kycgroupke", "display_name": None, "channel_id": -100123, "active": True},
+            {"channel_username": "no_id_ref", "display_name": "Unresolved Chan", "channel_id": None, "active": True},
+        ])
+        self.assertNotIn("📋", text)
+        self.assertNotIn("Monitored Sources", text)
+        self.assertNotIn("**", text)  # no bold per-supplier lines
+        self.assertNotIn("ID:", text)
+        self.assertNotIn("kycgroupke", text)
+        self.assertNotIn("-100123", text)
+        self.assertIn("Tap a source", text)
+
+        empty = admin_bot._sources_menu_text([])
+        self.assertIn("No sources configured yet", empty)
+        self.assertNotIn("📋", empty)
+
+    def test_sources_buttons_labels(self):
+        """Source buttons carry icon + name (the info that used to be text);
+        Add Source / Back rows are preserved."""
+        import admin_bot
+
+        suppliers = [
+            {"id": 1, "channel_username": "kycgroupke", "display_name": None, "channel_id": -100123, "active": True},
+            {"id": 2, "channel_username": "no_id_ref", "display_name": "Unresolved Chan", "channel_id": None, "active": True},
+            {"id": 3, "channel_username": "-1004567890", "display_name": None, "channel_id": -1004567890, "active": False},
+        ]
+        buttons = admin_bot._sources_buttons(suppliers)
+        self.assertEqual(len(buttons), len(suppliers) + 1, "one row per supplier + Add/Back row")
+        self.assertIn("kycgroupke", buttons[0][0].text)
+        self.assertIn("@kycgroupke", buttons[0][0].text)
+        self.assertIn("Unresolved Chan", buttons[1][0].text)
+        self.assertIn("-1004567890", buttons[2][0].text)  # numeric-id supplier label IS the id
+        self.assertIn("➕ Add Source", buttons[3][0].text)
+        self.assertIn("⬅️ Back", buttons[3][1].text)
+
+    def test_skipped_digest_buttons_only(self):
+        """/skipped is buttons-first: empty body (em-dash placeholder), no
+        numbered/snippet wall; each Re-review button label carries
+        reason-icon · reason · supplier · age; non-reopenable skips drop to a
+        one-line count."""
+        import admin_bot
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        skips = [
+            {"skip_id": 42, "listing_id": 7, "reason": "duplicate",
+             "channel_username": "kycgroupke", "display_name": None,
+             "timestamp": (now - timedelta(hours=2)).isoformat(),
+             "raw_text": "WTS Bybit account $100"},
+            {"skip_id": 41, "listing_id": 6, "reason": "no_content",
+             "channel_username": "src_b", "display_name": None,
+             "timestamp": (now - timedelta(minutes=5)).isoformat(),
+             "raw_text": "hello group"},
+            {"skip_id": 40, "listing_id": None, "reason": "chatter",  # not reopenable
+             "channel_username": "src_c", "display_name": None,
+             "timestamp": (now - timedelta(hours=1)).isoformat(),
+             "raw_text": "wassup"},
+        ]
+        text, buttons = admin_bot._skipped_digest(skips)
+
+        # Empty body: no redundant "Skipped — tap one..." line, no numbering,
+        # no snippet, no "Recently skipped", no emoji-heavy header.
+        self.assertTrue(text.strip().startswith("—"), text)
+        self.assertNotIn("tap one to re-review", text)
+        self.assertNotIn("**Skipped**", text)
+        self.assertNotIn("1.", text)
+        self.assertNotIn("WTS Bybit", text)
+        self.assertNotIn("hello group", text)
+        self.assertNotIn("Recently skipped", text)
+        self.assertNotIn("🚫", text)
+
+        # Buttons carry reason-icon · reason · supplier · age, and only for
+        # reopenable skips.
+        self.assertEqual(len(buttons), 3, "two skip rows + home row")
+        labels = [b[0].text for b in buttons[:2]]
+        self.assertTrue(any(
+            l.startswith("🔁") and "duplicate" in l and "@kycgroupke" in l and "2h ago" in l
+            for l in labels
+        ))
+        self.assertTrue(any(
+            l.startswith("⬜") and "no content" in l and "@src_b" in l and "5m ago" in l
+            for l in labels
+        ))
+        self.assertFalse(any("chatter" in l for l in labels), "non-reopenable skip has no button")
+
+        # Dropped skip is surfaced as a one-line count, not a dead screen entry.
+        self.assertIn("1 more recent skip(s) not re-reviewable", text)
+
+        home = buttons[-1][0].text
+        self.assertTrue(home.startswith("🏠"))
+
+    def test_skip_reason_icon_mapping(self):
+        """Every production skip reason has its own distinct icon; unmapped
+        ones fall back to a neutral glyph."""
+        import admin_bot
+
+        self.assertEqual(
+            set(admin_bot.SKIP_REASON_ICONS),
+            {"duplicate", "not_a_listing", "chatter", "no_content", "self_echo"},
+            "icon map must cover every reason emitted by filters.py / main.py",
+        )
+        icons = list(admin_bot.SKIP_REASON_ICONS.values())
+        self.assertEqual(len(icons), len(set(icons)), "icons must all be distinct")
+        self.assertEqual(admin_bot._skip_reason_icon("duplicate"), "🔁")
+        self.assertEqual(admin_bot._skip_reason_icon("not_a_listing"), "💬")
+        self.assertEqual(admin_bot._skip_reason_icon("chatter"), "🗨️")
+        self.assertEqual(admin_bot._skip_reason_icon("no_content"), "⬜")
+        self.assertEqual(admin_bot._skip_reason_icon("self_echo"), "🔄")
+        self.assertEqual(admin_bot._skip_reason_icon("legacy_unknown"), "📄")
+        self.assertEqual(admin_bot._skip_reason_icon(""), "📄")
+        self.assertEqual(admin_bot._skip_reason_icon(None), "📄")
+
+    def test_skipped_digest_buttons_only_none_reopenable(self):
+        """When no recent skip can be reopened, say so instead of showing an
+        empty tap-to-review hint."""
+        import admin_bot
+
+        text, buttons = admin_bot._skipped_digest([
+            {"skip_id": 9, "listing_id": None, "reason": "chatter",
+             "channel_username": "src_c", "display_name": None,
+             "timestamp": None, "raw_text": "x"},
+        ])
+        self.assertIn("none of the recent skips can be re-opened", text)
+        self.assertEqual(len(buttons), 1, "just the home row")
+        self.assertTrue(buttons[0][0].text.startswith("🏠"))
+
     def test_get_published_listings_joins_supplier(self):
         sid = db.add_supplier("trace_src", channel_id=-100777, db_path=TEST_DB)
         db.insert_listing(sid, 9001, None, None, 100.0, 80.0, "pending_approval",
@@ -1390,13 +2102,19 @@ class TestMonitorSystem(unittest.TestCase):
             intent="sell",
         )
         self.assertIn("IKUALO WTB ✦ DM FAST", out)
-        self.assertIn("\nSpain region\n", out)
+        # A body line mentioning a country carries that country's flag on the
+        # SAME line — the real alt emoji, anchored post-sanitization.
+        self.assertIn("\nSpain region  🇪🇸\n", out)
         self.assertIn("\nIncludes Tuyo account\n", out)
         self.assertIn("\nID card + proof of address\n", out)
         self.assertIn("🤑 Price  : DM", out)
         self.assertIn("📞 Order  : @buyer", out)
-        # Body must be emoji-free: no bullets, no fire/lightning/star inside.
+        # Body must be emoji-free: no bullets, no fire/lightning/star inside
+        # (the appended flag anchor is the only exception, and it is here).
         self.assertNotIn("⭐", out)
+        # …and Spain's custom flag entity is really attached at the right spot.
+        doc_ids = [e.document_id for e in entities]
+        self.assertIn(countries.emoji_for("Spain"), doc_ids)
 
     def test_build_ai_message_header_rotates_by_seed(self):
         """Header emoji alternates fire/lightning deterministically per listing seed."""

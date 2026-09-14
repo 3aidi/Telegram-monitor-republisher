@@ -187,6 +187,52 @@ def _supplier_label(supplier: dict) -> str:
     return "?"
 
 
+def deterministic_fallback_publish_ok(
+    paused: bool,
+    risky_keyword: Optional[str],
+    has_payment_proof: Optional[str],
+    has_clear_signal: bool,
+    body_ok: bool,
+) -> bool:
+    """Gate the deterministic AI-down fallback auto-publish.
+
+    During an AI outage a concrete listing with a substantive body routes
+    straight to the channel — but only when publishing is not paused via the
+    admin "All Stop" switch. Unpaused, a risky/payment-proof/weak body still
+    falls through to manual review. Paused, EVERY fallback listing routes to
+    manual review instead of auto-publishing.
+    """
+    return (
+        DETERMINISTIC_FALLBACK
+        and not paused
+        and not risky_keyword
+        and not has_payment_proof
+        and has_clear_signal
+        and body_ok
+    )
+
+
+def buy_auto_publish_ok(
+    intent: str,
+    paused: bool,
+    body_ok: bool,
+    has_payment_proof: Optional[str],
+) -> bool:
+    """Gate the buy-intent auto-publish.
+
+    A buy demand auto-publishes when it has a substantive sanitized body and no
+    payment-proof signal — prices and platforms never factor into the decision.
+    "All Stop" gates it too: while paused, buy signals route to manual approval
+    instead of auto-publishing (the admin's Approve is still honored).
+    """
+    return (
+        intent == "buy"
+        and not paused
+        and body_ok
+        and not has_payment_proof
+    )
+
+
 def zero_resolved_suppliers_alert_text(active_total: int, resolved_ok: int) -> Optional[str]:
     """Return a loud admin alert when suppliers exist but NONE resolved.
 
@@ -242,9 +288,10 @@ async def resolve_supplier_entities(
 
     Returns the freshly-resolved rows (with their final channel_id).
     """
-    rows = db.list_suppliers(active_only=True)
     if only_unresolved:
-        rows = [s for s in rows if s.get("channel_id") is None]
+        rows = db.get_unresolved_suppliers(active_only=True)
+    else:
+        rows = db.list_suppliers(active_only=True)
     resolved: List[Dict[str, Any]] = []
     for supplier in rows:
         channel_id = supplier.get("channel_id")
@@ -681,13 +728,12 @@ async def _process_supplier_message(
             if ln.strip()
         ] or ["Available"]
         fb_lines, fb_body_ok = parser.prepare_body(fb_content_lines, raw_text)
-        if (
-            DETERMINISTIC_FALLBACK
-            and not risky_keyword
-            and not filters.detect_payment_proof(raw_text)
-            and filters.has_clear_listing_signal(raw_text)
-            and fb_body_ok
-            and not db.is_paused()
+        if deterministic_fallback_publish_ok(
+            paused=await asyncio.to_thread(db.is_paused),
+            risky_keyword=risky_keyword,
+            has_payment_proof=filters.detect_payment_proof(raw_text),
+            has_clear_signal=filters.has_clear_listing_signal(raw_text),
+            body_ok=fb_body_ok,
         ):
             content_lines = fb_lines
             post_number = db.next_post_number()
@@ -818,11 +864,11 @@ async def _process_supplier_message(
     # platforms are never part of the decision. Everything else routes to manual
     # approval.
     body_lines, body_ok = parser.prepare_body(content_lines, ai_clean_text or raw_text)
-    buy_auto_ok = (
-        intent == "buy"
-        and not db.is_paused()
-        and body_ok
-        and not filters.detect_payment_proof(raw_text)
+    buy_auto_ok = buy_auto_publish_ok(
+        intent=intent,
+        paused=await asyncio.to_thread(db.is_paused),
+        body_ok=body_ok,
+        has_payment_proof=filters.detect_payment_proof(raw_text),
     )
 
     if buy_auto_ok:
@@ -1031,12 +1077,16 @@ async def process_deleted_message(event) -> None:
 async def approved_listings_worker(
     client: TelegramClient, stop_event: asyncio.Event, bot_client: Optional[TelegramClient]
 ) -> None:
-    """Publish admin-approved listings (DLQ-safe: requires published_message_id IS NULL)."""
+    """Publish admin-approved listings (DLQ-safe: requires published_message_id IS NULL).
+
+    Approval is the deliberate signal to publish: the queue drain runs even
+    while "All Stop" is on. Pausing only gates the AUTOMATIC publish paths
+    (buy-intent auto-publish and the deterministic AI-down fallback), never a
+    listing an admin has explicitly approved.
+    """
     while not stop_event.is_set():
         try:
             approved = await asyncio.to_thread(db.get_approved_listings_to_publish, 5)
-            if await asyncio.to_thread(db.is_paused):
-                continue
             for listing in approved:
                 listing_id = listing["id"]
                 # clean_text already holds the AI-rewritten body (or the raw fallback
@@ -1372,7 +1422,7 @@ async def main() -> None:
 
         logger.info(
             "User listener connected. Monitoring %s configured suppliers, publishing to %s",
-            len(SOURCE_CHANNELS),
+            active_total,
             DEST_CHANNEL,
         )
 
