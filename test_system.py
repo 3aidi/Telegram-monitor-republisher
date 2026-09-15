@@ -771,20 +771,25 @@ class TestMonitorSystem(unittest.TestCase):
                 self.sent.append((to, text))
                 return None
 
-        bot = _FakeBot()
-        sent_text = asyncio.run(
-            main_mod._warn_if_zero_suppliers_resolved(bot, active_total=4, resolved_ok=0)
-        )
-        self.assertIsNotNone(sent_text)
-        self.assertIn("0 of 4", sent_text)
-        self.assertEqual([t for _, t in bot.sent if "MONITORING NOTHING" in t], [sent_text])
-        self.assertEqual(len(bot.sent), 1)
+        old_admin_id = main_mod.ADMIN_USER_ID
+        main_mod.ADMIN_USER_ID = 5883701139
+        try:
+            bot = _FakeBot()
+            sent_text = asyncio.run(
+                main_mod._warn_if_zero_suppliers_resolved(bot, active_total=4, resolved_ok=0)
+            )
+            self.assertIsNotNone(sent_text)
+            self.assertIn("0 of 4", sent_text)
+            self.assertEqual([t for _, t in bot.sent if "MONITORING NOTHING" in t], [sent_text])
+            self.assertEqual(len(bot.sent), 1)
 
-        quiet_bot = _FakeBot()
-        self.assertIsNone(asyncio.run(
-            main_mod._warn_if_zero_suppliers_resolved(quiet_bot, active_total=4, resolved_ok=4)
-        ))
-        self.assertEqual(quiet_bot.sent, [])
+            quiet_bot = _FakeBot()
+            self.assertIsNone(asyncio.run(
+                main_mod._warn_if_zero_suppliers_resolved(quiet_bot, active_total=4, resolved_ok=4)
+            ))
+            self.assertEqual(quiet_bot.sent, [])
+        finally:
+            main_mod.ADMIN_USER_ID = old_admin_id
 
     def test_listing_is_editable_helper(self):
         """The shared editable-status predicate gates edit/approve/reject flows."""
@@ -2089,29 +2094,51 @@ class TestMonitorSystem(unittest.TestCase):
     def test_ai_rephraser_init_no_key_returns_false(self):
         """init_groq should fail gracefully without a key."""
         env_key = os.environ.pop("GROQ_API_KEY", None)
+        old_client, old_key = ai_rephraser._client, ai_rephraser._api_key
+        ai_rephraser._client = None
+        ai_rephraser._api_key = None
         try:
             result = ai_rephraser.init_groq("")
             self.assertFalse(result)
             self.assertFalse(ai_rephraser.is_available())
         finally:
+            ai_rephraser._client, ai_rephraser._api_key = old_client, old_key
             if env_key is not None:
                 os.environ["GROQ_API_KEY"] = env_key
 
     def test_ai_analyze_none_when_unavailable(self):
         """analyze_message should return None (triggering fallback) without a client."""
-        ai_rephraser.init_groq("")
-        import asyncio
-        result = asyncio.run(ai_rephraser.analyze_message(
-            "KYC Ikualo + Tuyo ID Card + Proof Address Serious Seller! Spain PRICE 50$"
-        ))
-        self.assertIsNone(result)
+        env_key = os.environ.pop("GROQ_API_KEY", None)
+        old_client, old_key = ai_rephraser._client, ai_rephraser._api_key
+        ai_rephraser._client = None
+        ai_rephraser._api_key = None
+        try:
+            ai_rephraser.init_groq("")
+            import asyncio
+            result = asyncio.run(ai_rephraser.analyze_message(
+                "KYC Ikualo + Tuyo ID Card + Proof Address Serious Seller! Spain PRICE 50$"
+            ))
+            self.assertIsNone(result)
+        finally:
+            ai_rephraser._client, ai_rephraser._api_key = old_client, old_key
+            if env_key is not None:
+                os.environ["GROQ_API_KEY"] = env_key
 
     def test_ai_analyze_none_on_empty(self):
         """analyze_message should return None for empty text."""
-        ai_rephraser.init_groq("")
-        import asyncio
-        result = asyncio.run(ai_rephraser.analyze_message("   "))
-        self.assertIsNone(result)
+        env_key = os.environ.pop("GROQ_API_KEY", None)
+        old_client, old_key = ai_rephraser._client, ai_rephraser._api_key
+        ai_rephraser._client = None
+        ai_rephraser._api_key = None
+        try:
+            ai_rephraser.init_groq("")
+            import asyncio
+            result = asyncio.run(ai_rephraser.analyze_message("   "))
+            self.assertIsNone(result)
+        finally:
+            ai_rephraser._client, ai_rephraser._api_key = old_client, old_key
+            if env_key is not None:
+                os.environ["GROQ_API_KEY"] = env_key
 
     def test_rephrase_unpublished_skips_when_ai_unavailable(self):
         """The stale-body rephrase sweep is a safe no-op without a Groq client."""
@@ -2119,10 +2146,14 @@ class TestMonitorSystem(unittest.TestCase):
         import main as main_mod
         # init_groq("") falls back to the .env key once main.py has loaded it,
         # so force the client off explicitly to keep this test hermetic.
+        old_client, old_key = ai_rephraser._client, ai_rephraser._api_key
         ai_rephraser._client = None
         ai_rephraser._api_key = None
-        result = asyncio.run(main_mod.rephrase_unpublished())
-        self.assertIsNone(result)
+        try:
+            result = asyncio.run(main_mod.rephrase_unpublished())
+            self.assertIsNone(result)
+        finally:
+            ai_rephraser._client, ai_rephraser._api_key = old_client, old_key
 
     def test_unpublished_sweep_bounded_by_limit_and_age(self):
         """REG (REPHR-1): the startup rephrase sweep must be bounded (per-run
@@ -3027,7 +3058,9 @@ class TestDestinationsForwarding(unittest.TestCase):
         message, so the router must match this text character-for-character)."""
         import admin_bot as admin_mod
 
-        labels = [b.button.text for row in admin_mod._home_keyboard() for b in row]
+        with mock.patch("db.is_paused", return_value=False), \
+             mock.patch("db.is_buyer_asleep", return_value=False):
+            labels = [b.button.text for row in admin_mod._home_keyboard() for b in row]
         self.assertIn("📥 Destinations", labels)
 
     def test_destinations_button_text_routes_to_menu(self):
@@ -3040,7 +3073,9 @@ class TestDestinationsForwarding(unittest.TestCase):
 
         import admin_bot as admin_mod
 
-        labels = [b.button.text for row in admin_mod._home_keyboard() for b in row]
+        with mock.patch("db.is_paused", return_value=False), \
+             mock.patch("db.is_buyer_asleep", return_value=False):
+            labels = [b.button.text for row in admin_mod._home_keyboard() for b in row]
 
         for text in (
             "📥 Destinations",            # the label the admin actually sees
