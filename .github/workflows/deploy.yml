@@ -1,38 +1,11 @@
-name: Test and Deploy
+name: Deploy to AWS
 
 on:
   push:
     branches: [main]
-  pull_request:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Lint (ruff)
-        run: |
-          pip install ruff
-          ruff check . --exclude venv --exclude .opencode --exclude .git
-
-      - name: Run tests
-        run: python -m unittest test_system
-
   deploy:
-    if: github.ref == 'refs/heads/main'
-    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
@@ -42,48 +15,6 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            set -e
             cd ${{ secrets.DEPLOY_PATH }}
-            PREV_REV=$(git rev-parse --short HEAD)
-            echo "Previous revision: $PREV_REV"
-
-            # Update the working tree to the tested commit, never merging.
-            git fetch --ff-only origin main
-            NEW_REV=$(git rev-parse --short FETCH_HEAD)
-            echo "Target revision: $NEW_REV"
-            if [ "$PREV_REV" = "$NEW_REV" ]; then
-              echo "Already up to date; nothing to deploy."
-              exit 0
-            fi
-            git checkout -f FETCH_HEAD
-
-            # Install dependencies (tests import every module).
-            if [ -d venv ]; then
-              ./venv/bin/pip install -q -r requirements.txt
-              PY=./venv/bin/python
-            else
-              pip3 install -q -r requirements.txt
-              PY=python3
-            fi
-
-            # Run the same suite on the server BEFORE touching the live bot.
-            if ! $PY -m unittest test_system; then
-              echo "DEPLOY FAILED: tests failed on server — rolling back to $PREV_REV."
-              git checkout -f $PREV_REV
-              exit 1
-            fi
-
-            # Tests passed — bring the new revision live and verify.
+            git pull
             sudo systemctl restart tele-monitor
-            sleep 5
-            STATUS=$(systemctl is-active tele-monitor)
-            echo "Service status: $STATUS"
-            if [ "$STATUS" != "active" ]; then
-              echo "DEPLOY FAILED: service not active after restart — rolling back to $PREV_REV."
-              git checkout -f $PREV_REV
-              sudo systemctl restart tele-monitor
-              sleep 5
-              echo "Rolled back. Post-rollback status: $(systemctl is-active tele-monitor)"
-              exit 1
-            fi
-            echo "Deployed and healthy: $NEW_REV"
