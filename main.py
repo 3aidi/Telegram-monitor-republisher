@@ -14,6 +14,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.errors import (
+    ChannelInvalidError,
+    ChannelPrivateError,
+    ChatAdminRequiredError,
+    ChatIdInvalidError,
+    ChatWriteForbiddenError,
+    PeerIdInvalidError,
+    UserBannedInChannelError,
+    UserKickedError,
+    UsernameNotOccupiedError,
+)
 
 import admin_bot
 import ai_rephraser
@@ -52,6 +63,28 @@ DEDUP_HOURS = int(os.environ.get("DEDUP_HOURS", "48") or 48)
 REPHRASE_SWEEP_LIMIT = int(os.environ.get("REPHRASE_SWEEP_LIMIT", "50") or 50)
 REPHRASE_SWEEP_MIN_AGE_SECONDS = int(
     os.environ.get("REPHRASE_SWEEP_MIN_AGE_SECONDS", "120") or 120
+)
+# Destination forwarding (DEST-1): the worker runs independently of the publish
+# path so a slow/flooded destination never slows main-channel publishing. The
+# flood budget bounds how long ONE destination may sleep before the worker
+# defers it (marked transient-failed with backoff) and moves on to the rest.
+FORWARD_FLOODWAIT_BUDGET_SECONDS = float(
+    os.environ.get("FORWARD_FLOODWAIT_BUDGET_SECONDS", "60") or 60
+)
+FORWARD_WORKER_INTERVAL = float(os.environ.get("FORWARD_WORKER_INTERVAL", "3") or 3)
+
+# Errors that will never succeed on retry: reporting them as the queue's final
+# state (failed) beats grinding retries forever (DEST-1).
+PERMANENT_FORWARD_ERRORS = (
+    ChatWriteForbiddenError,
+    ChatAdminRequiredError,
+    UserBannedInChannelError,
+    UserKickedError,
+    ChatIdInvalidError,
+    PeerIdInvalidError,
+    UsernameNotOccupiedError,
+    ChannelInvalidError,
+    ChannelPrivateError,
 )
 
 # Runtime health (MON-1): process-level state surfaced in the periodic health
@@ -575,6 +608,94 @@ async def _alert_admin_on_published(
 
 
 # ---------------------------------------------------------------------------
+# Destination forwarding (DEST-1)
+# ---------------------------------------------------------------------------
+# The ONLY way forwarding work is created is enqueue_destination_forwardings(),
+# which is called exclusively from the successful-publication path — never from
+# monitoring events in the main channel. That is what guarantees manually
+# written channel messages can never be forwarded to destination groups.
+async def enqueue_destination_forwardings(
+    listing_id: int, published_msg_id: int
+) -> int:
+    """Persist one pending forward for every ACTIVE destination."""
+    if not DEST_CHANNEL:
+        return 0
+    return await db.run_async(
+        db.queue_forwarding, listing_id, DEST_CHANNEL, published_msg_id
+    )
+
+
+async def _drain_forward_queue(client: TelegramClient) -> None:
+    """One pass over the pending destination-forward batch.
+
+    Sequential (never a parallel forward storm), oldest-first, each destination
+    isolated: one failing destination is marked and the next is still attempted.
+    Uses the SAME FloodWait retry helper as publishing (TEL-1) with a bounded
+    sleep budget so a long flood defers that destination instead of blocking
+    the others.
+    """
+    pending = await db.run_async(db.get_pending_forwardings, 10)
+    for row in pending:
+        fwd_id = row["id"]
+        try:
+            await publish_guard.run_with_floodwait_retry(
+                lambda _row=row: client.forward_messages(
+                    _row["destination_chat_id"],
+                    messages=[_row["published_message_id"]],
+                    from_peer=_row["published_chat_id"],
+                ),
+                f"forward listing #{row['listing_id']} "
+                f"msg {row['published_message_id']} to {row['destination_chat_id']}",
+                max_total_sleep=FORWARD_FLOODWAIT_BUDGET_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            permanent = isinstance(exc, PERMANENT_FORWARD_ERRORS)
+            await db.run_async(db.mark_forward_failed, fwd_id, str(exc)[:500], permanent)
+            logger.warning(
+                "Forward to destination %s failed%s: %s",
+                row["destination_chat_id"],
+                " (permanent)" if permanent else "",
+                exc,
+            )
+            continue
+        await db.run_async(db.mark_forwarded, fwd_id)
+        logger.info(
+            "Forwarded bot post #%s (msg %s) to destination %s",
+            row["listing_id"],
+            row["published_message_id"],
+            row["destination_chat_id"],
+        )
+
+
+async def forwarding_worker(
+    client: TelegramClient, stop_event: asyncio.Event, interval: float = None
+) -> None:
+    """Background loop draining the persistent destination-forward queue.
+
+    Runs independently of the publish path, so a temporarily unavailable
+    destination never delays main-channel publishing. Pending rows live in
+    SQLite, so a crash between 'published' and 'forwarded' recovers on restart
+    by simply draining whatever is still pending.
+    """
+    interval = FORWARD_WORKER_INTERVAL if interval is None else interval
+    while not stop_event.is_set():
+        try:
+            await _drain_forward_queue(client)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Destination forwarding worker crashed (will retry next tick)")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Core pipeline
 # ---------------------------------------------------------------------------
 # Per-message in-flight locks (CONC-2). Telegram handlers run concurrently and
@@ -865,6 +986,7 @@ async def _process_supplier_message(
                     listing_id,
                     detail=f"AI unavailable (msg_id {published_msg_id})",
                 )
+                await enqueue_destination_forwardings(listing_id, published_msg_id)
                 logger.info(
                     "Listing #%s published via deterministic fallback (AI down) -> %s (msg_id: %s)",
                     listing_id,
@@ -1008,6 +1130,7 @@ async def _process_supplier_message(
                 post_number=post_number,
             )
             await db.run_async(db.record_audit, "published_auto", listing_id, detail=published_msg_id)
+            await enqueue_destination_forwardings(listing_id, published_msg_id)
             logger.info(
                 "Published listing #%s -> %s (msg_id: %s, post #%s)",
                 listing_id,
@@ -1260,12 +1383,8 @@ async def approved_listings_worker(
                         published_message_id=published_msg_id,
                         post_number=post_number,
                     )
-                    await db.run_async(
-                        db.record_audit,
-                        "published_approved",
-                        listing_id,
-                        detail=published_msg_id,
-                    )
+                    await db.run_async(db.record_audit, "published_approved", listing_id, detail=published_msg_id)
+                    await enqueue_destination_forwardings(listing_id, published_msg_id)
                 except Exception as exc:
                     logger.exception(
                         "Worker published approved listing #%s (msg id %s) but bookkeeping failed: %s",
@@ -1279,6 +1398,7 @@ async def approved_listings_worker(
                             published_message_id=published_msg_id,
                             post_number=post_number,
                         )
+                        await enqueue_destination_forwardings(listing_id, published_msg_id)
                     except Exception:
                         logger.exception("Could not record published state for listing #%s", listing_id)
                 logger.info(
@@ -1574,6 +1694,7 @@ async def main() -> None:
 
     # Start background workers
     worker_task = asyncio.create_task(approved_listings_worker(user_client, stop_event, bot_client))
+    forward_task = asyncio.create_task(forwarding_worker(user_client, stop_event))
     health_task = None
     resolve_task = None
     rephrase_task = None
@@ -1607,6 +1728,7 @@ async def main() -> None:
         logger.info("Shutting down workers and clients...")
         stop_event.set()
         worker_task.cancel()
+        forward_task.cancel()
         for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 task.cancel()
@@ -1614,7 +1736,7 @@ async def main() -> None:
             backfill_task.cancel()
         # SHUT-1: actually await the cancelled tasks so their finally-blocks and
         # DB connection check-ins complete instead of leaking as orphans.
-        pending_tasks = [worker_task]
+        pending_tasks = [worker_task, forward_task]
         for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 pending_tasks.append(task)

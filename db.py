@@ -1,4 +1,4 @@
-"""Database layer for Telegram Monitor & Republisher using SQLite."""
+﻿"""Database layer for Telegram Monitor & Republisher using SQLite."""
 
 import asyncio
 import hashlib
@@ -23,8 +23,10 @@ DEFAULT_DB_PATH = os.environ.get("DB_PATH", "monitor.db")
 # v6 : skips table + price-aware content fingerprint for dedup.
 # v7 : ai_cache table (fingerprint-keyed AI analysis results).
 # v8 : suppliers.display_name for friendly labels (IDs stay the matching key).
+# v9 : pricing system removed at the application level (columns stay dormant).
+# v10: destinations table + forwardings queue (bot-published -> destination groups).
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Columns added in schema v1 to an existing (v0) listings table.
 V1_LISTING_COLUMNS = {
@@ -186,7 +188,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             """
         )
 
-        # 6. Skip log — every filtered-away message with its reason so the daily
+        # 6. Skip log â€” every filtered-away message with its reason so the daily
         #    report can break skipped stats down per reason and per supplier.
         cursor.execute(
             """
@@ -202,7 +204,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             """
         )
 
-        # 7. AI analysis cache — fingerprint-keyed, so the same listing content
+        # 7. AI analysis cache â€” fingerprint-keyed, so the same listing content
         #    is never re-analyzed (edits, restarts, re-deliveries, rephrase sweep).
         cursor.execute(
             """
@@ -218,6 +220,49 @@ def init_db(db_path: Optional[str] = None) -> None:
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_ai_cache_created ON ai_cache(created_at);"
+        )
+
+        # 8. Destinations â€” groups/chats that receive forwarded bot publications.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS destinations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL UNIQUE,
+                title TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+        # 9. Forwardings queue â€” one row per (bot-published message, destination).
+        #    UNIQUE(...) makes re-queuing idempotent: publishing bookkeeping or a
+        #    restart can never enqueue the same forward twice (DEST-1).
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS forwardings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                listing_id INTEGER,
+                published_chat_id TEXT NOT NULL,
+                published_message_id INTEGER NOT NULL,
+                destination_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                retry_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                forwarded_at TEXT,
+                UNIQUE(published_chat_id, published_message_id, destination_id)
+            );
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forwardings_pending ON forwardings(status, id);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forwardings_dest ON forwardings(destination_id);"
         )
 
         # Safe indexes on columns present in both v0 and v1 schemas
@@ -340,7 +385,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         cols = {r["name"] for r in table_info}
         if "header_word" not in cols:
             cursor.execute("ALTER TABLE listings ADD COLUMN header_word TEXT")
-        # No backfill — NULL falls back to the buyer default header at render.
+        # No backfill â€” NULL falls back to the buyer default header at render.
         cursor.execute("PRAGMA user_version = 5")
 
     if version < 6:
@@ -399,10 +444,53 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # fingerprint only; no price is stored, computed, or rendered. Legacy
         # columns (listings.original_price/our_price, suppliers.markup_multiplier)
         # are intentionally LEFT in place so existing databases migrate without a
-        # risky table rebuild — new databases never create them, and no code in
+        # risky table rebuild â€” new databases never create them, and no code in
         # the application reads or writes them anymore. Fresh installs created
         # after v8 have no such columns (see CREATE TABLE above).
         cursor.execute("PRAGMA user_version = 9")
+
+    if version < 10:
+        # DEST-1: destinations config + the persistent forwarding queue. Pure
+        # additive schema â€” existing v9 databases gain two new tables and their
+        # indexes; no existing table is touched.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS destinations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL UNIQUE,
+                title TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS forwardings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                listing_id INTEGER,
+                published_chat_id TEXT NOT NULL,
+                published_message_id INTEGER NOT NULL,
+                destination_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                retry_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                forwarded_at TEXT,
+                UNIQUE(published_chat_id, published_message_id, destination_id)
+            );
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forwardings_pending ON forwardings(status, id);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forwardings_dest ON forwardings(destination_id);"
+        )
+        cursor.execute("PRAGMA user_version = 10")
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +509,7 @@ def make_listing_fingerprint(
 
     Dedup must work BEFORE the AI runs (and be indifferent to AI output, which
     is non-deterministic), so the fingerprint is built from the deterministic
-    source text only — not platform/price (DEDUP-2). The price is folded in so
+    source text only â€” not platform/price (DEDUP-2). The price is folded in so
     the same product re-posted at a different price is NOT treated as a
     duplicate, and a re-post that arrives with a new Telegram message id IS
     caught (identity follows the content, not the message id). The 30-char
@@ -557,7 +645,7 @@ def add_supplier(
     Resolution happens BEFORE any caller reaches this function (see admin_bot);
     this is pure persistence. A supplier whose channel_id already exists on another
     row is updated/reactivated there instead of creating a second row keyed by a
-    different username — that is what made private channels silently duplicate.
+    different username â€” that is what made private channels silently duplicate.
 
     All channel_ids are normalized to the canonical marked form (-100 prefix for
     channels) so that events always match stored suppliers regardless of how they
@@ -813,7 +901,7 @@ def merge_supplier_rows(
         _move_listings_to_supplier(conn, keep_id, drop_id)
 
         # The keep row's channel_id is definitionally correct whenever it is
-        # non-null — every call site keeps the row that OWNS the resolved id — so
+        # non-null â€” every call site keeps the row that OWNS the resolved id â€” so
         # it must never be overwritten from the drop row. Only a keep row with a
         # NULL channel_id adopts the drop row's id. The drop row's unique slot is
         # freed FIRST, otherwise the transfer writes a value the (still-present)
@@ -937,7 +1025,7 @@ def delete_supplier(supplier_id: int, db_path: Optional[str] = None) -> bool:
     """Hard-delete a supplier row.
 
     Existing listings are KEPT for audit history: their supplier_id is nulled
-    (renders as '—' in the admin UI, never as a fake/deleted channel). Skips log
+    (renders as 'â€”' in the admin UI, never as a fake/deleted channel). Skips log
     rows for the supplier are removed with it.
     """
     with db_session(db_path) as conn:
@@ -1127,7 +1215,7 @@ def get_failed_listings(
     """Return failed listings (DLQ) ordered oldest-first.
 
     'error' is retained in the read query purely for legacy rows: no current
-    code path writes it (mark_listing_failed sets 'failed' only) — STATE-1.
+    code path writes it (mark_listing_failed sets 'failed' only) â€” STATE-1.
     """
     with db_session(db_path) as conn:
         rows = conn.execute(
@@ -1509,7 +1597,7 @@ def get_unpublished_listings(
 ) -> List[Dict[str, Any]]:
     """Listings that have not been published yet (received / pending review / approval).
 
-    ``limit`` bounds the sweep — startup recovery must be a bounded pass, never
+    ``limit`` bounds the sweep â€” startup recovery must be a bounded pass, never
     an unbounded AI batch. ``min_age_seconds`` skips listings created too
     recently so the sweep never races a message the live pipeline is still
     holding in-flight (REPHR-1).
@@ -1600,7 +1688,7 @@ def next_post_number(db_path: Optional[str] = None) -> int:
 
 
 # ---------------------------------------------------------------------------
-# App settings (key/value) — runtime toggles like the pause switch
+# App settings (key/value) â€” runtime toggles like the pause switch
 # ---------------------------------------------------------------------------
 def set_setting(key: str, value: str, db_path: Optional[str] = None) -> None:
     """Upsert a key/value setting."""
@@ -1671,7 +1759,7 @@ def get_buyer_asleep_footer(db_path: Optional[str] = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# .env bootstrap seeding — SOURCE_CHANNELS is ONE-TIME, never live state
+# .env bootstrap seeding â€” SOURCE_CHANNELS is ONE-TIME, never live state
 # ---------------------------------------------------------------------------
 # The suppliers table is the single source of truth for what is monitored.
 # SOURCE_CHANNELS is only consulted on the very first startup with an empty
@@ -1790,7 +1878,7 @@ def validate_env_seed_config(
         if not (channels_raw or "").strip():
             return (
                 "No suppliers configured yet (SOURCE_CHANNELS empty, database empty). "
-                "Bot will start with 0 monitored sources — add channels via the admin "
+                "Bot will start with 0 monitored sources â€” add channels via the admin "
                 "bot's Sources menu (Add Source, or forward a message from a private "
                 "channel/group)."
             )
@@ -1798,7 +1886,7 @@ def validate_env_seed_config(
 
 
 # ---------------------------------------------------------------------------
-# AI analysis cache — fingerprint-keyed so identical listing content is never
+# AI analysis cache â€” fingerprint-keyed so identical listing content is never
 # re-analyzed by the model (rephrase sweep, edits, re-deliveries).
 # ---------------------------------------------------------------------------
 def get_ai_cache(
@@ -1853,3 +1941,267 @@ def prune_ai_cache(max_age_hours: float = 48, db_path: Optional[str] = None) -> 
     with db_session(db_path) as conn:
         cursor = conn.execute("DELETE FROM ai_cache WHERE created_at < ?", (cutoff,))
         return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Destinations — groups/chats that receive forwarded bot publications.
+# Conceptually the forwarding twin of sources: same management semantics
+# (add / list / enable-disable / remove) but used purely as forward targets.
+# ---------------------------------------------------------------------------
+
+
+def _destination_chat_ref(chat_id) -> Optional[str]:
+    """Canonical destination peer reference: marked numeric id as TEXT, or '@username'.
+
+    Numeric ids (int or numeric string) are normalized to the -100 marked form;
+    '@handle' strings pass through lowercased. Anything else is rejected, so a
+    typo never becomes an unreachable destination row.
+    """
+    if isinstance(chat_id, str):
+        ref = (chat_id or "").strip()
+        if ref.startswith("@"):
+            if len(ref) > 1 and all(c.isalnum() or c == "_" for c in ref[1:]):
+                return ref.lower()
+            return None
+        marked = normalize_channel_id(ref)
+        return str(marked) if marked is not None else None
+    marked = normalize_channel_id(chat_id)
+    return str(marked) if marked is not None else None
+
+
+def add_destination(
+    chat_id,
+    title: Optional[str] = None,
+    active: bool = True,
+    db_path: Optional[str] = None,
+) -> int:
+    """Register a destination chat (upsert by chat_id) and return its id.
+
+    Mirrors add_supplier: the reference ('-100...' marked id or '@username') is
+    the identity; a re-add reactivates/updates the existing row instead of
+    duplicating it. Raises ValueError for references that can't be a real peer.
+    """
+    chat_ref = _destination_chat_ref(chat_id)
+    if chat_ref is None:
+        raise ValueError("destination requires a valid Telegram chat id or @username")
+    name = (title or "").strip()[:100]
+    active_int = 1 if active else 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO destinations (chat_id, title, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title = excluded.title,
+                active = excluded.active,
+                updated_at = excluded.updated_at
+            """,
+            (chat_ref, name, active_int, now_iso, now_iso),
+        )
+        row = conn.execute(
+            "SELECT id FROM destinations WHERE chat_id = ?", (chat_ref,)
+        ).fetchone()
+        return row["id"] if row else None
+
+
+def set_destination_active(
+    destination_id: int, active: bool, db_path: Optional[str] = None
+) -> bool:
+    """Enable/disable a destination by id. Returns True if a row was updated."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE destinations SET active = ?, updated_at = ? WHERE id = ?",
+            (1 if active else 0, now_iso, destination_id),
+        )
+        return cursor.rowcount > 0
+
+
+def delete_destination(destination_id: int, db_path: Optional[str] = None) -> bool:
+    """Permanently remove a destination. Forwarding history rows are kept.
+
+    Rows already queued for a deleted destination stay in forwardings as-is
+    (the queue join to destinations simply stops matching them); historical
+    'forwarded' records are preserved for the audit trail.
+    """
+    with db_session(db_path) as conn:
+        cursor = conn.execute(
+            "DELETE FROM destinations WHERE id = ?", (destination_id,)
+        )
+        return cursor.rowcount > 0
+
+
+def list_destinations(
+    active_only: bool = False, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """List all configured destinations, oldest first."""
+    query = "SELECT * FROM destinations"
+    if active_only:
+        query += " WHERE active = 1"
+    query += " ORDER BY id ASC"
+    with db_session(db_path) as conn:
+        rows = conn.execute(query).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_destination_by_id(
+    destination_id: int, db_path: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Return one destination row by its primary key."""
+    with db_session(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM destinations WHERE id = ?", (destination_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Forwardings queue — persistent, idempotent work list for destination forwards.
+# ---------------------------------------------------------------------------
+
+FORWARD_MAX_RETRIES = 8
+FORWARD_RETRY_BASE_SECONDS = 30
+FORWARD_RETRY_CAP_SECONDS = 3600
+
+
+def _forward_retry_at(retry_count: int) -> str:
+    """Wall-clock time after which a transient failure may be retried.
+
+    Exponential backoff capped at one hour so a destination that is briefly
+    down is retried soon, but the worker never hot-loops on it. The next retry
+    only becomes due after `retry_count` failures, so SQLite never thrashes.
+    """
+    delay = min(
+        FORWARD_RETRY_BASE_SECONDS * (2 ** max(retry_count - 1, 0)),
+        FORWARD_RETRY_CAP_SECONDS,
+    )
+    return (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+
+
+def queue_forwarding(
+    listing_id: int,
+    published_chat_id,
+    published_message_id: int,
+    db_path: Optional[str] = None,
+) -> int:
+    """Record pending forwarding work for ONE bot-published message.
+
+    Called ONLY from the successful-publication path (never from channel
+    monitoring), one row is created per ACTIVE destination. Re-queuing is a
+    no-op (UNIQUE(published_chat_id, published_message_id, destination_id)) so
+    publish bookkeeping retries and process restarts can never forward twice.
+    Returns the number of new rows created (0 when everything was already
+    queued or no destinations are enabled).
+    """
+    destinations = list_destinations(active_only=True, db_path=db_path)
+    if not destinations:
+        return 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    created = 0
+    with db_session(db_path) as conn:
+        for dest in destinations:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO forwardings
+                    (listing_id, published_chat_id, published_message_id,
+                     destination_id, status, retry_count, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
+                """,
+                (
+                    listing_id,
+                    str(published_chat_id),
+                    int(published_message_id),
+                    dest["id"],
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            created += cur.rowcount
+    return created
+
+
+def get_pending_forwardings(
+    limit: int = 10, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Rows ready to forward now, oldest first, only for ACTIVE destinations.
+
+    'Ready' means rate-limit/backoff (retry_at) is in the past or unset. A row
+    whose destination was deleted or disabled stops matching the JOIN, so the
+    worker never forwards to a chat the admin turned off.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT f.*, d.chat_id AS destination_chat_id, d.title AS destination_title
+            FROM forwardings f
+            JOIN destinations d ON d.id = f.destination_id
+            WHERE f.status = 'pending'
+              AND d.active = 1
+              AND (f.retry_at IS NULL OR f.retry_at <= ?)
+            ORDER BY f.id ASC
+            LIMIT ?
+            """,
+            (now_iso, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def mark_forwarded(forwarding_id: int, db_path: Optional[str] = None) -> None:
+    """Record a successfully forwarded message."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE forwardings
+            SET status = 'forwarded', error = NULL, retry_at = NULL,
+                forwarded_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (now_iso, now_iso, forwarding_id),
+        )
+
+
+def mark_forward_failed(
+    forwarding_id: int,
+    error: str,
+    permanent: bool = False,
+    db_path: Optional[str] = None,
+) -> None:
+    """Record a failed forward.
+
+    Permanent failures (permission errors, deleted/invalid chat, bot removed)
+    are failed immediately and are never retried. Transient failures bump the
+    retry count and stay 'pending' with a backoff (retry_at); after
+    FORWARD_MAX_RETRIES they are marked failed permanently so a dead destination
+    does not grind the queue forever.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if not permanent:
+        with db_session(db_path) as conn:
+            row = conn.execute(
+                "SELECT retry_count FROM forwardings WHERE id = ?", (forwarding_id,)
+            ).fetchone()
+            retry_count = (row["retry_count"] if row else 0) + 1
+        if retry_count < FORWARD_MAX_RETRIES:
+            with db_session(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE forwardings
+                    SET status = 'pending', error = ?, retry_count = ?, retry_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (error[:500], retry_count, _forward_retry_at(retry_count), now_iso, forwarding_id),
+                )
+            return
+    with db_session(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE forwardings
+            SET status = 'failed', error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (error[:500], now_iso, forwarding_id),
+        )

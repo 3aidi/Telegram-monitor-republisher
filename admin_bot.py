@@ -392,12 +392,29 @@ def _edit_prompt(listing: dict, existing_draft: Optional[str]) -> str:
 
 
 # Home reply keyboard — persistent 1-tap UI. Labels reflect current state.
+# Destinations is a reply-keyboard BUTTON, so its tap arrives as plain text that
+# must be caught by a text-tap router (exactly like 📋 Sources). The label and
+# the router share one constant, so a rename on either side can't silently break
+# the button again. The legacy '📤' label is also routed so keyboards rendered
+# before the label swap keep working.
+DESTINATIONS_BTN = "📥 Destinations"
+DESTINATIONS_BTN_LEGACY = "📤 Destinations"
+DESTINATIONS_ROUTE_RE = (
+    r"^(?:/destinations|"
+    + DESTINATIONS_BTN
+    + r"|"
+    + DESTINATIONS_BTN_LEGACY
+    + r")$"
+)
+
+
 def _home_keyboard() -> List[List[object]]:
     pause_label = "▶ All Start" if db.is_paused() else "⏸ All Stop"
     return [
         [Button.text("📊 Status", resize=True), Button.text("⏳ Pending", resize=True), Button.text("⚠️ Failed", resize=True)],
-        [Button.text("📋 Sources", resize=True), Button.text(pause_label, resize=True), Button.text("❓ Help", resize=True)],
+        [Button.text("📋 Sources", resize=True), Button.text(DESTINATIONS_BTN, resize=True), Button.text(pause_label, resize=True)],
         [Button.text("🚫 Skipped", resize=True), Button.text("📜 Published", resize=True), Button.text(_asleep_label(), resize=True)],
+        [Button.text("❓ Help", resize=True)],
     ]
 
 
@@ -736,6 +753,188 @@ def _sources_buttons(suppliers: List[dict]) -> List[List[object]]:
     return buttons
 
 
+# ---- Destinations submenu (DEST-1) ----------------------------------------
+def _destination_icon(d: dict) -> str:
+    return "🟢" if d.get("active") else "🔴"
+
+
+def _destination_label(d: dict) -> str:
+    title = (d.get("title") or "").strip()
+    ref = str(d.get("chat_id") or "")
+    if title:
+        return title
+    if ref.startswith("@"):
+        return ref
+    if ref.lstrip("-").isdigit():
+        return f"chat {ref}"
+    return ref or "?"
+
+
+def _destinations_menu_text(destinations: List[dict]) -> str:
+    if not destinations:
+        return (
+            "No destinations configured — every bot post currently goes only to "
+            "the main channel.\n\nTap **➕ Add Destination** to start forwarding "
+            "posts there too."
+        )
+    return (
+        f"**{len(destinations)} destination(s) configured.** "
+        "Tap one to manage it.\n\n"
+        "🟢 active — bot posts are forwarded here · 🔴 disabled — skipped"
+    )
+
+
+def _destinations_buttons(destinations: List[dict]) -> List[List[object]]:
+    buttons = []
+    for d in destinations[:12]:
+        icon = _destination_icon(d)
+        label = f"{icon} {_destination_label(d)}"
+        buttons.append([Button.inline(label, data=f"dest:{d['id']}")])
+    buttons.append([
+        Button.inline("➕ Add Destination", data="destadd"),
+        Button.inline("⬅️ Back", data="menu:home"),
+    ])
+    return buttons
+
+
+async def _edit_destination_menu(event, d: dict) -> None:
+    """Render the destination detail menu (also used after an enable/disable tap)."""
+    did = d["id"]
+    icon = _destination_icon(d)
+    label = _destination_label(d)
+    toggle_label = "⏸ Disable" if d["active"] else "▶ Enable"
+    await _message_delete_send(
+        event,
+        f"{icon} **{label}**\n"
+        f"Status: `{'Active' if d['active'] else 'Disabled'}`\n"
+        f"ID: `{d['chat_id']}`\n\n"
+        f"• **Active** destinations receive a copy of every successfully published "
+        f"bot post.\n"
+        f"• **Disabled** destinations are skipped (posts already queued are dropped).\n\n"
+        f"What would you like to do?",
+        buttons=[
+            [Button.inline(toggle_label, data=f"desttoggle:{did}")],
+            [Button.inline("🗑 Delete Permanently", data=f"destdel:{did}")],
+            [Button.inline("⬅️ Back", data="menu:destinations")],
+        ],
+    )
+
+
+async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
+    """Resolve-first, then-persist add flow used by /adddestination and the wizard.
+
+    A destination is a chat the bot-forwards posts TO, so resolution matters
+    less than for sources (delivery just needs a peer): numeric ids and '@'
+    usernames are stored as-is; an unresolvable username is confirmed explicitly
+    before being saved (destaddunresolved) instead of guessing silently.
+    """
+    if fwd is not None:
+        raw_chat_id = _channel_id_from_fwd(fwd)
+        if raw_chat_id is None:
+            await event.reply(
+                "That forward isn't from a channel/group I can identify. "
+                "Forward a post **made by the group** (not a message you typed "
+                "yourself), or send a username / numeric ID instead.",
+                buttons=_home_keyboard(),
+            )
+            return
+        chat_ref = db.normalize_channel_id(raw_chat_id)
+        entity = None
+        if user_client_ref and user_client_ref.is_connected():
+            try:
+                entity = await user_client_ref.get_entity(chat_ref)
+            except Exception:
+                entity = None
+        display = _entity_display(entity, fallback=f"chat {chat_ref}")
+        await db.run_async(db.add_destination, chat_ref, display, True)
+        await db.run_async(
+            db.record_audit,
+            "destination_added",
+            None,
+            actor_id=ADMIN_USER_ID,
+            detail=f"forwarded post -> {display} (id {chat_ref})",
+        )
+        await event.reply(
+            f"✅ **Destination added by forward**: `{display}` (ID `{chat_ref}`)\n"
+            f"Every bot post published from now on will be forwarded here.",
+            buttons=_home_keyboard(),
+        )
+        return
+
+    username, numeric = _supplier_ref_from_text(text)
+    if not username:
+        await event.reply(
+            "I couldn't read a chat reference from that. Send a group username "
+            "(e.g. `@mygroup`), a numeric ID (e.g. `-1001234567890`), or forward "
+            "a message from the group.",
+            buttons=_home_keyboard(),
+        )
+        return
+
+    entity = None
+    if user_client_ref and user_client_ref.is_connected():
+        reference = int(numeric) if numeric is not None else username
+        try:
+            entity = await user_client_ref.get_entity(reference)
+        except Exception as exc:
+            logger.warning("Could not resolve destination reference %r: %s", username, exc)
+
+    if entity is not None:
+        entity_id = db.normalize_channel_id(entity)
+        entity_username = (
+            (getattr(entity, "username", None) or "").strip().lstrip("@") or None
+        )
+        display = _entity_display(entity, fallback=username)
+        store_ref = (
+            f"@{entity_username.lower()}"
+            if entity_username
+            else (str(entity_id) if entity_id else username)
+        )
+        await db.run_async(db.add_destination, store_ref, display, True)
+        await db.run_async(
+            db.record_audit,
+            "destination_added",
+            None,
+            actor_id=ADMIN_USER_ID,
+            detail=f"{text} -> {display}",
+        )
+        await event.reply(
+            f"✅ **Destination added**: `{display}`\n"
+            f"Every bot post published from now on will be forwarded here.",
+            buttons=_home_keyboard(),
+        )
+        return
+
+    if numeric is not None:
+        display = f"chat {numeric}"
+        await db.run_async(db.add_destination, numeric, display, True)
+        await db.run_async(
+            db.record_audit,
+            "destination_added",
+            None,
+            actor_id=ADMIN_USER_ID,
+            detail=f"{numeric} (numeric) -> {display}",
+        )
+        await event.reply(
+            f"✅ **Destination added**: `{display}` (ID `{numeric}`)",
+            buttons=_home_keyboard(),
+        )
+        return
+
+    _wizard_state[ADMIN_USER_ID] = {"step": "adddest_confirm_unresolved", "raw": text}
+    await event.reply(
+        f"I couldn't verify `{text}` as a chat I can send to. It may be a private "
+        f"group I'm not a member of.\n\n"
+        f"• **Forward a message FROM the group** and I'll grab its exact ID, or\n"
+        f"• Add it anyway and I'll retry delivery on every post (failures show "
+        f"up in the queue).",
+        buttons=[
+            [Button.inline("✅ Add anyway (retry later)", data="destaddunresolved")],
+            [Button.inline("❌ Cancel", data="wiz:cancel")],
+        ],
+    )
+
+
 def _home_button_row() -> List[List[object]]:
     """Inline "back to Home" row used by every section rendered from the Home menu."""
     return [[Button.inline("🏠 Home", data="menu:home")]]
@@ -756,8 +955,8 @@ def _home_inline_keyboard() -> List[List[object]]:
         ],
         [
             Button.inline("📋 Sources", data="menu:sources"),
+            Button.inline(DESTINATIONS_BTN, data="menu:destinations"),
             Button.inline(pause_label, data="home:toggle"),
-            Button.inline("❓ Help", data="home:help"),
         ],
         [
             Button.inline("🚫 Skipped", data="home:skipped"),
@@ -765,6 +964,7 @@ def _home_inline_keyboard() -> List[List[object]]:
         ],
         [
             Button.inline(_asleep_label(), data="home:asleep"),
+            Button.inline("❓ Help", data="home:help"),
         ],
     ]
 
@@ -777,6 +977,7 @@ def _help_text() -> str:
         "• **⏳ Pending** — approve / preview / edit new listings\n"
         "• **⚠️ Failed** — retry failed publishes\n"
         "• **📋 Sources** — add, manage, remove sources\n"
+        f"• **{DESTINATIONS_BTN}** — add groups to forward copies of every bot post to\n"
         "• **📜 Published** — every post with its **#Post number** + channel & source links\n"
         "• **🔢 /post 12** — jump straight to post #12\n"
         "• **⏸ All Stop / ▶ All Start** — pause or resume AUTOMATIC publishing only. "
@@ -1030,6 +1231,36 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
         await _run_add_supplier_flow(event, arg)
+
+    @bot.on(events.NewMessage(pattern=r"^/adddestination(?:\s+(.+))?"))
+    async def handle_add_destination(event):
+        if not await check_admin(event):
+            return
+        arg = (event.pattern_match.group(1) or "").strip()
+        if not arg:
+            await event.reply(
+                "**Add a destination** — a group where forwarded copies of every "
+                "bot post should land. Any of these work:\n"
+                "• Group username: `@mygroup`\n"
+                "• Numeric ID: `-1001234567890`\n"
+                "• **Forward a message FROM the group** — best for private groups "
+                "with no username (I grab its exact ID automatically).\n\n"
+                "Example: `/adddestination @mygroup`",
+                buttons=_home_keyboard(),
+            )
+            return
+        await _run_add_destination_flow(event, arg)
+
+    @bot.on(events.NewMessage(pattern=DESTINATIONS_ROUTE_RE))
+    async def handle_destinations(event):
+        if not await check_admin(event):
+            return
+        destinations = db.list_destinations(active_only=False)
+        await event.reply(
+            _destinations_menu_text(destinations),
+            buttons=_destinations_buttons(destinations),
+            parse_mode=None,
+        )
 
     @bot.on(events.NewMessage(pattern=r"^/removesupplier(?:\s+(.+))?"))
     async def handle_remove_supplier(event):
@@ -1417,6 +1648,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await _message_delete_send(event, text, buttons=_sources_buttons(suppliers), parse_mode=None)
             return
 
+        if data_str == "menu:destinations":
+            destinations = db.list_destinations(active_only=False)
+            text = _destinations_menu_text(destinations)
+            await _message_delete_send(
+                event, text, buttons=_destinations_buttons(destinations), parse_mode=None
+            )
+            return
+
         if data_str.startswith("home:"):
             home_action = data_str.split(":", 1)[1]
             if home_action == "status":
@@ -1605,6 +1844,129 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
 
+        # ---- Destinations submenu ------------------------------------------
+        dest_match = re.match(r"^dest:(\d+)$", data_str)
+        if dest_match:
+            did = int(dest_match.group(1))
+            d = db.get_destination_by_id(did)
+            if not d:
+                await event.answer("Destination not found.", alert=True)
+                return
+            await _edit_destination_menu(event, d)
+            return
+
+        desttoggle_match = re.match(r"^desttoggle:(\d+)$", data_str)
+        if desttoggle_match:
+            did = int(desttoggle_match.group(1))
+            d = db.get_destination_by_id(did)
+            if not d:
+                await event.answer("Destination not found.", alert=True)
+                return
+            await db.run_async(db.set_destination_active, did, not d["active"])
+            await db.run_async(
+                db.record_audit,
+                "destination_toggle",
+                None,
+                actor_id=ADMIN_USER_ID,
+                detail=str(did),
+            )
+            refreshed = db.get_destination_by_id(did)
+            if refreshed:
+                await _edit_destination_menu(event, refreshed)
+            return
+
+        destdel_match = re.match(r"^destdel:(\d+)$", data_str)
+        if destdel_match:
+            did = int(destdel_match.group(1))
+            d = db.get_destination_by_id(did)
+            if not d:
+                await event.answer("Destination not found.", alert=True)
+                return
+            await _message_delete_send(
+                event,
+                f"🗑 **Delete {_destination_label(d)} permanently?**\n"
+                f"This removes the destination and stops forwarding posts to it.\n"
+                f"Existing forward history stays.\n"
+                f"This cannot be undone.",
+                buttons=[
+                    [Button.inline("✅ Yes, Delete Forever", data=f"destdelyes:{did}")],
+                    [Button.inline("❌ Cancel", data="wiz:cancel")],
+                ],
+            )
+            return
+
+        destdelyes_match = re.match(r"^destdelyes:(\d+)$", data_str)
+        if destdelyes_match:
+            did = int(destdelyes_match.group(1))
+            d = db.get_destination_by_id(did)
+            if not d:
+                await event.answer("Destination not found.", alert=True)
+                return
+            await db.run_async(db.delete_destination, did)
+            await db.run_async(
+                db.record_audit,
+                "destination_deleted",
+                None,
+                actor_id=ADMIN_USER_ID,
+                detail=str(did),
+            )
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            try:
+                await event.client.send_message(
+                    ADMIN_USER_ID,
+                    f"🗑 **Destination permanently deleted.**\n"
+                    f"{_destination_label(d)} is gone. History is kept.",
+                    parse_mode="markdown",
+                )
+            except Exception:
+                pass
+            destinations = db.list_destinations(active_only=False)
+            await event.client.send_message(
+                ADMIN_USER_ID,
+                _destinations_menu_text(destinations),
+                buttons=_destinations_buttons(destinations),
+                parse_mode=None,
+            )
+            return
+
+        if data_str == "destaddunresolved":
+            state = _wizard_state.get(ADMIN_USER_ID) or {}
+            raw = (state.get("raw") or "").strip()
+            _wizard_state.pop(ADMIN_USER_ID, None)
+            if not raw:
+                await event.answer("Nothing to add.", alert=True)
+                return
+            try:
+                did = await db.run_async(db.add_destination, raw, raw, True)
+            except ValueError as exc:
+                await _message_delete_send(
+                    event,
+                    f"⚠️ **Could not add destination**: {exc}\n"
+                    f"Use a group username (`@mygroup`) or numeric ID "
+                    f"(`-1001234567890`).",
+                    buttons=_home_keyboard(),
+                )
+                return
+            await db.run_async(
+                db.record_audit,
+                "destination_added",
+                None,
+                actor_id=ADMIN_USER_ID,
+                detail=f"{raw} (unverified) -> {raw}",
+            )
+            await _message_delete_send(
+                event,
+                f"⚠️ **Destination added (unverified)**: `{raw}`\n"
+                f"I couldn't confirm I can send to it yet — delivery will be "
+                f"retried on every post until it succeeds, and failures show up "
+                f"in the queue. Make sure the bot account is a member.",
+                buttons=_home_keyboard(),
+            )
+            return
+
         if data_str == "reseed:yes":
             try:
                 raw = os.environ.get("SOURCE_CHANNELS", "")
@@ -1689,6 +2051,22 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 "• Numeric ID: `-1001234567890`\n"
                 "• **Forward a message FROM the channel/group** — best for private "
                 "chats with no username (I'll grab its exact ID automatically).\n\n"
+                "Send any of the above now.",
+                buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
+                parse_mode="markdown",
+            )
+            return
+
+        if data_str == "destadd":
+            _wizard_state[ADMIN_USER_ID] = {"step": "adddest"}
+            await _message_delete_send(
+                event,
+                "✏️ **Add a destination** — a group where forwarded copies of every "
+                "bot post should land. Any of these work:\n"
+                "• Group username: `@mygroup`\n"
+                "• Numeric ID: `-1001234567890`\n"
+                "• **Forward a message FROM the group** — best for private groups "
+                "with no username (I'll grab its exact ID automatically).\n\n"
                 "Send any of the above now.",
                 buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
                 parse_mode="markdown",
@@ -1932,6 +2310,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         actor_id=event.sender_id,
                         detail=published_msg_id,
                     )
+                    await db.run_async(
+                        db.queue_forwarding, listing_id, DEST_CHANNEL, published_msg_id
+                    )
                 except Exception as exc:
                     logger.exception(
                         "Listing #%s WAS published (msg id %s) but bookkeeping failed: %s",
@@ -1944,6 +2325,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                             status="published",
                             published_message_id=published_msg_id,
                             post_number=post_number,
+                        )
+                        await db.run_async(
+                            db.queue_forwarding, listing_id, DEST_CHANNEL, published_msg_id
                         )
                     except Exception:
                         logger.exception("Could not record published state for listing #%s", listing_id)
@@ -2000,6 +2384,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await _run_add_supplier_flow(event, None, fwd=fwd)
             return
 
+        if state and state.get("step") == "adddest" and fwd is not None:
+            _wizard_state.pop(ADMIN_USER_ID, None)
+            await _run_add_destination_flow(event, None, fwd=fwd)
+            return
+
         text = event.text
         if not text:
             return
@@ -2007,7 +2396,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if text.startswith("/"):
             return
         # Menu taps must not be swallowed while a wizard is waiting
-        if text in ("📊 Status", "⏳ Pending", "⚠️ Failed", "📋 Sources",
+        if text in ("📊 Status", "⏳ Pending", "⚠️ Failed", "📋 Sources", DESTINATIONS_BTN,
                     "⏸ All Stop", "▶ All Start", "❓ Help", "📜 Published",
                     "😴 I'm Asleep", "☀️ I'm Awake"):
             _wizard_state.pop(ADMIN_USER_ID, None)
@@ -2020,6 +2409,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         if state["step"] == "add":
             await _run_add_supplier_flow(event, text)
+            return
+
+        if state["step"] == "adddest":
+            await _run_add_destination_flow(event, text)
             return
 
         if state["step"] == "edit":

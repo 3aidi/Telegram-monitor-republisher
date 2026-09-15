@@ -16,7 +16,7 @@ import db
 import filters
 import parser
 import publish_guard
-from telethon.errors import FloodWaitError
+from telethon.errors import ChatWriteForbiddenError, FloodWaitError
 
 TEST_DB = "test_monitor.db"
 
@@ -2714,6 +2714,356 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(db.get_skip_digest_marker(db_path=TEST_DB), 7)
         db.set_skip_digest_marker(3, db_path=TEST_DB)
         self.assertEqual(db.get_skip_digest_marker(db_path=TEST_DB), 3)
+
+
+class TestDestinationsForwarding(unittest.TestCase):
+    """DEST-1: destination forwards are queued ONLY on successful publication and
+    drained independently of the main-channel publish path."""
+
+    def setUp(self):
+        self.db_path = os.path.join(
+            tempfile.gettempdir(), f"test_destinations_{os.getpid()}.db"
+        )
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        db.init_db(self.db_path)
+
+    def tearDown(self):
+        for _ in range(3):
+            try:
+                os.remove(self.db_path)
+                return
+            except OSError:
+                time.sleep(0.05)
+
+    def _fresh_db(self, name: str) -> str:
+        path = os.path.join(tempfile.gettempdir(), name)
+        if os.path.exists(path):
+            os.remove(path)
+        db.init_db(path)
+        return path
+
+    def _sql(self, forwarding_id: int, db_path=None):
+        conn = sqlite3.connect(db_path or self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM forwardings WHERE id = ?", (forwarding_id,)
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def test_add_and_list_destinations(self):
+        a = db.add_destination(-100111, "Team Buyers", db_path=self.db_path)
+        b = db.add_destination("@mygroup", "My Group", db_path=self.db_path)
+        c = db.add_destination(-100333, active=False, db_path=self.db_path)
+
+        rows = db.list_destinations(active_only=False, db_path=self.db_path)
+        self.assertEqual([r["id"] for r in rows], [a, b, c])
+        self.assertEqual(rows[0]["chat_id"], "-100111")
+        self.assertEqual(rows[1]["chat_id"], "@mygroup")
+        self.assertEqual([r["active"] for r in rows], [1, 1, 0])
+
+        active = db.list_destinations(active_only=True, db_path=self.db_path)
+        self.assertEqual([r["id"] for r in active], [a, b])
+
+        got = db.get_destination_by_id(c, db_path=self.db_path)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["chat_id"], "-100333")
+
+    def test_add_destination_rejects_invalid_reference(self):
+        for bad in ("", "   ", "not a peer", "a#b", "-abc", "bad username!"):
+            with self.assertRaises(ValueError):
+                db.add_destination(bad, db_path=self.db_path)
+        self.assertEqual(db.list_destinations(active_only=False, db_path=self.db_path), [])
+
+    def test_upsert_reactivates_and_renames(self):
+        a = db.add_destination(-100121, "Old Title", active=False, db_path=self.db_path)
+        a2 = db.add_destination("-100121", "New Title", active=True, db_path=self.db_path)
+        self.assertEqual(a2, a, "re-adding the same chat must upsert, not duplicate")
+        rows = db.list_destinations(active_only=False, db_path=self.db_path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["title"], "New Title")
+        self.assertEqual(rows[0]["active"], 1)
+
+    def test_disabled_destination_skipped_until_reenabled(self):
+        off = db.add_destination(-100999, active=False, db_path=self.db_path)
+        created = db.queue_forwarding(10, "@chan", 500, db_path=self.db_path)
+        self.assertEqual(created, 0, "disabled destinations must not receive forwards")
+
+        ok = db.set_destination_active(off, True, db_path=self.db_path)
+        self.assertTrue(ok)
+        created = db.queue_forwarding(10, "@chan", 500, db_path=self.db_path)
+        self.assertEqual(created, 1)
+        pending = db.get_pending_forwardings(db_path=self.db_path)
+        self.assertEqual([p["destination_id"] for p in pending], [off])
+
+    def test_enqueue_helper_creates_one_forward_per_active_destination(self):
+        """The single choke point used by every publish site."""
+        import asyncio
+        import main as main_mod
+
+        db.add_destination(-100211, "G1", db_path=self.db_path)
+        db.add_destination(-100212, "G2", db_path=self.db_path)
+        db.add_destination(-100213, "G3", active=False, db_path=self.db_path)
+
+        old_default = db.DEFAULT_DB_PATH
+        old_dest = main_mod.DEST_CHANNEL
+        db.DEFAULT_DB_PATH = self.db_path
+        main_mod.DEST_CHANNEL = "@mainchan"
+        try:
+            n = asyncio.run(main_mod.enqueue_destination_forwardings(7, 222))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+            main_mod.DEST_CHANNEL = old_dest
+        self.assertEqual(n, 2)
+
+        pending = db.get_pending_forwardings(db_path=self.db_path)
+        self.assertEqual(len(pending), 2)
+        self.assertEqual(pending[0]["published_chat_id"], "@mainchan")
+        self.assertEqual(
+            [p["destination_chat_id"] for p in pending], ["-100211", "-100212"]
+        )
+        self.assertEqual(pending[0]["listing_id"], 7)
+        self.assertEqual(pending[0]["published_message_id"], 222)
+
+    def test_queue_forwarding_idempotent(self):
+        db.add_destination(-100221, "G", db_path=self.db_path)
+        first = db.queue_forwarding(7, "@chan", 111, db_path=self.db_path)
+        dup = db.queue_forwarding(7, "@chan", 111, db_path=self.db_path)
+        self.assertEqual(first, 1)
+        self.assertEqual(dup, 0, "re-queuing the same published message is a no-op")
+        self.assertEqual(len(db.get_pending_forwardings(db_path=self.db_path)), 1)
+
+    def test_get_pending_orders_by_id_and_hides_not_due(self):
+        a = db.add_destination(-100311, "A", db_path=self.db_path)
+        b = db.add_destination(-100312, "B", db_path=self.db_path)
+        db.queue_forwarding(1, "@c", 1, db_path=self.db_path)
+
+        pending = db.get_pending_forwardings(limit=1, db_path=self.db_path)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["destination_id"], a, "oldest row first")
+        self.assertEqual(pending[0]["listing_id"], 1)
+
+        fid = pending[0]["id"]
+        db.mark_forward_failed(fid, "transient", db_path=self.db_path)
+        pending2 = db.get_pending_forwardings(limit=10, db_path=self.db_path)
+        self.assertEqual(
+            [p["destination_id"] for p in pending2],
+            [b],
+            "a backoff row is not due until retry_at",
+        )
+
+        row = self._sql(fid)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["retry_count"], 1)
+        self.assertIsNotNone(row["retry_at"])
+
+    def test_transient_failures_eventually_failed(self):
+        db.add_destination(-100411, "T", db_path=self.db_path)
+        db.queue_forwarding(1, "@c", 1, db_path=self.db_path)
+        pending = db.get_pending_forwardings(db_path=self.db_path)
+        self.assertEqual(len(pending), 1)
+        fid = pending[0]["id"]
+
+        for _ in range(db.FORWARD_MAX_RETRIES + 2):
+            row = self._sql(fid)
+            if row and row["status"] == "failed":
+                break
+            db.mark_forward_failed(fid, "boom", db_path=self.db_path)
+        row = self._sql(fid)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["retry_count"], db.FORWARD_MAX_RETRIES - 1)
+        self.assertEqual(db.get_pending_forwardings(db_path=self.db_path), [])
+
+    def test_permanent_failure_is_terminal(self):
+        db.add_destination(-100511, "P", db_path=self.db_path)
+        db.queue_forwarding(1, "@c", 1, db_path=self.db_path)
+        pending = db.get_pending_forwardings(db_path=self.db_path)
+        fid = pending[0]["id"]
+        db.mark_forward_failed(fid, "ChatWriteForbiddenError", permanent=True, db_path=self.db_path)
+        row = self._sql(fid)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["retry_count"], 0, "permanent errors are never retried")
+        self.assertEqual(db.get_pending_forwardings(db_path=self.db_path), [])
+
+    def test_delete_destination_keeps_forwarding_history(self):
+        d = db.add_destination(-100611, "H", db_path=self.db_path)
+        db.queue_forwarding(1, "@c", 1, db_path=self.db_path)
+
+        ok = db.delete_destination(d, db_path=self.db_path)
+        self.assertTrue(ok)
+        self.assertIsNone(db.get_destination_by_id(d, db_path=self.db_path))
+        self.assertEqual(db.list_destinations(active_only=False, db_path=self.db_path), [])
+        self.assertEqual(db.get_pending_forwardings(db_path=self.db_path), [])
+
+        conn = sqlite3.connect(self.db_path)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM forwardings WHERE destination_id = ?", (d,)
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1, "history rows outlive the destination")
+
+    def test_worker_drain_delivers_and_defers_a_flooded_destination(self):
+        db_path = self._fresh_db("dest_worker_flood.db")
+        db.add_destination("-100710", "A", db_path=db_path)
+        db.add_destination("-100712", "B", db_path=db_path)
+        db.queue_forwarding(1, "@chan", 700, db_path=db_path)
+
+        delivered = []
+        calls = {"n": 0}
+
+        def _flood_err():
+            calls["n"] += 1
+            err = FloodWaitError.__new__(FloodWaitError)
+            err.seconds = 5
+            return err
+
+        class _FakeClient:
+            async def forward_messages(self, to_entity, messages, from_peer):
+                if to_entity == "-100712":
+                    raise _flood_err()
+                delivered.append(to_entity)
+                return object()
+
+        main_mod = None
+        import asyncio
+        import main as _main
+        main_mod = _main
+        old_default = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = db_path
+        try:
+            with mock.patch("main.FORWARD_FLOODWAIT_BUDGET_SECONDS", 2.0), mock.patch.object(
+                publish_guard.asyncio, "sleep", new_callable=lambda: mock.AsyncMock()
+            ):
+                asyncio.run(main_mod._drain_forward_queue(_FakeClient()))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+
+        self.assertEqual(delivered, ["-100710"], "non-flooded destination still delivered")
+        self.assertGreaterEqual(calls["n"], 1, "the flooded destination was attempted")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT f.*, d.chat_id AS destination_chat_id FROM forwardings f "
+            "JOIN destinations d ON d.id = f.destination_id ORDER BY f.id"
+        ).fetchall()
+        conn.close()
+        by_dest = {r["destination_chat_id"]: r for r in rows}
+        self.assertEqual(by_dest["-100710"]["status"], "forwarded")
+        self.assertEqual(by_dest["-100712"]["status"], "pending", "flooded dest is deferred, not failed")
+        self.assertEqual(by_dest["-100712"]["retry_count"], 1)
+        os.remove(db_path)
+
+    def test_worker_drain_marks_permanent_failure_terminal(self):
+        db_path = self._fresh_db("dest_worker_perm.db")
+        db.add_destination("-100810", "A", db_path=db_path)
+        db.add_destination("-100812", "B", db_path=db_path)
+        db.queue_forwarding(1, "@chan", 800, db_path=db_path)
+
+        delivered = []
+
+        class _FakeClient:
+            async def forward_messages(self, to_entity, messages, from_peer):
+                if to_entity == "-100812":
+                    raise ChatWriteForbiddenError(request=None)
+                delivered.append(to_entity)
+                return object()
+
+        import asyncio
+        import main as _main
+        main_mod = _main
+        old_default = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = db_path
+        try:
+            asyncio.run(main_mod._drain_forward_queue(_FakeClient()))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+
+        self.assertEqual(delivered, ["-100810"])
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT f.*, d.chat_id AS destination_chat_id FROM forwardings f "
+            "JOIN destinations d ON d.id = f.destination_id ORDER BY f.id"
+        ).fetchall()
+        conn.close()
+        by_dest = {r["destination_chat_id"]: r for r in rows}
+        self.assertEqual(by_dest["-100810"]["status"], "forwarded")
+        self.assertEqual(by_dest["-100812"]["status"], "failed", "permanent error is terminal")
+        self.assertEqual(by_dest["-100812"]["retry_count"], 0, "no retries for permanent errors")
+        os.remove(db_path)
+
+    def test_queue_forwarding_only_called_from_publish_path(self):
+        """DEST-1 guard: manual messages typed in the main channel can NEVER be
+        forwarded — the only callers of queue_forwarding in the whole codebase
+        are the successful-publication choke point (main.py) and the admin
+        approve-publish hook (admin_bot.py)."""
+        import admin_bot as admin_mod
+        import main as main_mod
+
+        src_main = open(main_mod.__file__, encoding="utf-8").read()
+        src_admin = open(admin_mod.__file__, encoding="utf-8").read()
+
+        self.assertEqual(
+            src_main.count("queue_forwarding"),
+            1,
+            "main.py must enqueue ONLY inside enqueue_destination_forwardings "
+            "(monitoring / pipeline paths may never call it)",
+        )
+        self.assertIn("async def enqueue_destination_forwardings", src_main)
+        self.assertIn("db.queue_forwarding", src_main)
+
+        approve_blocks = src_admin.count("db.queue_forwarding")
+        self.assertGreaterEqual(
+            approve_blocks, 1, "admin approve-publish must enqueue forwarding"
+        )
+        for needle in ("destadd", "desttoggle", "destdel", "destdelyes",
+                       "menu:destinations", "adddestination"):
+            self.assertIn(needle, src_admin)
+
+    def test_destinations_reply_keyboard_button_exact_text(self):
+        """The reply-keyboard button the admin sees must be exactly
+        '📥 Destinations' (Telegram sends the button text back as a plain
+        message, so the router must match this text character-for-character)."""
+        import admin_bot as admin_mod
+
+        labels = [b.button.text for row in admin_mod._home_keyboard() for b in row]
+        self.assertIn("📥 Destinations", labels)
+
+    def test_destinations_button_text_routes_to_menu(self):
+        """Logical routing check mirroring Telethon's own matching: the
+        destinations text-tap router is wired to the SAME constant as the reply
+        keyboard button, and Telethon runs `re.compile(pattern).match(raw_text)`;
+        the exact text sent by the '📥 Destinations' button must therefore reach
+        the handler — just like '📋 Sources' does for Sources."""
+        import re
+
+        import admin_bot as admin_mod
+
+        labels = [b.button.text for row in admin_mod._home_keyboard() for b in row]
+
+        for text in (
+            "📥 Destinations",            # the label the admin actually sees
+            admin_mod.DESTINATIONS_BTN,   # the shared constant
+            "/destinations",              # command entry point still routes
+            "📤 Destinations",            # legacy label keyboards keep working
+        ):
+            self.assertIsNotNone(
+                re.compile(admin_mod.DESTINATIONS_ROUTE_RE).match(text),
+                f"'{text}' must route to the Destinations menu",
+            )
+
+        self.assertTrue(
+            any(
+                re.compile(admin_mod.DESTINATIONS_ROUTE_RE).match(t) for t in labels
+            ),
+            "the reply-keyboard Destinations button text must match the router",
+        )
+
+        self.assertIsNone(
+            re.compile(admin_mod.DESTINATIONS_ROUTE_RE).match("📋 Sources"),
+            "Sources text must not be swallowed by the Destinations router",
+        )
 
 
 if __name__ == "__main__":
