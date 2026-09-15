@@ -1,5 +1,6 @@
 """Database layer for Telegram Monitor & Republisher using SQLite."""
 
+import asyncio
 import hashlib
 import os
 import re
@@ -7,7 +8,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 DEFAULT_DB_PATH = os.environ.get("DB_PATH", "monitor.db")
 
@@ -23,7 +24,7 @@ DEFAULT_DB_PATH = os.environ.get("DB_PATH", "monitor.db")
 # v7 : ai_cache table (fingerprint-keyed AI analysis results).
 # v8 : suppliers.display_name for friendly labels (IDs stay the matching key).
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Columns added in schema v1 to an existing (v0) listings table.
 V1_LISTING_COLUMNS = {
@@ -35,6 +36,17 @@ V1_LISTING_COLUMNS = {
     "published_at": "TEXT",
     "fingerprint": "TEXT",
 }
+
+
+async def run_async(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking DB call off the event loop (the one async-DB idiom).
+
+    Writes contend on SQLite's single writer lock; a call that hits
+    busy_timeout would otherwise freeze the whole event loop. Every database
+    WRITE from async code must go through this helper. WAL-mode reads never
+    block on the writer, so read-only lookups may stay synchronous (ASYNC-1).
+    """
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def get_db_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
@@ -55,7 +67,7 @@ def _commit_with_retry(conn, retries: int = 5, base_delay: float = 0.1) -> None:
         try:
             conn.commit()
             return
-        except sqlite3.OperationalError as exc:
+        except sqlite3.OperationalError:
             if attempt >= retries - 1:
                 raise
             time.sleep(base_delay * (attempt + 1))
@@ -103,7 +115,6 @@ def init_db(db_path: Optional[str] = None) -> None:
                 channel_id INTEGER UNIQUE,
                 display_name TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
-                markup_multiplier REAL NOT NULL DEFAULT 0.75,
                 added_at TEXT NOT NULL
             );
             """
@@ -118,8 +129,6 @@ def init_db(db_path: Optional[str] = None) -> None:
                 source_message_id INTEGER NOT NULL,
                 game_name TEXT,
                 rank_tier TEXT,
-                original_price REAL,
-                our_price REAL,
                 status TEXT NOT NULL,
                 raw_text TEXT,
                 clean_text TEXT,
@@ -384,10 +393,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
             cursor.execute("ALTER TABLE suppliers ADD COLUMN display_name TEXT")
         cursor.execute("PRAGMA user_version = 8")
 
+    if version < 9:
+        # PRIC-1: the pricing system is removed at the application level. Source
+        # price is still read from the message text transiently for the dedup
+        # fingerprint only; no price is stored, computed, or rendered. Legacy
+        # columns (listings.original_price/our_price, suppliers.markup_multiplier)
+        # are intentionally LEFT in place so existing databases migrate without a
+        # risky table rebuild — new databases never create them, and no code in
+        # the application reads or writes them anymore. Fresh installs created
+        # after v8 have no such columns (see CREATE TABLE above).
+        cursor.execute("PRAGMA user_version = 9")
+
 
 # ---------------------------------------------------------------------------
 # Fingerprinting (canonical, shared between store + dedup lookup)
 # ---------------------------------------------------------------------------
+# In-flight 'received' rows only match each other within this short window, so
+# a row stranded in 'received' (e.g. after a hard kill) cannot blind duplicate
+# detection for the full dedup window (CONC-2).
+_RECEIVED_DEDUP_MINUTES = 30
+
+
 def make_listing_fingerprint(
     clean_text: str, price: Optional[float] = None
 ) -> str:
@@ -523,7 +549,6 @@ def normalize_supplier_channel_ids(
 def add_supplier(
     channel_username: str,
     channel_id: Optional[int] = None,
-    markup_multiplier: float = 0.75,
     db_path: Optional[str] = None,
     active: bool = True,
 ) -> int:
@@ -537,11 +562,6 @@ def add_supplier(
     All channel_ids are normalized to the canonical marked form (-100 prefix for
     channels) so that events always match stored suppliers regardless of how they
     were added.
-
-    markup_multiplier is only ever applied when a NEW row is created; re-adding an
-    existing channel NEVER resets its multiplier (a custom rule set via the admin
-    Sources menu must survive restarts and env re-syncs). Change it with
-    set_supplier_rule.
     """
     username = channel_username.strip()
     if username.startswith("@"):
@@ -587,14 +607,14 @@ def add_supplier(
         try:
             cursor.execute(
                 """
-                INSERT INTO suppliers (channel_username, channel_id, active, markup_multiplier, added_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO suppliers (channel_username, channel_id, active, added_at)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(channel_username) DO UPDATE SET
                     channel_id = coalesce(excluded.channel_id, suppliers.channel_id),
                     active = excluded.active,
                     added_at = excluded.added_at
                 """,
-                (username, channel_id, active_int, markup_multiplier, now_iso),
+                (username, channel_id, active_int, now_iso),
             )
         except sqlite3.IntegrityError:
             # channel_id already belongs to another username (e.g. a renamed
@@ -658,21 +678,6 @@ def set_supplier_display_name(
             "UPDATE suppliers SET display_name = ? "
             "WHERE channel_id = ? OR channel_username = ?",
             (name, raw, raw.lower()),
-        )
-        return cursor.rowcount > 0
-
-
-def set_supplier_rule(
-    channel_username: str, markup_multiplier: float, db_path: Optional[str] = None
-) -> bool:
-    """Set custom markup multiplier for a specific supplier (matches by username
-    OR numeric id, so ID-addressed suppliers can be re-ruled too)."""
-    username = channel_username.strip().lstrip("@").lower()
-    with db_session(db_path) as conn:
-        cursor = conn.execute(
-            "UPDATE suppliers SET markup_multiplier = ? "
-            "WHERE channel_username = ? OR channel_id = ?",
-            (markup_multiplier, username, username),
         )
         return cursor.rowcount > 0
 
@@ -953,15 +958,19 @@ def insert_listing(
     source_message_id: int,
     game_name: Optional[str],
     rank_tier: Optional[str],
-    original_price: Optional[float],
-    our_price: Optional[float],
     status: str,
     raw_text: str,
     clean_text: str,
     published_message_id: Optional[int] = None,
+    fingerprint: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> int:
-    """Insert a captured listing record (idempotent per supplier+message)."""
+    """Insert a captured listing record (idempotent per supplier+message).
+
+    ``fingerprint`` must be set at insert time (CONC-2 race fix): the dedup
+    query reads it from the DB, so writing it later left a window in which two
+    identical concurrent messages could both pass the duplicate check.
+    """
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
         cursor = conn.cursor()
@@ -969,9 +978,9 @@ def insert_listing(
             """
             INSERT INTO listings (
                 supplier_id, source_message_id, game_name, rank_tier,
-                original_price, our_price, status, raw_text, clean_text,
-                published_message_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, raw_text, clean_text,
+                fingerprint, published_message_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(supplier_id, source_message_id) DO NOTHING
             """,
             (
@@ -979,11 +988,10 @@ def insert_listing(
                 source_message_id,
                 game_name,
                 rank_tier,
-                original_price,
-                our_price,
                 status,
                 raw_text,
                 clean_text,
+                fingerprint,
                 published_message_id,
                 now_iso,
                 now_iso,
@@ -999,12 +1007,11 @@ def insert_listing(
 def update_listing_status(
     listing_id: int,
     status: str,
-    our_price: Optional[float] = None,
     published_message_id: Optional[int] = None,
     post_number: Optional[int] = None,
     db_path: Optional[str] = None,
 ) -> None:
-    """Update listing status, and optionally our_price, published_message_id and post_number."""
+    """Update listing status, and optionally published_message_id and post_number."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
         # published_at is stamped when transitioning to a published state.
@@ -1015,64 +1022,57 @@ def update_listing_status(
             """
             UPDATE listings
             SET status = ?,
-                our_price = coalesce(?, our_price),
                 published_message_id = coalesce(?, published_message_id),
                 post_number = coalesce(?, post_number),
                 published_at = coalesce(?, published_at),
                 updated_at = ?
             WHERE id = ?
             """,
-            (status, our_price, published_message_id, post_number, publish_ts, now_iso, listing_id),
+            (status, published_message_id, post_number, publish_ts, now_iso, listing_id),
         )
 
 
 def update_listing_content(
     listing_id: int,
     clean_text: str,
-    our_price: Optional[float] = None,
     rank_tier: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> None:
-    """Update content and price when source message is edited."""
+    """Update content when source message is edited."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
         conn.execute(
             """
             UPDATE listings
             SET clean_text = ?,
-                our_price = coalesce(?, our_price),
                 rank_tier = coalesce(?, rank_tier),
                 updated_at = ?
             WHERE id = ?
             """,
-            (clean_text, our_price, rank_tier, now_iso, listing_id),
+            (clean_text, rank_tier, now_iso, listing_id),
         )
 
 
 def update_listing_fields(
     listing_id: int,
     platform_name: Optional[str] = None,
-    original_price: Optional[float] = None,
-    our_price: Optional[float] = None,
     intent: Optional[str] = None,
     header_word: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> None:
-    """Persist parsed listing fields (platform + original price)."""
+    """Persist parsed listing fields (platform)."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
         conn.execute(
             """
             UPDATE listings
             SET platform_name = coalesce(?, platform_name),
-                original_price = coalesce(?, original_price),
-                our_price = coalesce(?, our_price),
                 intent = coalesce(?, intent),
                 header_word = coalesce(?, header_word),
                 updated_at = ?
             WHERE id = ?
             """,
-            (platform_name, original_price, our_price, intent, header_word, now_iso, listing_id),
+            (platform_name, intent, header_word, now_iso, listing_id),
         )
 
 
@@ -1221,29 +1221,47 @@ def find_recent_similar_listing(
     clean_text: str,
     hours: int = 48,
     price: Optional[float] = None,
+    exclude_listing_id: Optional[int] = None,
     db_path: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Search for a similar fingerprint (normalized text + price) in the last N
     hours. Content-based: a re-post with a fresh Telegram message id is still
     caught, while the same text at a different price is not (deduplication).
+
+    In-flight ``received`` rows are also matched so a concurrent identical twin
+    (different message id, same content) is caught while the first message is
+    still being processed. Only *recent* received rows count, so a row stranded
+    in ``received`` (e.g. after a hard kill) stops blinding duplicates for a
+    few minutes instead of the whole window. The caller's own row is excluded
+    (``exclude_listing_id``) because it always carries the same fingerprint.
     """
     if not (clean_text or "").strip():
         return None
 
     fingerprint = make_listing_fingerprint(clean_text, price=price)
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    received_cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=_RECEIVED_DEDUP_MINUTES)
+    ).isoformat()
 
     query = """
         SELECT * FROM listings
         WHERE created_at >= ?
           AND fingerprint = ?
-          AND status IN ('published', 'pending_approval', 'pending_review', 'approved')
-        ORDER BY id DESC LIMIT 1
+          AND (
+                status IN ('published', 'pending_approval', 'pending_review', 'approved')
+                OR (status = 'received' AND created_at >= ?)
+              )
     """
+    params: List[Any] = [cutoff, fingerprint, received_cutoff]
+    if exclude_listing_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_listing_id)
+    query += " ORDER BY id DESC LIMIT 1"
 
     with db_session(db_path) as conn:
-        row = conn.execute(query, (cutoff, fingerprint)).fetchone()
+        row = conn.execute(query, params).fetchone()
         return dict(row) if row else None
 
 
@@ -1484,15 +1502,32 @@ def get_pending_listings(
         return [dict(row) for row in rows]
 
 
-def get_unpublished_listings(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Listings that have not been published yet (received / pending review / approval)."""
-    query = """
-        SELECT * FROM listings
-        WHERE status IN ('received', 'pending_approval', 'pending_review')
-        ORDER BY id ASC
+def get_unpublished_listings(
+    limit: Optional[int] = None,
+    min_age_seconds: Optional[int] = None,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Listings that have not been published yet (received / pending review / approval).
+
+    ``limit`` bounds the sweep — startup recovery must be a bounded pass, never
+    an unbounded AI batch. ``min_age_seconds`` skips listings created too
+    recently so the sweep never races a message the live pipeline is still
+    holding in-flight (REPHR-1).
     """
+    where = ["status IN ('received', 'pending_approval', 'pending_review')"]
+    params: List[Any] = []
+    if min_age_seconds:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=min_age_seconds)
+        ).isoformat()
+        where.append("created_at <= ?")
+        params.append(cutoff)
+    query = f"SELECT * FROM listings WHERE {' AND '.join(where)} ORDER BY id ASC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
     with db_session(db_path) as conn:
-        rows = conn.execute(query).fetchall()
+        rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -1671,14 +1706,12 @@ def count_suppliers(db_path: Optional[str] = None) -> int:
 
 def seed_suppliers_from_env(
     channels: List[str],
-    default_multiplier: float = 0.75,
     db_path: Optional[str] = None,
 ) -> int:
     """Bootstrap: upsert every channel from the env list into suppliers.
 
     Numeric ids become channel_id-keyed rows, usernames are stored lowercased.
-    Because add_supplier preserves the multiplier on an existing row, a reseed
-    never resets a custom rule. Returns the number of channels processed.
+    Returns the number of channels processed.
     """
     seeded = 0
     for raw in channels:
@@ -1690,13 +1723,11 @@ def seed_suppliers_from_env(
             add_supplier(
                 channel_username=str(channel_id),
                 channel_id=channel_id,
-                markup_multiplier=default_multiplier,
                 db_path=db_path,
             )
         else:
             add_supplier(
                 ch.lstrip("@").lower(),
-                markup_multiplier=default_multiplier,
                 db_path=db_path,
             )
         seeded += 1
@@ -1705,7 +1736,6 @@ def seed_suppliers_from_env(
 
 def ensure_env_seed(
     channels: List[str],
-    default_multiplier: float = 0.75,
     db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the one-time .env bootstrap exactly once, safely.
@@ -1733,7 +1763,7 @@ def ensure_env_seed(
         )
         return {"state": "migrated", "seeded": 0, "migrated": True, "existing": existing}
 
-    seeded = seed_suppliers_from_env(channels, default_multiplier, db_path=db_path)
+    seeded = seed_suppliers_from_env(channels, db_path=db_path)
     mark_env_seed_completed(db_path)
     record_audit(
         "env_seed_completed",

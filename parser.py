@@ -172,34 +172,6 @@ def extract_price(text: str) -> Tuple[Optional[float], Optional[str]]:
     return _extract_price_from_text(text)
 
 
-def apply_pricing_rule(original_price: float, multiplier: float = 0.75) -> int:
-    """
-    Apply the multiplier (e.g. 0.75x) and round up to the nearest integer
-    if the resulting price has a decimal part.
-
-    Uses Decimal arithmetic so financial calculations never hit binary-float
-    precision drift (e.g. 7 * 0.1 is not exactly 0.7 as a float) — FIN-1.
-    Examples:
-      - $7 * 0.75 = 5.25 -> 6
-      - $130 * 0.75 = 97.5 -> 98
-      - $50 * 0.75 = 37.5 -> 38
-      - $100 * 0.75 = 75.0 -> 75
-    """
-    from decimal import Decimal, ROUND_CEILING
-
-    amount = Decimal(str(original_price)) * Decimal(str(multiplier))
-    return int(amount.to_integral_value(rounding=ROUND_CEILING))
-
-
-def _format_price(price: float) -> str:
-    """Render a price cleanly: '$38' not '$38.0'; keeps decimals like '$12.50'."""
-    if price is None:
-        return ""
-    if float(price).is_integer():
-        return f"{int(price)}"
-    return f"{float(price):g}"
-
-
 # ---------------------------------------------------------------------------
 # Body sanitizer: strip leaked source prices, supplier handles and pure DM
 # lines out of the AI-written body. The destination channel is the BUYER and
@@ -365,12 +337,10 @@ def _asleep_footer_line() -> Optional[str]:
 
 def build_ai_message(
     content_lines: List[str],
-    our_price: Optional[float],
     platform: Optional[str] = None,
     contact_username: Optional[str] = None,
     intent: str = "sell",
     header_word: Optional[str] = None,
-    has_price: Optional[bool] = None,
     listing_seed: int = 0,
     post_number: Optional[int] = None,
     sanitize_body: bool = True,
@@ -385,15 +355,14 @@ def build_ai_message(
     (price/contact lines) — the body is deliberately kept emoji-free. The
     header emoji rotates between the fire and lightning pools, seeded by
     listing_seed so the admin preview always matches the post that gets
-    published. When ``post_number`` is given, a small "Post #N" banner is
+    published. When ``post_number`` is given, a small "#N" banner is
     prepended so each post is individually referenceable.
 
     The channel always reads as the BUYER: the header label is the AI-suggested
     ``header_word`` when it is buyer-framed (see sanitize_buyer_header), else the
     buyer default "WTB ✦ DM FAST". The footer always carries the static
-    "Price: DM" line — prices are never computed, rendered, or used in
-    publishing decisions here. ``our_price`` / ``has_price`` are accepted for
-    call-site compatibility but are deliberately ignored.
+    "Price DM" line — prices are never computed, rendered, or used in
+    publishing decisions here.
 
     Every country mentioned in the body is flagged on its OWN line where it
     appears: the country's real flag emoji (e.g. 🇵🇱 — the exact
@@ -430,7 +399,7 @@ def build_ai_message(
 
     # ── Post number banner (lets subscribers + admin reference the exact post)
     if post_number is not None:
-        post_num_line = f"🗂 Post  #{post_number}\n"
+        post_num_line = f"#{post_number}\n"
         parts.append(post_num_line)
         cursor += _utf16_len(post_num_line)
 
@@ -447,10 +416,9 @@ def build_ai_message(
     parts.append(header_text)
     cursor += _utf16_len(header_text)
 
-    # ── Divider
-    divider = "─────────────────────\n"
-    parts.append(divider)
-    cursor += _utf16_len(divider)
+    # ── Empty line separating the header from the body
+    parts.append("\n")
+    cursor += 1
 
     # ── Content lines (emoji-free body: emoji allowed only in header/footer).
     # Country flags are attached HERE, after sanitization: a body line that
@@ -494,11 +462,12 @@ def build_ai_message(
         cursor += _utf16_len(leader) + _utf16_len(alt) + 1
 
     # ── Divider
+    divider = "────────\n"
     parts.append(divider)
     cursor += _utf16_len(divider)
 
-    # ── Price line (always the static "Price: DM" footer — prices never render)
-    price_str = f"{PH_PRICE} Price  : DM\n"
+    # ── Price line (always the static "Price DM" footer — prices never render)
+    price_str = f"{PH_PRICE} Price  DM\n"
     entities.append(_make_custom_emoji_entity(cursor, CE_MONEYBAG, PH_PRICE))
     parts.append(price_str)
     cursor += _utf16_len(price_str)
@@ -508,7 +477,7 @@ def build_ai_message(
         clean_contact = contact_username.strip().lstrip("@")
         if clean_contact:
             contact_placeholder = PH_PHONE
-            contact_str = f"{contact_placeholder} Order  : @{clean_contact}"
+            contact_str = f"{contact_placeholder} Contact  : @{clean_contact}"
             entities.append(_make_custom_emoji_entity(cursor, CE_PHONE, contact_placeholder))
             parts.append(contact_str)
             cursor += _utf16_len(contact_str)

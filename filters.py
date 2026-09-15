@@ -24,6 +24,7 @@ def is_duplicate_listing(
     clean_text: str,
     hours: int = 12,
     price: Optional[float] = None,
+    exclude_listing_id: Optional[int] = None,
     db_path: Optional[str] = None,
 ) -> bool:
     """
@@ -31,6 +32,9 @@ def is_duplicate_listing(
     processed in the last N hours. This is content-based — a re-post with a
     new Telegram message id is still caught, while the same product at a
     different price is NOT.
+
+    ``exclude_listing_id`` skips the caller's own row: the current listing
+    carries the same fingerprint from insert time, and must never match itself.
     """
     if not (clean_text or "").strip():
         return False
@@ -39,6 +43,7 @@ def is_duplicate_listing(
         clean_text=clean_text,
         hours=hours,
         price=price,
+        exclude_listing_id=exclude_listing_id,
         db_path=db_path,
     )
 
@@ -57,6 +62,7 @@ def check_filters(
     clean_text: str,
     hours: int = 12,
     price: Optional[float] = None,
+    exclude_listing_id: Optional[int] = None,
     db_path: Optional[str] = None,
 ) -> Optional[str]:
     """Run the pre-AI filter chain and return the name of the first rule that
@@ -69,7 +75,11 @@ def check_filters(
         return REASON_NO_CONTENT
 
     if is_duplicate_listing(
-        clean_text, hours=hours, price=price, db_path=db_path
+        clean_text,
+        hours=hours,
+        price=price,
+        exclude_listing_id=exclude_listing_id,
+        db_path=db_path,
     ):
         return REASON_DUPLICATE
 

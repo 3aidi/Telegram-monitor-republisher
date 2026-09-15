@@ -5,6 +5,9 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
+from unittest import mock
+
 import emoji
 
 import ai_rephraser
@@ -12,6 +15,8 @@ import countries
 import db
 import filters
 import parser
+import publish_guard
+from telethon.errors import FloodWaitError
 
 TEST_DB = "test_monitor.db"
 
@@ -97,44 +102,34 @@ class TestMonitorSystem(unittest.TestCase):
         price4, _ = parser.extract_price("Wise account $1,200.50")
         self.assertAlmostEqual(price4, 1200.5)
 
-    def test_pricing_multiplier(self):
-        self.assertEqual(parser.apply_pricing_rule(100.0, 0.75), 75)
-        self.assertEqual(parser.apply_pricing_rule(130.0, 0.75), 98)
-        self.assertEqual(parser.apply_pricing_rule(7.0, 0.75), 6)
-        self.assertEqual(parser.apply_pricing_rule(50.0, 0.75), 38)
-
     def test_build_ai_message_never_emits_numeric_price(self):
         """Prices must NEVER reach rendered output: every post carries the
-        static '🤑 Price  : DM' footer and the frozen 'WTB ✦ DM FAST' header no
-        matter what price value was supplied."""
+        static '🤑 Price  DM' footer and the frozen 'WTB ✦ DM FAST' header no
+        matter what the source text contained."""
         import re
-        for price in (None, 0, 0.0, 38, 12.5, 98, 999999, 1e9):
+        for source in ("Tuyo full access", "Tuyo full access 50$", "Tuyo 1000 EUR", "Tuyo 12,50€"):
             msg, _ = parser.build_ai_message(
                 content_lines=["Tuyo full access"],
-                our_price=price,
                 platform="tuyo",
                 contact_username="@buyer",
                 intent="sell",
+                source_text=source,
             )
-            self.assertIn("TUYO WTB ✦ DM FAST", msg, f"header default broken for {price}")
-            self.assertIn("🤑 Price  : DM", msg, f"static price footer missing for {price}")
+            self.assertIn("TUYO WTB ✦ DM FAST", msg, f"header default broken for {source}")
+            self.assertIn("🤑 Price  DM", msg, f"static price footer missing for {source}")
             leaked = re.findall(r"\$\s?\d|€|\b(?:USD|USDT|EUR)\b", msg)
-            self.assertEqual(leaked, [], f"numeric price leaked in output for {price}: {msg!r}")
+            self.assertEqual(leaked, [], f"numeric price leaked in output for {source}: {msg!r}")
 
-    def test_price_formatting(self):
-        """Whole-number prices render without '.0'; decimals preserved."""
-        self.assertEqual(parser._format_price(38.0), "38")
-        self.assertEqual(parser._format_price(98), "98")
-        self.assertEqual(parser._format_price(12.50), "12.5")
-        self.assertEqual(parser._format_price(None), "")
+    def test_price_footer_static(self):
+        """The footer price line is always the static '🤑 Price  DM'."""
         msg, _ = parser.build_ai_message(
             content_lines=["Bybit kyc", "da"],
-            our_price=38.0,
             platform="bybit",
             contact_username="@x",
             intent="sell",
         )
-        self.assertIn("🤑 Price  : DM", msg)
+        self.assertIn("🤑 Price  DM", msg)
+        self.assertIn("WTB ✦ DM FAST", msg)
         self.assertNotIn("$38", msg)
         self.assertNotIn("€", msg)
 
@@ -142,7 +137,6 @@ class TestMonitorSystem(unittest.TestCase):
         """Every entity must point inside the final text, ascending and non-overlapping."""
         msg, entities = parser.build_ai_message(
             content_lines=["Netflix 1 month", "4K ready"],
-            our_price=30,
             platform="netflix",
             contact_username="@buy",
             intent="sell",
@@ -229,7 +223,6 @@ class TestMonitorSystem(unittest.TestCase):
         carrying the real flag emoji that its custom document's alt matches."""
         msg, entities = parser.build_ai_message(
             content_lines=["Available"],
-            our_price=None,
             platform="netflix",
             contact_username="@buy",
             intent="sell",
@@ -264,7 +257,6 @@ class TestMonitorSystem(unittest.TestCase):
     def test_build_ai_message_no_countries_when_no_source_text(self):
         msg, entities = parser.build_ai_message(
             content_lines=["Plain line"],
-            our_price=None,
             platform="netflix",
             intent="sell",
         )
@@ -276,7 +268,6 @@ class TestMonitorSystem(unittest.TestCase):
     def test_build_ai_message_skips_unmapped_countries(self):
         msg, entities = parser.build_ai_message(
             content_lines=["Available"],
-            our_price=None,
             platform="netflix",
             intent="sell",
             source_text="Applicable in DR Congo and South Sudan only",
@@ -294,7 +285,6 @@ class TestMonitorSystem(unittest.TestCase):
         a country ('NO POLAND' must not also emit a generated 'POLAND  🇵🇱' line)."""
         msg, entities = parser.build_ai_message(
             content_lines=["KYC BY LINK", "ANY EUROPE", "NO POLAND"],
-            our_price=None,
             platform="bybit",
             contact_username="@b",
             intent="sell",
@@ -321,7 +311,6 @@ class TestMonitorSystem(unittest.TestCase):
         """\"UK, USA and Germany\" splits into one flag-carrying line per country."""
         msg, entities = parser.build_ai_message(
             content_lines=["UK, USA and Germany"],
-            our_price=None,
             platform="netflix",
             contact_username="@b",
             intent="sell",
@@ -345,7 +334,6 @@ class TestMonitorSystem(unittest.TestCase):
         # End-to-end: build never appends anything for an unmapped mention.
         msg, _entities = parser.build_ai_message(
             content_lines=["ship to Grenada"],
-            our_price=None,
             platform="netflix",
             contact_username="@b",
             intent="sell",
@@ -459,7 +447,6 @@ class TestMonitorSystem(unittest.TestCase):
         counts them)."""
         msg, entities = parser.build_ai_message(
             content_lines=["KYC BY LINK", "ANY EUROPE", "NO POLAND", "UK and USA"],
-            our_price=None,
             platform="bybit",
             contact_username="@b",
             intent="sell",
@@ -482,7 +469,7 @@ class TestMonitorSystem(unittest.TestCase):
             self.assertGreaterEqual(e.offset, prev_end)
             self.assertLessEqual(e.offset + e.length, units)
             prev_end = e.offset + e.length
-        # The ‼ header flames must be rebased past the 🗂 banner prefix.
+        # The ‼ header flames must be rebased past the #N banner prefix.
         header_prefix = msg[:msg.index(parser.PH_FIRE)]
         self.assertEqual(entities[0].offset, parser._utf16_len(header_prefix))
         self.assertIn("NO POLAND  🇵🇱", msg)
@@ -523,7 +510,6 @@ class TestMonitorSystem(unittest.TestCase):
         # Extras path (from raw source text) uses the same two-space format.
         msg, entities = parser.build_ai_message(
             content_lines=["Available"],
-            our_price=None,
             platform="netflix",
             contact_username="@b",
             intent="sell",
@@ -553,7 +539,6 @@ class TestMonitorSystem(unittest.TestCase):
         # Through the full render (auto-publish / approve / preview all use this).
         out, _ = parser.build_ai_message(
             content_lines=["**ESTY KYC**", "Full access now"],
-            our_price=None,
             platform="bybit",
             contact_username="@b",
             intent="sell",
@@ -566,17 +551,11 @@ class TestMonitorSystem(unittest.TestCase):
     # DATABASE TESTS
     # -------------------------------------------------------------
     def test_db_suppliers(self):
-        db.add_supplier("@supplier_test1", channel_id=-100111, markup_multiplier=0.75, db_path=TEST_DB)
-        db.add_supplier("@supplier_test2", channel_id=-100222, markup_multiplier=0.80, db_path=TEST_DB)
+        db.add_supplier("@supplier_test1", channel_id=-100111, db_path=TEST_DB)
+        db.add_supplier("@supplier_test2", channel_id=-100222, db_path=TEST_DB)
 
         suppliers = db.list_suppliers(active_only=True, db_path=TEST_DB)
         self.assertGreaterEqual(len(suppliers), 2)
-
-        # Update rule
-        db.set_supplier_rule("supplier_test1", 0.70, db_path=TEST_DB)
-        sup1 = db.get_supplier_by_chat(chat_id=-100111, db_path=TEST_DB)
-        self.assertIsNotNone(sup1)
-        self.assertEqual(sup1["markup_multiplier"], 0.70)
 
         # Remove supplier
         db.remove_supplier("supplier_test2", db_path=TEST_DB)
@@ -592,23 +571,23 @@ class TestMonitorSystem(unittest.TestCase):
         instead of overwriting it with the raw ID string (ID-based sources must
         never destroy the friendly label)."""
         db_path = TEST_DB
-        db.add_supplier("kycgroupke", channel_id=-100123, markup_multiplier=0.75, db_path=db_path)
+        db.add_supplier("kycgroupke", channel_id=-100123, db_path=db_path)
         # Same channel re-added by its numeric id -> single row, username preserved.
-        db.add_supplier("-100123", channel_id=-100123, markup_multiplier=0.80, db_path=db_path)
+        db.add_supplier("-100123", channel_id=-100123, db_path=db_path)
         suppliers = db.list_suppliers(db_path=db_path)
         matches = [s for s in suppliers if s["channel_id"] == -100123]
         self.assertEqual(len(matches), 1, "channel must not be duplicated across rows")
         row = matches[0]
         self.assertEqual(row["channel_username"], "kycgroupke")
-        self.assertEqual(row["markup_multiplier"], 0.75, "re-add must preserve the existing multiplier")
+        self.assertNotIn("markup_multiplier", row, "pricing columns must not exist in v9")
         self.assertEqual(row["active"], 1)
 
     def test_db_add_supplier_upgrades_numeric_placeholder_to_username(self):
         """A supplier seeded with only a numeric id is upgraded to the real
         username when the channel is later added by username."""
         db_path = TEST_DB
-        db.add_supplier("-100456", channel_id=-100456, markup_multiplier=0.75, db_path=db_path)
-        db.add_supplier("@renamedchan", channel_id=-100456, markup_multiplier=0.75, db_path=db_path)
+        db.add_supplier("-100456", channel_id=-100456, db_path=db_path)
+        db.add_supplier("@renamedchan", channel_id=-100456, db_path=db_path)
         suppliers = db.list_suppliers(db_path=db_path)
         matches = [s for s in suppliers if s["channel_id"] == -100456]
         self.assertEqual(len(matches), 1)
@@ -621,8 +600,8 @@ class TestMonitorSystem(unittest.TestCase):
         wrote the drop row's id onto the keep row while the drop row still held
         it -> sqlite3.IntegrityError during resolve_supplier_entities.)"""
         db_path = TEST_DB
-        keep = db.add_supplier("ownschan", channel_id=-100500, markup_multiplier=0.70, db_path=db_path)
-        drop = db.add_supplier("stalechan", channel_id=-100501, markup_multiplier=0.90, db_path=db_path)
+        keep = db.add_supplier("ownschan", channel_id=-100500, db_path=db_path)
+        drop = db.add_supplier("stalechan", channel_id=-100501, db_path=db_path)
         ok = db.merge_supplier_rows(keep, drop, db_path=db_path)
         self.assertTrue(ok)
         kept = db.get_supplier_by_id(keep, db_path=db_path)
@@ -636,8 +615,8 @@ class TestMonitorSystem(unittest.TestCase):
         a previously-unresolved keep row adopts the drop row's resolved id after
         the drop row's unique slot is freed."""
         db_path = TEST_DB
-        keep = db.add_supplier("noidchan", channel_id=None, markup_multiplier=0.75, db_path=db_path)
-        drop = db.add_supplier("resolvedchan", channel_id=-100502, markup_multiplier=0.75, db_path=db_path)
+        keep = db.add_supplier("noidchan", channel_id=None, db_path=db_path)
+        drop = db.add_supplier("resolvedchan", channel_id=-100502, db_path=db_path)
         ok = db.merge_supplier_rows(keep, drop, db_path=db_path)
         self.assertTrue(ok)
         kept = db.get_supplier_by_id(keep, db_path=db_path)
@@ -660,7 +639,7 @@ class TestMonitorSystem(unittest.TestCase):
         two startups does NOT reappear (env is one-time bootstrap, not live state)."""
         path = self._fresh_db("env_seed_bootstrap_test.db")
         channels = ["@chanone", "-100111"]
-        result1 = db.ensure_env_seed(channels, 0.75, db_path=path)
+        result1 = db.ensure_env_seed(channels, db_path=path)
         self.assertEqual(result1["state"], "seeded")
         self.assertEqual(result1["seeded"], 2)
         self.assertTrue(db.env_seed_completed(db_path=path))
@@ -669,7 +648,7 @@ class TestMonitorSystem(unittest.TestCase):
         row = db.get_supplier_by_chat(username="chanone", db_path=path)
         db.delete_supplier(row["id"], db_path=path)
 
-        result2 = db.ensure_env_seed(channels, 0.75, db_path=path)
+        result2 = db.ensure_env_seed(channels, db_path=path)
         self.assertEqual(result2["state"], "already_seeded")
         self.assertEqual(result2["seeded"], 0)
         self.assertIsNone(
@@ -689,7 +668,7 @@ class TestMonitorSystem(unittest.TestCase):
         before = [dict(r) for r in db.list_suppliers(db_path=path)]
         self.assertFalse(db.env_seed_completed(db_path=path))
 
-        result = db.ensure_env_seed(["@wouldhavebeen", "-100999"], 0.75, db_path=path)
+        result = db.ensure_env_seed(["@wouldhavebeen", "-100999"], db_path=path)
         self.assertEqual(result["state"], "migrated")
         self.assertTrue(result["migrated"])
         self.assertEqual(result["seeded"], 0)
@@ -697,7 +676,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(before, after, "migration must not modify any supplier row")
         self.assertTrue(db.env_seed_completed(db_path=path))
 
-        again = db.ensure_env_seed(["@alsoignored"], 0.75, db_path=path)
+        again = db.ensure_env_seed(["@alsoignored"], db_path=path)
         self.assertEqual(again["state"], "already_seeded")
         self.assertEqual(db.count_suppliers(db_path=path), 2)
         db.clear_env_seed_completed(db_path=path)
@@ -708,12 +687,12 @@ class TestMonitorSystem(unittest.TestCase):
         Existing suppliers are preserved, new ones are added, and restarts keep
         ignoring .env afterwards."""
         path = self._fresh_db("env_seed_reseed_test.db")
-        db.ensure_env_seed(["@a", "@b"], 0.75, db_path=path)
+        db.ensure_env_seed(["@a", "@b"], db_path=path)
         self.assertEqual(db.count_suppliers(db_path=path), 2)
         self.assertTrue(db.env_seed_completed(db_path=path))
 
         db.clear_env_seed_completed(db_path=path)
-        n = db.seed_suppliers_from_env(["@a", "@b", "@c"], 0.75, db_path=path)
+        n = db.seed_suppliers_from_env(["@a", "@b", "@c"], db_path=path)
         db.mark_env_seed_completed(db_path=path)
         self.assertEqual(n, 3)
         self.assertEqual(db.count_suppliers(db_path=path), 3)
@@ -721,7 +700,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIsNotNone(db.get_supplier_by_chat(username="c", db_path=path))
         self.assertTrue(db.env_seed_completed(db_path=path))
 
-        again = db.ensure_env_seed(["@zzz"], 0.75, db_path=path)
+        again = db.ensure_env_seed(["@zzz"], db_path=path)
         self.assertEqual(again["state"], "already_seeded")
         self.assertEqual(again["seeded"], 0)
         self.assertIsNone(db.get_supplier_by_chat(username="zzz", db_path=path))
@@ -758,7 +737,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIsNotNone(notice)
         self.assertIn("0 monitored sources", notice)
         self.assertIn("Sources menu", notice)
-        result = db.ensure_env_seed([], 0.75, db_path=path)
+        result = db.ensure_env_seed([], db_path=path)
         self.assertEqual(result["state"], "seeded")
         self.assertEqual(result["seeded"], 0)
         self.assertTrue(db.env_seed_completed(db_path=path))
@@ -827,7 +806,6 @@ class TestMonitorSystem(unittest.TestCase):
         listing = {
             "id": 42,
             "clean_text": "KYC CURVE PAY\nANY EU",
-            "our_price": 12.5,
         }
         prompt = admin_bot._edit_prompt(listing, None)
         self.assertIn("Current content", prompt)
@@ -844,7 +822,6 @@ class TestMonitorSystem(unittest.TestCase):
         listing = {
             "id": 7,
             "clean_text": "OLD LINE FROM AI",
-            "our_price": None,
         }
         prompt = admin_bot._edit_prompt(listing, "MY EDITED LINE\nCHANGED")
         self.assertIn("> MY EDITED LINE", prompt)
@@ -909,14 +886,14 @@ class TestMonitorSystem(unittest.TestCase):
         db.add_supplier("ok_already_marked", channel_id=marked_chb, db_path=path)
         with db.db_session(path) as conn:
             conn.execute(
-                "INSERT INTO suppliers (channel_username, channel_id, active, markup_multiplier, added_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("old_bare_chan", bare_cha, 1, 0.75, "2025-01-01T00:00:00+00:00"),
+                "INSERT INTO suppliers (channel_username, channel_id, active, added_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("old_bare_chan", bare_cha, 1, "2025-01-01T00:00:00+00:00"),
             )
             conn.execute(
-                "INSERT INTO suppliers (channel_username, channel_id, active, markup_multiplier, added_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("dup_via_bare", bare_chb, 1, 0.75, "2025-01-01T00:00:00+00:00"),
+                "INSERT INTO suppliers (channel_username, channel_id, active, added_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("dup_via_bare", bare_chb, 1, "2025-01-01T00:00:00+00:00"),
             )
         self.assertEqual(db.count_suppliers(db_path=path), 3)
         report = db.normalize_supplier_channel_ids(db_path=path)
@@ -995,7 +972,7 @@ class TestMonitorSystem(unittest.TestCase):
         old_default = db.DEFAULT_DB_PATH
         db.DEFAULT_DB_PATH = path
         try:
-            supplier = main_mod.resolve_supplier_for_event(_FakeEvent())
+            supplier = asyncio.run(main_mod.resolve_supplier_for_event(_FakeEvent()))
             self.assertIsNotNone(supplier, "resolve_supplier_for_event must match on marked chat_id")
             self.assertEqual(supplier["channel_id"], marked)
             self.assertTrue(supplier.get("active"))
@@ -1005,7 +982,7 @@ class TestMonitorSystem(unittest.TestCase):
     def test_db_display_name_roundtrip(self):
         """set_supplier_display_name stores a friendly label keyed by username OR id."""
         db_path = TEST_DB
-        db.add_supplier("-100789", channel_id=-100789, markup_multiplier=0.75, db_path=db_path)
+        db.add_supplier("-100789", channel_id=-100789, db_path=db_path)
         ok = db.set_supplier_display_name("-100789", "KYC Group UK", db_path=db_path)
         self.assertTrue(ok)
         row = db.get_supplier_by_chat(chat_id=-100789, db_path=db_path)
@@ -1017,7 +994,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(row2["display_name"], "disp_handle")
 
     def test_db_listings_and_dedup(self):
-        db.add_supplier("@dedup_supplier", channel_id=-100333, markup_multiplier=0.75, db_path=TEST_DB)
+        db.add_supplier("@dedup_supplier", channel_id=-100333, db_path=TEST_DB)
         sup = db.get_supplier_by_chat(username="dedup_supplier", db_path=TEST_DB)
         self.assertIsNotNone(sup)
         sup_id = sup["id"]
@@ -1027,8 +1004,6 @@ class TestMonitorSystem(unittest.TestCase):
             source_message_id=9991,
             game_name="bybit",
             rank_tier=None,
-            original_price=100.0,
-            our_price=75.0,
             status="published",
             raw_text="WTS Bybit verified account $100",
             clean_text="WTS Bybit verified account $100",
@@ -1043,8 +1018,6 @@ class TestMonitorSystem(unittest.TestCase):
             source_message_id=9991,
             game_name="bybit",
             rank_tier=None,
-            original_price=100.0,
-            our_price=75.0,
             status="published",
             raw_text="WTS Bybit verified account $100",
             clean_text="WTS Bybit verified account $100",
@@ -1121,29 +1094,25 @@ class TestMonitorSystem(unittest.TestCase):
 
     def test_db_unpublished_listings(self):
         """get_unpublished_listings returns only non-published statuses."""
-        db.add_supplier("@unpub_supplier", channel_id=-100557, markup_multiplier=0.75, db_path=TEST_DB)
+        db.add_supplier("@unpub_supplier", channel_id=-100557, db_path=TEST_DB)
         sup = db.get_supplier_by_chat(username="unpub_supplier", db_path=TEST_DB)
         pend_id = db.insert_listing(
             supplier_id=sup["id"], source_message_id=9951, game_name=None, rank_tier=None,
-            original_price=100.0, our_price=75.0,
             status="pending_review", raw_text="WTS Revolut account $100",
             clean_text="WTS Revolut account $100", db_path=TEST_DB,
         )
         recv_id = db.insert_listing(
             supplier_id=sup["id"], source_message_id=9952, game_name=None, rank_tier=None,
-            original_price=100.0, our_price=75.0,
             status="received", raw_text="WTS Revolut account $100",
             clean_text="WTS Revolut account $100", db_path=TEST_DB,
         )
         db.insert_listing(
             supplier_id=sup["id"], source_message_id=9953, game_name=None, rank_tier=None,
-            original_price=100.0, our_price=75.0,
             status="published", raw_text="WTS Revolut account $100",
             clean_text="WTS Revolut account $100", published_message_id=5002, db_path=TEST_DB,
         )
         db.insert_listing(
             supplier_id=sup["id"], source_message_id=9954, game_name=None, rank_tier=None,
-            original_price=100.0, our_price=75.0,
             status="failed", raw_text="WTS Revolut account $100",
             clean_text="WTS Revolut account $100", db_path=TEST_DB,
         )
@@ -1154,15 +1123,13 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertTrue(all(l["status"] in ("received", "pending_approval", "pending_review") for l in unpub))
 
     def test_db_failed_queue_and_requeue(self):
-        db.add_supplier("@fail_supplier", channel_id=-100444, markup_multiplier=0.75, db_path=TEST_DB)
+        db.add_supplier("@fail_supplier", channel_id=-100444, db_path=TEST_DB)
         sup = db.get_supplier_by_chat(username="fail_supplier", db_path=TEST_DB)
         listing_id = db.insert_listing(
             supplier_id=sup["id"],
             source_message_id=9940,
             game_name=None,
             rank_tier=None,
-            original_price=100.0,
-            our_price=75.0,
             status="approved",
             raw_text="WTS Revolut account $100",
             clean_text="WTS Revolut account $100",
@@ -1195,16 +1162,130 @@ class TestMonitorSystem(unittest.TestCase):
             ).fetchall()]
         self.assertTrue(any(e["action"] == "published_auto" for e in entries))
 
+    def test_concurrent_duplicate_twin_cannot_both_publish(self):
+        db.add_supplier("@twin_src", channel_id=-100401, db_path=TEST_DB)
+        sup_id = db.get_supplier_by_chat(username="twin_src", db_path=TEST_DB)["id"]
+        text = "WTS Bybit verified account $100"
+        fp = db.make_listing_fingerprint(text, price=100.0)
+        first_id = db.insert_listing(
+            supplier_id=sup_id, source_message_id=60001,
+            game_name="bybit", rank_tier=None,
+            status="received",
+            raw_text=text, clean_text=text, fingerprint=fp, db_path=TEST_DB,
+        )
+        twin_id = db.insert_listing(
+            supplier_id=sup_id, source_message_id=60002,
+            game_name="bybit", rank_tier=None,
+            status="received",
+            raw_text=text, clean_text=text, fingerprint=fp, db_path=TEST_DB,
+        )
+        block = db.find_recent_similar_listing(
+            text, price=100.0, exclude_listing_id=twin_id, db_path=TEST_DB
+        )
+        self.assertIsNotNone(
+            block,
+            "concurrent twin must be blocked by the in-flight row (CONC-2)",
+        )
+        self.assertEqual(block["id"], first_id)
+
+    def test_duplicate_check_never_matches_self(self):
+        db.add_supplier("@self_src", channel_id=-100402, db_path=TEST_DB)
+        sup_id = db.get_supplier_by_chat(username="self_src", db_path=TEST_DB)["id"]
+        text = "WTS Wise personal $200"
+        fp = db.make_listing_fingerprint(text, price=200.0)
+        listing_id = db.insert_listing(
+            supplier_id=sup_id, source_message_id=60003,
+            game_name="wise", rank_tier=None,
+            status="pending_approval",
+            raw_text=text, clean_text=text, fingerprint=fp, db_path=TEST_DB,
+        )
+        match = db.find_recent_similar_listing(
+            text, price=200.0, exclude_listing_id=listing_id, db_path=TEST_DB
+        )
+        self.assertIsNone(match, "a listing must never count as its own duplicate")
+
+    def test_stale_received_row_does_not_blind_dedup(self):
+        db.add_supplier("@stale_src", channel_id=-100403, db_path=TEST_DB)
+        sup_id = db.get_supplier_by_chat(username="stale_src", db_path=TEST_DB)["id"]
+        text = "WTS Revolut premium $150"
+        fp = db.make_listing_fingerprint(text, price=150.0)
+        stale_id = db.insert_listing(
+            supplier_id=sup_id, source_message_id=60004,
+            game_name=None, rank_tier=None,
+            status="received",
+            raw_text=text, clean_text=text, fingerprint=fp, db_path=TEST_DB,
+        )
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        with sqlite3.connect(TEST_DB) as conn:
+            conn.execute(
+                "UPDATE listings SET created_at = ? WHERE id = ?", (old_ts, stale_id)
+            )
+        match = db.find_recent_similar_listing(text, price=150.0, db_path=TEST_DB)
+        self.assertIsNone(
+            match, "stale received row must not blind the dedup window"
+        )
+        fresh_id = db.insert_listing(
+            supplier_id=sup_id, source_message_id=60005,
+            game_name=None, rank_tier=None,
+            status="received",
+            raw_text=text, clean_text=text, fingerprint=fp, db_path=TEST_DB,
+        )
+        twin_id = db.insert_listing(
+            supplier_id=sup_id, source_message_id=60006,
+            game_name=None, rank_tier=None,
+            status="received",
+            raw_text=text, clean_text=text, fingerprint=fp, db_path=TEST_DB,
+        )
+        block = db.find_recent_similar_listing(
+            text, price=150.0, exclude_listing_id=twin_id, db_path=TEST_DB
+        )
+        self.assertIsNotNone(block)
+        self.assertEqual(block["id"], fresh_id)
+
+    def test_processing_lock_released_after_processing(self):
+        """REG (CONC-3): per-message in-flight locks serialize identical
+        concurrent messages and are removed from the lock dict once processing
+        finishes — no dead entries leak."""
+        import asyncio
+        import main as main_mod
+
+        main_mod._processing_locks.clear()
+        runs = []
+        gate = asyncio.Event()
+
+        async def worker(name, wait_for_twin):
+            if wait_for_twin:
+                await gate.wait()
+            entry = main_mod._acquire_processing_lock(42, 800001)
+            try:
+                async with entry.lock:
+                    runs.append(name)
+                    if not wait_for_twin:
+                        gate.set()
+                        await asyncio.sleep(0.02)
+            finally:
+                main_mod._release_processing_lock(42, 800001, entry)
+
+        async def scenario():
+            await asyncio.gather(
+                worker("A", wait_for_twin=False),
+                worker("B", wait_for_twin=True),
+            )
+
+        asyncio.run(scenario())
+        self.assertEqual(runs, ["A", "B"], "twin messages must be serialized")
+        self.assertEqual(
+            main_mod._processing_locks, {}, "lock entries must not leak"
+        )
+
     def test_db_platform_fields_persisted(self):
-        db.add_supplier("@fields_supplier", channel_id=-100555, markup_multiplier=0.75, db_path=TEST_DB)
+        db.add_supplier("@fields_supplier", channel_id=-100555, db_path=TEST_DB)
         sup = db.get_supplier_by_chat(username="fields_supplier", db_path=TEST_DB)
         listing_id = db.insert_listing(
             supplier_id=sup["id"],
             source_message_id=9950,
             game_name=None,
             rank_tier=None,
-            original_price=None,
-            our_price=None,
             status="received",
             raw_text="WTS Wise personal $200",
             clean_text="WTS Wise personal $200",
@@ -1212,29 +1293,26 @@ class TestMonitorSystem(unittest.TestCase):
         )
         listing = db.get_listing_by_id(listing_id, db_path=TEST_DB)
         self.assertIsNone(listing["platform_name"])
-        self.assertIsNone(listing["original_price"])
+        self.assertNotIn("original_price", listing, "pricing columns must not exist in v9")
 
         db.update_listing_fields(
-            listing_id, platform_name="wise", original_price=200.0, our_price=150.0,
+            listing_id, platform_name="wise",
             db_path=TEST_DB,
         )
         updated = db.get_listing_by_id(listing_id, db_path=TEST_DB)
         self.assertEqual(updated["platform_name"], "wise")
-        self.assertEqual(updated["original_price"], 200.0)
-        self.assertEqual(updated["our_price"], 150.0)
+        self.assertNotIn("our_price", updated, "pricing columns must not exist in v9")
 
     def test_db_stats_and_pending(self):
         # A dedicated supplier so the FK insert is always valid (PRAGMA
         # foreign_keys is now ON).
-        sid = db.add_supplier("@stats_src", channel_id=-100666, markup_multiplier=0.75, db_path=TEST_DB)
+        sid = db.add_supplier("@stats_src", channel_id=-100666, db_path=TEST_DB)
         # Insert a pending listing
         pending_id = db.insert_listing(
             supplier_id=sid,
             source_message_id=9992,
             game_name=None,
             rank_tier=None,
-            original_price=40.0,
-            our_price=30.0,
             status="pending_approval",
             raw_text="Netflix 1 Month $40",
             clean_text="Netflix 1 Month $40",
@@ -1341,7 +1419,7 @@ class TestMonitorSystem(unittest.TestCase):
 
         # user_version migrated to latest
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        self.assertGreaterEqual(version, 7)
+        self.assertGreaterEqual(version, 9)
 
         # skips table added by the v6 migration; ai_cache by the v7 migration
         tables = {r[0] for r in conn.execute(
@@ -1407,7 +1485,7 @@ class TestMonitorSystem(unittest.TestCase):
             cols = {r[1] for r in conn.execute("PRAGMA table_info(suppliers)").fetchall()}
             self.assertIn("display_name", cols)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertGreaterEqual(version, 8)
+            self.assertGreaterEqual(version, 9)
         finally:
             conn.close()
         # display name is usable on the migrated table.
@@ -1491,7 +1569,7 @@ class TestMonitorSystem(unittest.TestCase):
             sup_id = db.add_supplier("@pause_drain", channel_id=-100777, db_path=TEST_DB)
             listing_id = db.insert_listing(
                 supplier_id=sup_id, source_message_id=9960, game_name=None, rank_tier=None,
-                original_price=50.0, our_price=40.0, status="approved",
+                status="approved",
                 raw_text="WTS Netflix $50", clean_text="WTS Netflix $50", db_path=TEST_DB,
             )
             # The drain query feeds the worker: paused or not, approved rows surface.
@@ -1571,7 +1649,6 @@ class TestMonitorSystem(unittest.TestCase):
             db.set_buyer_asleep(False, db_path=path)
             msg_off, _ = parser.build_ai_message(
                 content_lines=["Bybit full kyc"],
-                our_price=None,
                 platform="bybit",
                 contact_username="@buyer",
                 intent="buy",
@@ -1582,7 +1659,6 @@ class TestMonitorSystem(unittest.TestCase):
             db.set_setting("buyer_asleep_footer", "Back soon", db_path=path)
             msg_on, entities = parser.build_ai_message(
                 content_lines=["Bybit full kyc"],
-                our_price=None,
                 platform="bybit",
                 contact_username="@buyer",
                 intent="buy",
@@ -1855,11 +1931,11 @@ class TestMonitorSystem(unittest.TestCase):
 
     def test_get_published_listings_joins_supplier(self):
         sid = db.add_supplier("trace_src", channel_id=-100777, db_path=TEST_DB)
-        db.insert_listing(sid, 9001, None, None, 100.0, 80.0, "pending_approval",
+        db.insert_listing(sid, 9001, None, None, "pending_approval",
                           "t", "t", db_path=TEST_DB)
-        pid = db.insert_listing(sid, 9002, None, None, 100.0, 80.0, "published",
+        pid = db.insert_listing(sid, 9002, None, None, "published",
                                 "t", "t", published_message_id=50, db_path=TEST_DB)
-        pid2 = db.insert_listing(sid, 9003, None, None, 100.0, 80.0, "published",
+        pid2 = db.insert_listing(sid, 9003, None, None, "published",
                                  "t", "t", published_message_id=51, db_path=TEST_DB)
         rows = db.get_published_listings(db_path=TEST_DB)
         published_ids = {r["id"] for r in rows}
@@ -1876,9 +1952,8 @@ class TestMonitorSystem(unittest.TestCase):
         n2 = db.next_post_number(db_path=TEST_DB)
         self.assertEqual(n2, n1 + 1)
 
-        sid = db.add_supplier("@pn_src", channel_id=-100889,
-                              markup_multiplier=0.75, db_path=TEST_DB)
-        listing_id = db.insert_listing(sid, 9100, None, None, 100.0, 80.0, "approved",
+        sid = db.add_supplier("@pn_src", channel_id=-100889, db_path=TEST_DB)
+        listing_id = db.insert_listing(sid, 9100, None, None, "approved",
                                        "t", "t", db_path=TEST_DB)
         self.assertIsNone(db.get_listing_by_id(listing_id, db_path=TEST_DB)["post_number"])
 
@@ -1912,9 +1987,9 @@ class TestMonitorSystem(unittest.TestCase):
         try:
             db.init_db(path)
             sid = db.add_supplier("@bf_src", channel_id=-100900, db_path=path)
-            db.insert_listing(sid, 1, None, None, None, None, "published",
+            db.insert_listing(sid, 1, None, None, "published",
                               "a", "a", published_message_id=10, db_path=path)
-            db.insert_listing(sid, 2, None, None, None, None, "published",
+            db.insert_listing(sid, 2, None, None, "published",
                               "b", "b", published_message_id=11, db_path=path)
             # Simulate a pre-v4 database: drop the counter and downgrade.
             with db.db_session(path) as conn:
@@ -1945,17 +2020,15 @@ class TestMonitorSystem(unittest.TestCase):
     def test_build_ai_message_post_number_banner(self):
         out, entities = parser.build_ai_message(
             content_lines=["Netflix 1 month"],
-            our_price=38.0,
             platform="netflix",
             post_number=42,
         )
-        self.assertIn("Post  #42", out)
+        self.assertIn("#42\n", out)
         msg2, _ = parser.build_ai_message(
             content_lines=["Netflix 1 month"],
-            our_price=38.0,
             platform="netflix",
         )
-        self.assertNotIn("Post  #", msg2)
+        self.assertNotIn("#42", msg2)
 
     def test_tgram_chat_link_helper(self):
         import admin_bot
@@ -2015,9 +2088,14 @@ class TestMonitorSystem(unittest.TestCase):
     # -------------------------------------------------------------
     def test_ai_rephraser_init_no_key_returns_false(self):
         """init_groq should fail gracefully without a key."""
-        result = ai_rephraser.init_groq("")
-        self.assertFalse(result)
-        self.assertFalse(ai_rephraser.is_available())
+        env_key = os.environ.pop("GROQ_API_KEY", None)
+        try:
+            result = ai_rephraser.init_groq("")
+            self.assertFalse(result)
+            self.assertFalse(ai_rephraser.is_available())
+        finally:
+            if env_key is not None:
+                os.environ["GROQ_API_KEY"] = env_key
 
     def test_ai_analyze_none_when_unavailable(self):
         """analyze_message should return None (triggering fallback) without a client."""
@@ -2046,6 +2124,78 @@ class TestMonitorSystem(unittest.TestCase):
         result = asyncio.run(main_mod.rephrase_unpublished())
         self.assertIsNone(result)
 
+    def test_unpublished_sweep_bounded_by_limit_and_age(self):
+        """REG (REPHR-1): the startup rephrase sweep must be bounded (per-run
+        limit) and skip listings that are too fresh to race the live pipeline."""
+        db.add_supplier("@rephr_src", channel_id=-100995, db_path=TEST_DB)
+        sup_id = db.get_supplier_by_chat(username="rephr_src", db_path=TEST_DB)["id"]
+        fresh_id = db.insert_listing(
+            supplier_id=sup_id, source_message_id=50001, game_name=None,
+            rank_tier=None,
+            status="pending_review", raw_text="WTS Chime account",
+            clean_text="WTS Chime account", db_path=TEST_DB,
+        )
+        old_id = db.insert_listing(
+            supplier_id=sup_id, source_message_id=50002, game_name=None,
+            rank_tier=None,
+            status="pending_review", raw_text="WTS Wise account",
+            clean_text="WTS Wise account", db_path=TEST_DB,
+        )
+        old_ts = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        with sqlite3.connect(TEST_DB) as conn:
+            conn.execute(
+                "UPDATE listings SET created_at = ? WHERE id = ?", (old_ts, old_id)
+            )
+        aged = [l["id"] for l in db.get_unpublished_listings(
+            min_age_seconds=300, db_path=TEST_DB
+        ) if l["supplier_id"] == sup_id]
+        self.assertIn(old_id, aged)
+        self.assertNotIn(fresh_id, aged)
+        limited = db.get_unpublished_listings(
+            min_age_seconds=300, limit=1, db_path=TEST_DB
+        )
+        self.assertLessEqual(len(limited), 1)
+
+    def test_floodwait_retry_shared_helper(self):
+        """REG (TEL-1): the single FloodWait retry helper honors floods, retries
+        until the budget is spent, and bubbles the last FloodWaitError at the
+        cap so interactive admin actions never hang the bot loop forever."""
+
+        def _flood(seconds):
+            err = FloodWaitError.__new__(FloodWaitError)
+            err.seconds = seconds
+            return err
+
+        calls = {"n": 0}
+
+        async def flaky_then_success():
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise _flood(3)
+            return 42
+
+        with mock.patch.object(publish_guard.asyncio, "sleep", new_callable=lambda: mock.AsyncMock()):
+            result = publish_guard.asyncio.run(
+                publish_guard.run_with_floodwait_retry(flaky_then_success, "test")
+            )
+        self.assertEqual(result, 42)
+        self.assertEqual(calls["n"], 3)
+
+        calls["n"] = 0
+
+        async def always_floods():
+            calls["n"] += 1
+            raise _flood(3)
+
+        with mock.patch.object(publish_guard.asyncio, "sleep", new_callable=lambda: mock.AsyncMock()):
+            with self.assertRaises(FloodWaitError):
+                publish_guard.asyncio.run(
+                    publish_guard.run_with_floodwait_retry(
+                        always_floods, "test", max_total_sleep=5.0
+                    )
+                )
+        self.assertEqual(calls["n"], 2)
+
     def test_ai_analyze_prompt_is_strict_json_schema(self):
         """ANALYZE_PROMPT must demand the full JSON schema fields."""
         self.assertIn("is_listing", ai_rephraser.ANALYZE_PROMPT)
@@ -2056,6 +2206,31 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("dm_request", ai_rephraser.ANALYZE_PROMPT)
         self.assertIn("content", ai_rephraser.ANALYZE_PROMPT)
         self.assertIn("JSON:", ai_rephraser.ANALYZE_PROMPT)
+
+    def test_ai_prompt_delimiters_untrusted_message(self):
+        """INJECT-1: the supplier text is wrapped in a <supplier_message> block
+        and the model is told it is untrusted data, never instructions."""
+        self.assertIn("<supplier_message>", ai_rephraser.ANALYZE_PROMPT)
+        self.assertIn("</supplier_message>", ai_rephraser.ANALYZE_PROMPT)
+        self.assertIn("UNTRUSTED USER DATA", ai_rephraser.ANALYZE_PROMPT)
+
+    def test_ai_blocklist_has_deterministic_override(self):
+        """INJECT-1: even a lenient AI verdict ('blocked':false) must route a
+        listing to manual review when the raw source trips a blocked keyword —
+        the deterministic keyword screen re-runs AFTER the AI, untrusting it."""
+        import inspect
+        import main as main_mod
+        handler_src = inspect.getsource(main_mod._process_supplier_message)
+        self.assertIn(
+            "filters.contains_blocked_keyword(raw_text)",
+            handler_src,
+            "post-AI keyword screen must exist",
+        )
+        self.assertIn(
+            'analysis.get("blocked") or risky_keyword',
+            handler_src,
+            "a blocked ALWAYS routes to review even when the model says lenient",
+        )
 
     def test_ai_parse_analysis_json(self):
         """Tolerant JSON parsing of analyzer output (fenced + trailing comma)."""
@@ -2096,7 +2271,6 @@ class TestMonitorSystem(unittest.TestCase):
         """build_ai_message wraps AI lines as-is (no regex cleanup, no body emoji)."""
         out, entities = parser.build_ai_message(
             content_lines=["Spain region", "Includes Tuyo account", "ID card + proof of address"],
-            our_price=38,
             platform="ikualo",
             contact_username="@buyer",
             intent="sell",
@@ -2107,8 +2281,8 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("\nSpain region  🇪🇸\n", out)
         self.assertIn("\nIncludes Tuyo account\n", out)
         self.assertIn("\nID card + proof of address\n", out)
-        self.assertIn("🤑 Price  : DM", out)
-        self.assertIn("📞 Order  : @buyer", out)
+        self.assertIn("🤑 Price  DM", out)
+        self.assertIn("📞 Contact  : @buyer", out)
         # Body must be emoji-free: no bullets, no fire/lightning/star inside
         # (the appended flag anchor is the only exception, and it is here).
         self.assertNotIn("⭐", out)
@@ -2119,15 +2293,15 @@ class TestMonitorSystem(unittest.TestCase):
     def test_build_ai_message_header_rotates_by_seed(self):
         """Header emoji alternates fire/lightning deterministically per listing seed."""
         _, e0 = parser.build_ai_message(
-            content_lines=["line"], our_price=30, platform="x", contact_username="@b", intent="sell",
+            content_lines=["line"], platform="x", contact_username="@b", intent="sell",
             listing_seed=0,
         )
         _, e1 = parser.build_ai_message(
-            content_lines=["line"], our_price=30, platform="x", contact_username="@b", intent="sell",
+            content_lines=["line"], platform="x", contact_username="@b", intent="sell",
             listing_seed=1,
         )
         _, e0b = parser.build_ai_message(
-            content_lines=["line"], our_price=30, platform="x", contact_username="@b", intent="sell",
+            content_lines=["line"], platform="x", contact_username="@b", intent="sell",
             listing_seed=0,
         )
         self.assertEqual(e0[0].document_id, parser.CE_FIRE)
@@ -2139,7 +2313,6 @@ class TestMonitorSystem(unittest.TestCase):
         """Emoji appear ONLY in the header/footer lines, never in the body."""
         out, _ = parser.build_ai_message(
             content_lines=["Plain body line one", "Plain body line two"],
-            our_price=50,
             platform="revolut",
             contact_username="@b",
             intent="sell",
@@ -2162,7 +2335,6 @@ class TestMonitorSystem(unittest.TestCase):
         countries = [f"Country {i}" for i in range(9)]
         out, _ = parser.build_ai_message(
             content_lines=countries,
-            our_price=50,
             platform="kyc",
             contact_username="@b",
             intent="sell",
@@ -2180,8 +2352,7 @@ class TestMonitorSystem(unittest.TestCase):
     def test_build_ai_message_defaults_to_buyer_header(self):
         """Every post carries a buyer-framed header, whatever the source intent."""
         out, _ = parser.build_ai_message(
-            content_lines=["Need curve pay"], our_price=38,
-            platform="curve", contact_username="@buyer", intent="buy",
+            content_lines=["Need curve pay"], platform="curve", contact_username="@buyer", intent="buy",
         )
         self.assertIn("CURVE WTB ✦ DM FAST", out)
         self.assertNotIn("FOR SALE", out)
@@ -2189,14 +2360,12 @@ class TestMonitorSystem(unittest.TestCase):
     def test_build_ai_message_uses_validated_ai_header(self):
         """A buyer-framed AI tagline is used; seller wording falls back to default."""
         out, _ = parser.build_ai_message(
-            content_lines=["Netflix"], our_price=38,
-            platform="netflix", contact_username="@b",
+            content_lines=["Netflix"], platform="netflix", contact_username="@b",
             header_word="WANTED ✦ DM FAST",
         )
         self.assertIn("NETFLIX WANTED ✦ DM FAST", out)
         out, _ = parser.build_ai_message(
-            content_lines=["Netflix"], our_price=38,
-            platform="netflix", contact_username="@b",
+            content_lines=["Netflix"], platform="netflix", contact_username="@b",
             header_word="FOR SALE",
         )
         self.assertIn("NETFLIX WTB ✦ DM FAST", out)
@@ -2231,22 +2400,22 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("header", ai_rephraser.ANALYZE_PROMPT)
 
     def test_build_ai_message_no_price_variant(self):
-        """Even with no price the static 'Price: DM' footer and the frozen buyer
+        """Even with no price the static 'Price DM' footer and the frozen buyer
         header are present — the variant used to show 'WANTED' and skip Price."""
         out, _ = parser.build_ai_message(
-            content_lines=["Tuyo full access"], our_price=None,
-            platform="tuyo", contact_username="@buyer", intent="neutral",
+            content_lines=["Tuyo full access"], platform="tuyo", contact_username="@buyer", intent="neutral",
         )
         self.assertIn("TUYO WTB ✦ DM FAST", out)
-        self.assertIn("🤑 Price  : DM", out)
+        self.assertIn("🤑 Price  DM", out)
 
-    def test_build_ai_message_knows_no_price_passed(self):
-        """our_price=0 still renders the static 'Price: DM' footer, never '$0'."""
+    def test_build_ai_message_price_zero_source_text(self):
+        """A '$0'-looking source never renders 'Price: $0' — the footer is
+        always the static 'Price DM' line."""
         out, _ = parser.build_ai_message(
-            content_lines=["Line"], our_price=0,
+            content_lines=["Line"], source_text="WTS netflix $0",
             platform="x", contact_username="@b", intent="sell",
         )
-        self.assertIn("🤑 Price  : DM", out)
+        self.assertIn("🤑 Price  DM", out)
         self.assertNotIn("$0", out)
 
     # -------------------------------------------------------------
@@ -2456,7 +2625,6 @@ class TestMonitorSystem(unittest.TestCase):
     def test_build_ai_message_sanitizes_body_by_default(self):
         msg, _entities = parser.build_ai_message(
             content_lines=["KYC CURVE PAY", "PRICE: $30", "DM: @godf4therCO"],
-            our_price=30,
             platform="curve",
             contact_username="@buy",
             intent="buy",
@@ -2469,7 +2637,6 @@ class TestMonitorSystem(unittest.TestCase):
         # /repair reconstructs the as-published text: verbatim body, no sanitizing.
         msg, _entities = parser.build_ai_message(
             content_lines=["KYC CURVE PAY", "PRICE: $30"],
-            our_price=30,
             platform="curve",
             contact_username="@buy",
             intent="buy",
@@ -2511,8 +2678,6 @@ class TestMonitorSystem(unittest.TestCase):
             904477,
             "netflix",
             None,
-            12.5,
-            9.0,
             "skipped_filter",
             "some raw leaked body",
             "clean body",

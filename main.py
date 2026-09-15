@@ -9,11 +9,11 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
 
 import admin_bot
 import ai_rephraser
@@ -33,14 +33,10 @@ DEST_CHANNEL = os.environ.get("DEST_CHANNEL", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0") or 0)
 CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "")
-DEFAULT_MULTIPLIER = float(os.environ.get("PRICE_MULTIPLIER", "0.75"))
 PUBLISH_INTERVAL = float(os.environ.get("PUBLISH_INTERVAL", "1.5"))
 PUBLISH_MAX_RETRIES = int(os.environ.get("PUBLISH_MAX_RETRIES", "4"))
 BACKFILL_ON_START = os.environ.get("BACKFILL_ON_START", "0").strip().lower() in ("1", "true", "yes")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-# Upper sanity bound for an AI-reported price; anything beyond this is
-# treated as a hallucination and routed to manual review (AI-1).
-MAX_PRICE = float(os.environ.get("MAX_PRICE", "100000") or 100000)
 # Free-tier reliability toggles: the chatter pre-filter saves AI quota, and the
 # deterministic fallback keeps real listings publishing when every AI path is down.
 PRE_FILTER_CHATTER = os.environ.get("PRE_FILTER_CHATTER", "1").strip().lower() in ("1", "true", "yes")
@@ -49,6 +45,72 @@ AI_CACHE_TTL_HOURS = float(os.environ.get("AI_CACHE_TTL_HOURS", "48") or 48)
 # How long identical content stays blocked as a duplicate: a re-post of the
 # same listing within DEDUP_HOURS is skipped (content fingerprint + price).
 DEDUP_HOURS = int(os.environ.get("DEDUP_HOURS", "48") or 48)
+# Startup stale-body rephrase sweep (REPHR-1): bounded to a small batch of
+# listings older than a few minutes, so restart recovery never becomes an
+# unbounded AI batch and never races messages the live pipeline is still
+# holding in-flight. AI results are cached per fingerprint anyway (ai_cache).
+REPHRASE_SWEEP_LIMIT = int(os.environ.get("REPHRASE_SWEEP_LIMIT", "50") or 50)
+REPHRASE_SWEEP_MIN_AGE_SECONDS = int(
+    os.environ.get("REPHRASE_SWEEP_MIN_AGE_SECONDS", "120") or 120
+)
+
+# Runtime health (MON-1): process-level state surfaced in the periodic health
+# line so a silently-dead worker / stalled publish path is visible in the logs
+# with no dashboard and no extra dependencies. Times are monotonic seconds.
+_RUNTIME_STARTED_AT = time.monotonic()
+_LAST_ACTIVITY_AT: Optional[float] = None
+_LAST_PUBLISH_AT: Optional[float] = None
+_LAST_FAILURE: Optional[Tuple[float, str]] = None
+_WORKER_HEARTBEATS: Dict[str, float] = {}
+
+
+def _mark_activity() -> None:
+    global _LAST_ACTIVITY_AT
+    _LAST_ACTIVITY_AT = time.monotonic()
+
+
+def _mark_publish() -> None:
+    global _LAST_PUBLISH_AT, _LAST_ACTIVITY_AT
+    _LAST_PUBLISH_AT = time.monotonic()
+    _LAST_ACTIVITY_AT = _LAST_PUBLISH_AT
+
+
+def _record_failure(where: str, err: str) -> None:
+    global _LAST_FAILURE
+    _LAST_FAILURE = (time.monotonic(), f"{where}: {err[:200]}")
+
+
+def _mark_worker_heartbeat(name: str) -> None:
+    _WORKER_HEARTBEATS[name] = time.monotonic()
+
+
+def _runtime_health_suffix() -> str:
+    """Short summary of process-level liveness for the health log line."""
+    upstream = max(
+        [t for t in (_LAST_ACTIVITY_AT, _LAST_PUBLISH_AT) if t is not None], default=0
+    )
+    alive = (
+        f"inbound-activity-{(time.monotonic() - upstream):.0f}s-ago"
+        if upstream
+        else "no-inbound-activity-yet"
+    )
+    last_pub = (
+        f"last-publish-{(time.monotonic() - _LAST_PUBLISH_AT):.0f}s-ago"
+        if _LAST_PUBLISH_AT
+        else "no-publish-yet"
+    )
+    beats = ",".join(
+        f"{name}-{(time.monotonic() - ts):.0f}s" for name, ts in sorted(_WORKER_HEARTBEATS.items())
+    ) or "no-worker-heartbeats"
+    failure = (
+        f"last-failure={_LAST_FAILURE[1]}"
+        if _LAST_FAILURE
+        else "no-failures"
+    )
+    return (
+        f" | uptime={(time.monotonic() - _RUNTIME_STARTED_AT) / 60:.0f}m | {alive} | "
+        f"{last_pub} | beats: {beats} | {failure}"
+    )
 # Manual mode (`python main.py --manual`): start the admin bot + user client
 # ONLY. No listener, no auto-publish, no backfill, no supplier resolution —
 # the admin reviews and publishes everything. Approvals drain the queue worker.
@@ -147,12 +209,7 @@ def _validate_config() -> None:
         errors.append("API_HASH is missing in .env")
     if not DEST_CHANNEL:
         errors.append("DEST_CHANNEL is missing in .env")
-    # CFG-1: reject unrealistic price multipliers instead of silently corrupting prices.
-    if not (0 < DEFAULT_MULTIPLIER <= 5.0):
-        errors.append(
-            f"PRICE_MULTIPLIER must be between 0 (exclusive) and 5.0 (got {DEFAULT_MULTIPLIER})"
-        )
-
+    # PRIC-1: no price multiplier exists anymore; nothing to validate.
     if errors:
         for err in errors:
             logger.error("Configuration error: %s", err)
@@ -325,13 +382,15 @@ async def resolve_supplier_entities(
 
         display = getattr(entity, "username", None) or getattr(entity, "title", None)
         if display:
-            db.set_supplier_display_name(
-                channel_id if channel_id is not None else username, display
+            await db.run_async(
+                db.set_supplier_display_name,
+                channel_id if channel_id is not None else username,
+                display,
             )
 
         real_owner = db.get_supplier_by_chat(chat_id=entity_id, username=None)
         if real_owner is not None and real_owner["id"] != supplier["id"]:
-            db.merge_supplier_rows(real_owner["id"], supplier["id"])
+            await db.run_async(db.merge_supplier_rows, real_owner["id"], supplier["id"])
             resolved.append({**real_owner, "channel_id": entity_id})
             logger.info(
                 "Supplier %s resolved into existing row id %s (%s)",
@@ -342,10 +401,12 @@ async def resolve_supplier_entities(
             continue
 
         if channel_id is None:
-            db.set_supplier_channel_id(username, entity_id)
+            await db.run_async(db.set_supplier_channel_id, username, entity_id)
             channel_id = entity_id
         elif channel_id != entity_id:
-            db.set_supplier_channel_id(username or str(channel_id), entity_id)
+            await db.run_async(
+                db.set_supplier_channel_id, username or str(channel_id), entity_id
+            )
             channel_id = entity_id
 
         resolved.append({**supplier, "channel_id": channel_id})
@@ -410,7 +471,7 @@ async def resolve_chat(client: TelegramClient, supplier: dict):
     return await client.get_entity(supplier["channel_username"])
 
 
-def resolve_supplier_for_event(event) -> Optional[dict]:
+async def resolve_supplier_for_event(event) -> Optional[dict]:
     """Find the active supplier matching this message event."""
     chat_id = event.chat_id
     chat_username = getattr(event.chat, "username", None)
@@ -418,7 +479,9 @@ def resolve_supplier_for_event(event) -> Optional[dict]:
 
     # If supplier was stored without channel_id, update it now
     if supplier and supplier.get("channel_id") is None and chat_id is not None:
-        db.set_supplier_channel_id(supplier["channel_username"], chat_id)
+        await db.run_async(
+            db.set_supplier_channel_id, supplier["channel_username"], chat_id
+        )
         supplier["channel_id"] = chat_id
 
     if supplier and supplier.get("active"):
@@ -446,11 +509,13 @@ async def publish_to_destination(
     for attempt in range(1, PUBLISH_MAX_RETRIES + 1):
         try:
             sent = await client.send_message(DEST_CHANNEL, text, formatting_entities=entities)
+            _mark_publish()
             return sent.id
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             last_error = str(exc)[:500]
+            _record_failure("publish_to_destination", last_error)
             flood_seconds = getattr(exc, "seconds", 0) or 0
             if flood_seconds:
                 logger.warning(
@@ -472,20 +537,6 @@ async def publish_to_destination(
                 delay = min(delay * 2, 30)
 
     raise PublishError(last_error)
-
-
-async def _run_with_floodwait_retry(coro_factory, context: str):
-    """Await a coroutine factory, transparently honoring FloodWaitError (TEL-1)."""
-    while True:
-        try:
-            return await coro_factory()
-        except FloodWaitError as fwe:
-            logger.warning(
-                "FloodWait(%ss) hit during %s — sleeping before retry.",
-                fwe.seconds,
-                context,
-            )
-            await asyncio.sleep(max(fwe.seconds, 1))
 
 
 async def _alert_admin_on_failure(
@@ -528,18 +579,46 @@ async def _alert_admin_on_published(
 # ---------------------------------------------------------------------------
 # Per-message in-flight locks (CONC-2). Telegram handlers run concurrently and
 # the same source message may be delivered twice; this serializes processing
-# per (supplier_id, source_msg_id). Entries are intentionally retained — removing
-# one would race with waiters that already captured the Lock object.
-_processing_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+# per (supplier_id, source_msg_id).
+#
+# Each entry carries a holder count (current holders + waiters). An entry is
+# removed from the dict ONLY when the count drops to zero: a waiter that has
+# already captured the entry object still runs against the same Lock, and a
+# NEW caller can never get a fresh lock while another task is still using the
+# key. This bounds memory without introducing a removal race (CONC-3).
+class _ProcessingLockEntry:
+    __slots__ = ("lock", "holders")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.holders = 0
 
 
-def _get_processing_lock(supplier_id: int, source_msg_id: int) -> asyncio.Lock:
+_processing_locks: Dict[Tuple[int, int], _ProcessingLockEntry] = {}
+
+
+def _acquire_processing_lock(supplier_id: int, source_msg_id: int) -> _ProcessingLockEntry:
     key = (supplier_id, source_msg_id)
-    lock = _processing_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _processing_locks[key] = lock
-    return lock
+    entry = _processing_locks.get(key)
+    if entry is None:
+        entry = _ProcessingLockEntry()
+        _processing_locks[key] = entry
+    entry.holders += 1
+    return entry
+
+
+def _release_processing_lock(
+    supplier_id: int, source_msg_id: int, entry: _ProcessingLockEntry
+) -> None:
+    """Drop a holder/waiter reference; remove the entry once nobody is left.
+
+    The check-and-pop runs without awaiting, so no other task can interleave:
+    by the time the count reaches zero all processing for the key is done.
+    """
+    key = (supplier_id, source_msg_id)
+    entry.holders -= 1
+    if entry.holders == 0 and _processing_locks.get(key) is entry:
+        del _processing_locks[key]
 
 
 async def process_supplier_message(
@@ -554,33 +633,44 @@ async def process_supplier_message(
     source_msg_id = getattr(msg, "id", None)
     if source_msg_id is None:
         return
-    async with _get_processing_lock(supplier["id"], source_msg_id):
-        try:
-            await _process_supplier_message(client, bot_client, supplier, msg)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # ERR-1: an unexpected pipeline failure must never leave the listing
-            # stuck as 'received' with no audit trail and no admin alert.
+    entry = _acquire_processing_lock(supplier["id"], source_msg_id)
+    try:
+        async with entry.lock:
             try:
-                listing = db.get_listing_by_source(supplier["id"], source_msg_id)
-                if listing:
-                    db.mark_listing_failed(
-                        listing["id"], f"pipeline error: {str(exc)[:500]}"
+                await _process_supplier_message(client, bot_client, supplier, msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # ERR-1: an unexpected pipeline failure must never leave the listing
+                # stuck as 'received' with no audit trail and no admin alert.
+                try:
+                    listing = db.get_listing_by_source(supplier["id"], source_msg_id)
+                    if listing:
+                        await db.run_async(
+                            db.mark_listing_failed,
+                            listing["id"],
+                            f"pipeline error: {str(exc)[:500]}",
+                        )
+                        await db.run_async(
+                            db.record_audit,
+                            "pipeline_error_failed",
+                            listing["id"],
+                            detail=str(exc)[:500],
+                        )
+                        await _alert_admin_on_failure(bot_client, supplier, listing["id"])
+                except Exception:
+                    logger.exception(
+                        "Could not mark/fail listing for source message %s", source_msg_id
                     )
-                    db.record_audit(
-                        "pipeline_error_failed", listing["id"], detail=str(exc)[:500]
-                    )
-                    await _alert_admin_on_failure(bot_client, supplier, listing["id"])
-            except Exception:
                 logger.exception(
-                    "Could not mark/fail listing for source message %s", source_msg_id
+                    "Pipeline error processing source message %s from supplier %s",
+                    source_msg_id,
+                    _supplier_label(supplier),
                 )
-            logger.exception(
-                "Pipeline error processing source message %s from supplier %s",
-                source_msg_id,
-                _supplier_label(supplier),
-            )
+                _record_failure("process_supplier_message", str(exc))
+    finally:
+        _mark_activity()
+        _release_processing_lock(supplier["id"], source_msg_id, entry)
 
 
 async def _process_supplier_message(
@@ -617,13 +707,13 @@ async def _process_supplier_message(
     # contact signature; skipping stops repricing compounding (e.g. $60 -> $45 -> $34)
     # and duplicate re-posts. This is a *containment* measure for re-shares of our
     # own posts, not a filter on real supplier ads.
-    if CONTACT_USERNAME and f"Order  : @{CONTACT_USERNAME}" in raw_text:
+    if CONTACT_USERNAME and f"Contact  : @{CONTACT_USERNAME}" in raw_text:
         logger.info(
             "Source message %s from %s looks like our own destination output; skipping",
             source_msg_id,
             _supplier_label(supplier),
         )
-        db.log_skip(supplier_id, source_msg_id, "self_echo", raw_text)
+        await db.run_async(db.log_skip, supplier_id, source_msg_id, "self_echo", raw_text)
         return
 
     logger.info(
@@ -635,33 +725,42 @@ async def _process_supplier_message(
 
     fallback_clean_text = parser.strip_all_emoji(raw_text)
 
-    listing_id = db.insert_listing(
+    # Fingerprint is computed and stored with the row itself (CONC-2 race fix):
+    # the dedup query reads fingerprints from the DB, so a concurrent identical
+    # twin arriving right after this insert must be able to match this row while
+    # it is still in-flight (status 'received').
+    source_price, _ = parser.extract_price(raw_text)
+    fingerprint = db.make_listing_fingerprint(raw_text, price=source_price)
+
+    listing_id = await db.run_async(
+        db.insert_listing,
         supplier_id=supplier_id,
         source_message_id=source_msg_id,
         game_name=None,
         rank_tier=None,
-        original_price=None,
-        our_price=None,
         status="received",
         raw_text=raw_text,
         clean_text=fallback_clean_text,
+        fingerprint=fingerprint,
     )
 
     # Step 1: Content-based filter check FIRST — plain-text fingerprint
     # (normalized text + parsed price), no AI needed. Skip identical listings
     # already processed within DEDUP_HOURS; reason is logged to the skips
     # table so the daily report can break skipped stats down per rule (DEDUP-2).
-    source_price, _ = parser.extract_price(raw_text)
+    # exclude_listing_id prevents a message from matching itself.
     skip_reason = filters.check_filters(
-        raw_text, hours=DEDUP_HOURS, price=source_price
+        raw_text,
+        hours=DEDUP_HOURS,
+        price=source_price,
+        exclude_listing_id=listing_id,
     )
     if skip_reason:
-        db.update_listing_status(listing_id, f"skipped_{skip_reason}")
-        db.log_skip(supplier_id, source_msg_id, skip_reason, raw_text)
-        db.record_audit(skip_reason, listing_id, detail=raw_text[:200])
+        await db.run_async(db.update_listing_status, listing_id, f"skipped_{skip_reason}")
+        await db.run_async(db.log_skip, supplier_id, source_msg_id, skip_reason, raw_text)
+        await db.run_async(db.record_audit, skip_reason, listing_id, detail=raw_text[:200])
         logger.info("Listing #%s skipped by filter '%s'.", listing_id, skip_reason)
         return
-    db.set_listing_fingerprint(listing_id, raw_text, price=source_price)
 
     # Step 1.5 (optional): cheap chatter pre-filter. Obvious non-listings
     # (rule posts, admin pins, welcome greetings, bot tests) never reach the AI
@@ -669,9 +768,9 @@ async def _process_supplier_message(
     if PRE_FILTER_CHATTER:
         chatter_reason = filters.obvious_non_listing(raw_text)
         if chatter_reason == filters.REASON_CHATTER:
-            db.update_listing_status(listing_id, f"skipped_{chatter_reason}")
-            db.log_skip(supplier_id, source_msg_id, chatter_reason, raw_text)
-            db.record_audit(chatter_reason, listing_id, detail=raw_text[:200])
+            await db.run_async(db.update_listing_status, listing_id, f"skipped_{chatter_reason}")
+            await db.run_async(db.log_skip, supplier_id, source_msg_id, chatter_reason, raw_text)
+            await db.run_async(db.record_audit, chatter_reason, listing_id, detail=raw_text[:200])
             logger.info(
                 "Listing #%s skipped by chatter pre-filter '%s'.",
                 listing_id,
@@ -685,9 +784,12 @@ async def _process_supplier_message(
     # path — so it is caught BEFORE the AI and routed to manual review.
     payment_proof = filters.detect_payment_proof(raw_text)
     if payment_proof:
-        db.update_listing_status(listing_id, "pending_approval")
-        db.record_audit(
-            "payment_proof_review", listing_id, detail=payment_proof[:200]
+        await db.run_async(db.update_listing_status, listing_id, "pending_approval")
+        await db.run_async(
+            db.record_audit,
+            "payment_proof_review",
+            listing_id,
+            detail=payment_proof[:200],
         )
         logger.warning(
             "Listing #%s flagged as payment proof ('%s') — manual review, not published.",
@@ -709,7 +811,8 @@ async def _process_supplier_message(
     if analysis is None:
         # AI unavailable / failed. Record the neutral intent (the regex price is
         # used only for the dedup fingerprint, never for publishing).
-        db.update_listing_fields(
+        await db.run_async(
+            db.update_listing_fields,
             listing_id,
             intent="neutral",
         )
@@ -729,17 +832,16 @@ async def _process_supplier_message(
         ] or ["Available"]
         fb_lines, fb_body_ok = parser.prepare_body(fb_content_lines, raw_text)
         if deterministic_fallback_publish_ok(
-            paused=await asyncio.to_thread(db.is_paused),
+            paused=await db.run_async(db.is_paused),
             risky_keyword=risky_keyword,
             has_payment_proof=filters.detect_payment_proof(raw_text),
             has_clear_signal=filters.has_clear_listing_signal(raw_text),
             body_ok=fb_body_ok,
         ):
             content_lines = fb_lines
-            post_number = db.next_post_number()
+            post_number = await db.run_async(db.next_post_number)
             out_text, entities = parser.build_ai_message(
                 content_lines=content_lines,
-                our_price=None,
                 platform=None,
                 contact_username=CONTACT_USERNAME,
                 intent="neutral",
@@ -750,13 +852,15 @@ async def _process_supplier_message(
             )
             try:
                 published_msg_id = await publish_to_destination(client, out_text, entities)
-                db.update_listing_status(
+                await db.run_async(
+                    db.update_listing_status,
                     listing_id=listing_id,
                     status="published",
                     published_message_id=published_msg_id,
                     post_number=post_number,
                 )
-                db.record_audit(
+                await db.run_async(
+                    db.record_audit,
                     "published_deterministic_fallback",
                     listing_id,
                     detail=f"AI unavailable (msg_id {published_msg_id})",
@@ -769,7 +873,7 @@ async def _process_supplier_message(
                 )
                 await _alert_admin_on_published(bot_client, supplier, listing_id)
             except PublishError as exc:
-                db.mark_listing_failed(listing_id, str(exc))
+                await db.run_async(db.mark_listing_failed, listing_id, str(exc))
                 logger.error(
                     "Listing #%s deterministic fallback exhausted publish retries; "
                     "moved to failed queue. Last error: %s",
@@ -780,7 +884,11 @@ async def _process_supplier_message(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                db.mark_listing_failed(listing_id, "unexpected deterministic fallback publish error")
+                await db.run_async(
+                    db.mark_listing_failed,
+                    listing_id,
+                    "unexpected deterministic fallback publish error",
+                )
                 logger.exception(
                     "Failed to publish listing #%s via deterministic fallback",
                     listing_id,
@@ -795,8 +903,8 @@ async def _process_supplier_message(
             if risky_keyword
             else "No AI response; routed for manual review"
         )
-        db.update_listing_status(listing_id, "pending_review")
-        db.record_audit("ai_unavailable", listing_id, detail=reason_detail)
+        await db.run_async(db.update_listing_status, listing_id, "pending_review")
+        await db.run_async(db.record_audit, "ai_unavailable", listing_id, detail=reason_detail)
         logger.warning(
             "Listing #%s: AI analysis unavailable (%s). Routed to pending_review.",
             listing_id,
@@ -813,11 +921,15 @@ async def _process_supplier_message(
     # Blocklist check (AI-detected illicit / hacked / stolen content).
     # A wrong "blocked" would silently destroy a real listing, so flagged
     # messages go to admin review, not the trash.
-    if analysis.get("blocked"):
-        reason = analysis.get("block_reason") or "blocked by AI analysis"
-        db.update_listing_status(listing_id, "pending_review")
-        db.record_blocklist_hit(listing_id, reason[:200])
-        db.record_audit("ai_blocked_review", listing_id, detail=reason)
+    # INJECT-1: the deterministic keyword screen also overrides a lenient AI
+    # verdict — if the raw source trips a blocked keyword, the listing ALWAYS
+    # routes to manual review, never auto-published, without trusting the model.
+    risky_keyword = filters.contains_blocked_keyword(raw_text)
+    if analysis.get("blocked") or risky_keyword:
+        reason = analysis.get("block_reason") or f"blocked-keyword screen: {risky_keyword}"
+        await db.run_async(db.update_listing_status, listing_id, "pending_review")
+        await db.run_async(db.record_blocklist_hit, listing_id, reason[:200])
+        await db.run_async(db.record_audit, "ai_blocked_review", listing_id, detail=reason)
         logger.warning(
             "Listing #%s flagged as blocked by AI (%s) — routed to manual review.",
             listing_id,
@@ -833,9 +945,9 @@ async def _process_supplier_message(
 
     # Not a legitimate listing (spam / admin chatter / nonsense)
     if not analysis.get("is_listing"):
-        db.update_listing_status(listing_id, "skipped_filter")
-        db.log_skip(supplier_id, source_msg_id, "not_a_listing", raw_text)
-        db.record_audit("not_a_listing", listing_id, detail="AI: not a listing")
+        await db.run_async(db.update_listing_status, listing_id, "skipped_filter")
+        await db.run_async(db.log_skip, supplier_id, source_msg_id, "not_a_listing", raw_text)
+        await db.run_async(db.record_audit, "not_a_listing", listing_id, detail="AI: not a listing")
         logger.info(
             "Listing #%s skipped (AI classified as not a listing).",
             listing_id,
@@ -849,14 +961,15 @@ async def _process_supplier_message(
 
     # Persist the AI-rewritten body so the worker / admin preview reuse it as-is.
     # platform is informational only — it does NOT gate publishing.
-    db.update_listing_fields(
+    await db.run_async(
+        db.update_listing_fields,
         listing_id,
         platform_name=platform_name,
         intent=intent,
         header_word=analysis.get("header"),
     )
     if ai_clean_text:
-        db.update_listing_content(listing_id, clean_text=ai_clean_text)
+        await db.run_async(db.update_listing_content, listing_id, clean_text=ai_clean_text)
 
     # Sanitize the AI body now (strip leaked prices/@handles/DM lines) and gate
     # the buy auto-publish: a buy demand auto-publishes when it has a
@@ -866,17 +979,16 @@ async def _process_supplier_message(
     body_lines, body_ok = parser.prepare_body(content_lines, ai_clean_text or raw_text)
     buy_auto_ok = buy_auto_publish_ok(
         intent=intent,
-        paused=await asyncio.to_thread(db.is_paused),
+        paused=await db.run_async(db.is_paused),
         body_ok=body_ok,
         has_payment_proof=filters.detect_payment_proof(raw_text),
     )
 
     if buy_auto_ok:
         # Buy demand -> rephrase + auto-publish (gated).
-        post_number = db.next_post_number()
+        post_number = await db.run_async(db.next_post_number)
         our_text, entities = parser.build_ai_message(
             content_lines=body_lines,
-            our_price=None,
             platform=platform_name,
             contact_username=CONTACT_USERNAME,
             intent=intent,
@@ -888,13 +1000,14 @@ async def _process_supplier_message(
 
         try:
             published_msg_id = await publish_to_destination(client, our_text, entities)
-            db.update_listing_status(
+            await db.run_async(
+                db.update_listing_status,
                 listing_id=listing_id,
                 status="published",
                 published_message_id=published_msg_id,
                 post_number=post_number,
             )
-            db.record_audit("published_auto", listing_id, detail=published_msg_id)
+            await db.run_async(db.record_audit, "published_auto", listing_id, detail=published_msg_id)
             logger.info(
                 "Published listing #%s -> %s (msg_id: %s, post #%s)",
                 listing_id,
@@ -904,7 +1017,7 @@ async def _process_supplier_message(
             )
             await _alert_admin_on_published(bot_client, supplier, listing_id)
         except PublishError as exc:
-            db.mark_listing_failed(listing_id, str(exc))
+            await db.run_async(db.mark_listing_failed, listing_id, str(exc))
             logger.error(
                 "Listing #%s exhausted publish retries; moved to failed queue. Last error: %s",
                 listing_id,
@@ -914,7 +1027,7 @@ async def _process_supplier_message(
         except asyncio.CancelledError:
             raise
         except Exception:
-            db.mark_listing_failed(listing_id, "unexpected publish error")
+            await db.run_async(db.mark_listing_failed, listing_id, "unexpected publish error")
             logger.exception("Failed to publish message for listing #%s", listing_id)
             await _alert_admin_on_failure(bot_client, supplier, listing_id)
     else:
@@ -928,7 +1041,7 @@ async def _process_supplier_message(
                 gate_reason = "buy_gate_weak_body"
             else:
                 gate_reason = "buy_gate"
-        db.update_listing_status(listing_id, "pending_approval")
+        await db.run_async(db.update_listing_status, listing_id, "pending_approval")
         logger.info(
             "Listing #%s marked pending_approval (gate=%s). Alerting admin...",
             listing_id,
@@ -949,7 +1062,7 @@ async def process_edited_message(client: TelegramClient, event) -> None:
     if not msg:
         return
 
-    supplier = resolve_supplier_for_event(event)
+    supplier = await resolve_supplier_for_event(event)
     if not supplier:
         return
 
@@ -993,7 +1106,7 @@ async def process_edited_message(client: TelegramClient, event) -> None:
     header_word = analysis.get("header")
 
     # AI-only decision: update the destination post from whatever the analysis
-    # returns (the footer price is always the static "Price: DM" line).
+    # returns (the footer price is always the static "Price DM" line).
 
     # No-op guard: skip edit if nothing meaningfully changed.
     if ai_clean_text == existing.get("clean_text"):
@@ -1002,7 +1115,6 @@ async def process_edited_message(client: TelegramClient, event) -> None:
 
     updated_text, entities = parser.build_ai_message(
         content_lines=content_lines,
-        our_price=None,
         platform=platform_name,
         contact_username=CONTACT_USERNAME,
         intent=intent,
@@ -1018,13 +1130,15 @@ async def process_edited_message(client: TelegramClient, event) -> None:
             DEST_CHANNEL, published_msg_id, updated_text,
             formatting_entities=entities
         )
-        db.update_listing_fields(
+        await db.run_async(
+            db.update_listing_fields,
             listing_id=existing["id"],
             platform_name=platform_name,
             intent=intent,
             header_word=header_word,
         )
-        db.update_listing_content(
+        await db.run_async(
+            db.update_listing_content,
             listing_id=existing["id"],
             clean_text=ai_clean_text,
             rank_tier=None,
@@ -1032,12 +1146,18 @@ async def process_edited_message(client: TelegramClient, event) -> None:
         # TEL-3: refresh the dedup fingerprint from the edited raw text so a
         # re-processed/re-delivered version of this message is recognized.
         edit_price, _ = parser.extract_price(raw_text)
-        db.set_listing_fingerprint(
+        await db.run_async(
+            db.set_listing_fingerprint,
             existing["id"],
             raw_text,
             price=edit_price,
         )
-        db.record_audit("edited_destination", existing["id"], detail=f"source {source_msg_id}")
+        await db.run_async(
+            db.record_audit,
+            "edited_destination",
+            existing["id"],
+            detail=f"source {source_msg_id}",
+        )
         logger.info(
             "Updated destination post %s in %s for source msg %s",
             published_msg_id,
@@ -1056,7 +1176,7 @@ async def process_edited_message(client: TelegramClient, event) -> None:
 
 async def process_deleted_message(event) -> None:
     """Handle deleted message notification from source channels."""
-    supplier = resolve_supplier_for_event(event)
+    supplier = await resolve_supplier_for_event(event)
     if not supplier:
         return
 
@@ -1085,8 +1205,9 @@ async def approved_listings_worker(
     listing an admin has explicitly approved.
     """
     while not stop_event.is_set():
+        _mark_worker_heartbeat("approved_worker")
         try:
-            approved = await asyncio.to_thread(db.get_approved_listings_to_publish, 5)
+            approved = await db.run_async(db.get_approved_listings_to_publish, 5)
             for listing in approved:
                 listing_id = listing["id"]
                 # clean_text already holds the AI-rewritten body (or the raw fallback
@@ -1094,11 +1215,10 @@ async def approved_listings_worker(
                 content_text = listing.get("clean_text") or listing.get("raw_text") or ""
                 content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
                 intent = listing.get("intent") or "neutral"
-                post_number = await asyncio.to_thread(db.next_post_number)
+                post_number = await db.run_async(db.next_post_number)
 
                 out_text, entities = parser.build_ai_message(
                     content_lines=content_lines,
-                    our_price=None,
                     platform=listing.get("platform_name"),
                     contact_username=CONTACT_USERNAME,
                     intent=intent,
@@ -1112,7 +1232,7 @@ async def approved_listings_worker(
                 try:
                     published_msg_id = await publish_to_destination(client, out_text, entities)
                 except PublishError as exc:
-                    await asyncio.to_thread(db.mark_listing_failed, listing_id, str(exc))
+                    await db.run_async(db.mark_listing_failed, listing_id, str(exc))
                     logger.error(
                         "Worker failed to publish approved listing #%s after retries → failed queue: %s",
                         listing_id,
@@ -1125,7 +1245,7 @@ async def approved_listings_worker(
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    await asyncio.to_thread(db.mark_listing_failed, listing_id, str(exc)[:500])
+                    await db.run_async(db.mark_listing_failed, listing_id, str(exc)[:500])
                     logger.exception("Worker failed to publish approved listing #%s", listing_id)
                     await _alert_admin_on_failure(
                         bot_client, {"channel_username": listing.get("supplier_username")}, listing_id
@@ -1133,14 +1253,14 @@ async def approved_listings_worker(
                     continue
 
                 try:
-                    await asyncio.to_thread(
+                    await db.run_async(
                         db.update_listing_status,
                         listing_id=listing_id,
                         status="published",
                         published_message_id=published_msg_id,
                         post_number=post_number,
                     )
-                    await asyncio.to_thread(
+                    await db.run_async(
                         db.record_audit,
                         "published_approved",
                         listing_id,
@@ -1152,7 +1272,7 @@ async def approved_listings_worker(
                         listing_id, published_msg_id, exc,
                     )
                     try:
-                        await asyncio.to_thread(
+                        await db.run_async(
                             db.update_listing_status,
                             listing_id=listing_id,
                             status="published",
@@ -1182,16 +1302,18 @@ async def health_check_worker(stop_event: asyncio.Event) -> None:
     """Periodic health check logging every hour."""
     while not stop_event.is_set():
         try:
-            stats = await asyncio.to_thread(db.get_today_stats)
+            stats = await db.run_async(db.get_today_stats)
+            _mark_worker_heartbeat("health_check")
             logger.info(
                 "Periodic Health Check: Active Suppliers=%s | Today Processed=%s | "
-                "Published=%s | Pending=%s | Skipped=%s | Errors=%s",
+                "Published=%s | Pending=%s | Skipped=%s | Errors=%s%s",
                 stats["active_suppliers"],
                 stats["total_processed"],
                 stats["published"],
                 stats["pending"],
                 stats["total_skipped"],
                 stats["errors"],
+                _runtime_health_suffix(),
             )
         except Exception:
             logger.exception("Error in health check worker")
@@ -1242,11 +1364,22 @@ async def run_backfill(client: TelegramClient, bot_client: Optional[TelegramClie
 async def rephrase_unpublished() -> None:
     """Re-run AI rewriting over unpublished listings whose stored body is still
     the regex fallback (emoji-stripped source), so admin previews show real AI
-    rephrasing instead. Already-AI bodies are left untouched to avoid churn."""
+    rephrasing instead. Already-AI bodies are left untouched to avoid churn.
+
+    Bounded (REPHR-1): the sweep is capped per run and only touches listings
+    older than REPHRASE_SWEEP_MIN_AGE_SECONDS, so startup recovery stays fast,
+    burns a bounded amount of AI quota, and never races a listing the live
+    pipeline or the approval worker is still working on. Identical content
+    re-uses the fingerprint-keyed ai_cache. Re-running the sweep later covers
+    the next oldest slice of the queue.
+    """
     if not ai_rephraser.is_available():
         logger.info("AI not available; skipping stale rephrase sweep.")
         return
-    listings = db.get_unpublished_listings()
+    listings = db.get_unpublished_listings(
+        limit=REPHRASE_SWEEP_LIMIT,
+        min_age_seconds=REPHRASE_SWEEP_MIN_AGE_SECONDS,
+    )
     refreshed = 0
     for listing in listings:
         listing_id = listing["id"]
@@ -1265,12 +1398,13 @@ async def rephrase_unpublished() -> None:
         if not content_lines:
             continue
         ai_clean_text = "\n".join(content_lines)
-        db.update_listing_fields(
+        await db.run_async(
+            db.update_listing_fields,
             listing_id,
             platform_name=analysis.get("platform"),
             intent=analysis.get("intent"),
         )
-        db.update_listing_content(listing_id, clean_text=ai_clean_text)
+        await db.run_async(db.update_listing_content, listing_id, clean_text=ai_clean_text)
         refreshed += 1
         logger.info(
             "Rephrase sweep: listing #%s body refreshed via AI (platform=%s)",
@@ -1309,7 +1443,7 @@ async def main() -> None:
     env_seed_notice = db.validate_env_seed_config(SOURCE_CHANNELS_RAW)
     if env_seed_notice:
         logger.warning("%s", env_seed_notice)
-    env_seed_result = db.ensure_env_seed(SOURCE_CHANNELS, DEFAULT_MULTIPLIER)
+    env_seed_result = db.ensure_env_seed(SOURCE_CHANNELS)
     logger.info(
         "Env seeding: state=%s seeded=%s migrated=%s — .env is NOT consulted again "
         "unless /reseed_from_env is run manually.",
@@ -1341,11 +1475,11 @@ async def main() -> None:
         async def on_new_message(event):
             try:
                 async def _handle_new():
-                    supplier = resolve_supplier_for_event(event)
+                    supplier = await resolve_supplier_for_event(event)
                     if supplier:
                         await process_supplier_message(user_client, bot_client, supplier, event.message)
 
-                await _run_with_floodwait_retry(
+                await publish_guard.run_with_floodwait_retry(
                     _handle_new,
                     f"new message {getattr(event.message, 'id', None)}",
                 )
@@ -1360,7 +1494,7 @@ async def main() -> None:
                 async def _handle_edit():
                     await process_edited_message(user_client, event)
 
-                await _run_with_floodwait_retry(
+                await publish_guard.run_with_floodwait_retry(
                     _handle_edit,
                     f"edited message {getattr(event.message, 'id', None)}",
                 )

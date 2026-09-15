@@ -26,7 +26,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0") or 0)
 DEST_CHANNEL = os.environ.get("DEST_CHANNEL", "")
 CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "")
-DEFAULT_MULTIPLIER = float(os.environ.get("PRICE_MULTIPLIER", "0.75"))
 
 # Statuses in which a listing may still be edited / approved / rejected. Once a
 # listing leaves this set (published, failed, rejected...) any in-flight admin
@@ -43,6 +42,17 @@ SKIP_DIGEST_MIN_INTERVAL = 10 * 60
 SKIP_DIGEST_MAX_CARDS = 10
 _skip_digest_last_sent = 0.0
 _skip_digest_task: Optional[asyncio.Task] = None
+
+# FloodWait budget for interactive admin send/edit actions (shared helper in
+# publish_guard). Capped so a large flood can never hang the
+# admin bot's event loop indefinitely — on exhaustion the action fails through
+# into its existing error path (e.g. re-queue for the worker).
+REPAIR_FLOODWAIT_BUDGET_SECONDS = float(
+    os.environ.get("REPAIR_FLOODWAIT_BUDGET_SECONDS", "120") or 120
+)
+APPROVE_FLOODWAIT_BUDGET_SECONDS = float(
+    os.environ.get("APPROVE_FLOODWAIT_BUDGET_SECONDS", "120") or 120
+)
 
 
 def listing_is_editable(status: str) -> bool:
@@ -212,7 +222,6 @@ async def _build_preview_text(listing: dict) -> str:
 
     preview_text, _ = parser.build_ai_message(
         content_lines=content_lines,
-        our_price=None,
         platform=platform,
         contact_username=CONTACT_USERNAME,
         intent=intent,
@@ -241,7 +250,6 @@ def _repair_targets(max_posts: int = 100) -> List[dict]:
 
         current_text, _ = parser.build_ai_message(
             content_lines=content_lines,
-            our_price=None,
             platform=platform,
             contact_username=CONTACT_USERNAME,
             intent=intent,
@@ -253,7 +261,6 @@ def _repair_targets(max_posts: int = 100) -> List[dict]:
         )
         repaired_text, entities = parser.build_ai_message(
             content_lines=sanitized,
-            our_price=None,
             platform=platform,
             contact_username=CONTACT_USERNAME,
             intent=intent,
@@ -339,7 +346,10 @@ async def skip_digest_worker(bot: TelegramClient) -> None:
                         "Failed to send skip notification for skip #%s", k["skip_id"]
                     )
                     continue
-            db.set_skip_digest_marker(max(k["skip_id"] for k in new_skips))
+            await db.run_async(
+                db.set_skip_digest_marker,
+                max(k["skip_id"] for k in new_skips),
+            )
             _skip_digest_last_sent = now
         except asyncio.CancelledError:
             raise
@@ -618,15 +628,18 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
             (getattr(entity, "username", None) or "").strip().lstrip("@") or None
         )
         display = _entity_display(entity, fallback=f"channel {channel_id}")
-        sid = db.add_supplier(
+        sid = await db.run_async(
+            db.add_supplier,
             entity_username or str(channel_id),
             channel_id=channel_id,
-            markup_multiplier=DEFAULT_MULTIPLIER,
         )
         if display:
-            db.set_supplier_display_name(str(channel_id), display)
-        db.record_audit(
-            "supplier_added", sid, actor_id=ADMIN_USER_ID,
+            await db.run_async(db.set_supplier_display_name, str(channel_id), display)
+        await db.run_async(
+            db.record_audit,
+            "supplier_added",
+            sid,
+            actor_id=ADMIN_USER_ID,
             detail=f"forwarded post -> {display} (id {channel_id})",
         )
         if entity is None:
@@ -668,15 +681,18 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
         )
         display = _entity_display(entity, fallback=username)
         store_username = entity_username or (str(entity_id) if entity_id else username)
-        sid = db.add_supplier(
+        sid = await db.run_async(
+            db.add_supplier,
             store_username,
             channel_id=entity_id,
-            markup_multiplier=DEFAULT_MULTIPLIER,
         )
         if entity_id and display:
-            db.set_supplier_display_name(str(entity_id), display)
-        db.record_audit(
-            "supplier_added", sid, actor_id=ADMIN_USER_ID,
+            await db.run_async(db.set_supplier_display_name, str(entity_id), display)
+        await db.run_async(
+            db.record_audit,
+            "supplier_added",
+            sid,
+            actor_id=ADMIN_USER_ID,
             detail=f"{text} -> {display} (id {entity_id})",
         )
         await event.reply(
@@ -971,7 +987,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if not await check_admin(event):
             return
         paused = db.is_paused()
-        db.set_paused(not paused)
+        await db.run_async(db.set_paused, not paused)
         state_label = "⏸ **Paused**" if not paused else "▶ **Resumed**"
         await event.reply(
             f"{state_label}. New listings are still captured and shown here for review. "
@@ -986,7 +1002,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if not await check_admin(event):
             return
         asleep = db.is_buyer_asleep()
-        db.set_buyer_asleep(not asleep)
+        await db.run_async(db.set_buyer_asleep, not asleep)
         if not asleep:
             state_label = (
                 "😴 **Asleep** — every new post now carries the footer\n"
@@ -1034,15 +1050,21 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if not s:
             await event.reply(f"❌ Supplier **@{arg.lstrip('@')}** not found.", buttons=_home_keyboard())
             return
-        db.delete_supplier(s["id"])
-        db.record_audit("supplier_deleted", None, actor_id=event.sender_id, detail=f"@{arg.lstrip('@')}")
+        await db.run_async(db.delete_supplier, s["id"])
+        await db.run_async(
+            db.record_audit,
+            "supplier_deleted",
+            None,
+            actor_id=event.sender_id,
+            detail=f"@{arg.lstrip('@')}",
+        )
         await event.reply(f"🗑 Supplier **@{arg.lstrip('@')}** permanently deleted.", buttons=_home_keyboard())
 
     @bot.on(events.NewMessage(pattern=r"^/dedupe_suppliers$"))
     async def handle_dedupe_suppliers(event):
         if not await check_admin(event):
             return
-        summary = db.dedupe_suppliers()
+        summary = await db.run_async(db.dedupe_suppliers)
         merges = summary.get("merges", [])
         if not merges:
             await event.reply(
@@ -1057,8 +1079,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 f"merged into row `#{m['merged_into']}` (channel `{m['channel_id']}`)"
             )
         for m in merges:
-            db.record_audit(
-                "supplier_dedupe", None, actor_id=event.sender_id, detail=str(m)
+            await db.run_async(
+                db.record_audit,
+                "supplier_dedupe",
+                None,
+                actor_id=event.sender_id,
+                detail=str(m),
             )
         await event.reply("\n".join(lines), buttons=_home_keyboard(), parse_mode="markdown")
         suppliers = db.list_suppliers(active_only=False)
@@ -1182,20 +1208,27 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         for t in targets:
             try:
                 await publish_guard.throttle()
-                await user_client_ref.edit_message(
-                    DEST_CHANNEL,
-                    t["published_message_id"],
-                    t["repaired_text"],
-                    formatting_entities=t["entities"],
+                await publish_guard.run_with_floodwait_retry(
+                    lambda t=t: user_client_ref.edit_message(
+                        DEST_CHANNEL,
+                        t["published_message_id"],
+                        t["repaired_text"],
+                        formatting_entities=t["entities"],
+                    ),
+                    f"repair edit post {t['published_message_id']}",
+                    max_total_sleep=REPAIR_FLOODWAIT_BUDGET_SECONDS,
                 )
-                db.record_audit(
-                    "repair_edited", t["listing_id"], actor_id=event.sender_id,
+                await db.run_async(
+                    db.record_audit,
+                    "repair_edited",
+                    t["listing_id"],
+                    actor_id=event.sender_id,
                     detail=f"post #{t['post_number']}",
                 )
                 done += 1
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception:
                 logger.exception("Repair edit failed for post %s", t.get("post_number"))
                 failed += 1
         await event.reply(
@@ -1245,7 +1278,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             f"🔢 **Post #{arg}**",
             "━━━━━━━━━━━━━━━━━━━━",
             f"Platform : {platform}",
-            f"Price    : DM",
+            "Price    : DM",
             f"Supplier : {src_disp}",
             f"Published: {published}",
             f"Listing  : `#{post.get('id')}`",
@@ -1281,8 +1314,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
 
-        ok = db.requeue_listing(listing_id)
-        db.record_audit("requeue", listing_id, actor_id=event.sender_id)
+        ok = await db.run_async(db.requeue_listing, listing_id)
+        await db.run_async(db.record_audit, "requeue", listing_id, actor_id=event.sender_id)
         if ok:
             await event.reply(
                 f"🔁 Listing **#{listing_id}** re-queued for publishing. "
@@ -1346,12 +1379,15 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             except ValueError:
                 await event.answer("Invalid skip id", alert=True)
                 return
-            reopened = db.reopen_skipped(skip_id)
+            reopened = await db.run_async(db.reopen_skipped, skip_id)
             if not reopened:
                 await event.answer("Skip not found or already processed.", alert=True)
                 return
-            db.record_audit(
-                "skipped_reopen", reopened["id"], actor_id=event.sender_id,
+            await db.run_async(
+                db.record_audit,
+                "skipped_reopen",
+                reopened["id"],
+                actor_id=event.sender_id,
                 detail=f"skip #{skip_id}",
             )
             # Delete the tapped message — whether it's one of the new per-skip
@@ -1420,7 +1456,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
             if home_action == "toggle":
                 paused = db.is_paused()
-                db.set_paused(not paused)
+                await db.run_async(db.set_paused, not paused)
                 await event.answer(
                     "⏸ Automatic publishing paused" if not paused else "▶ Automatic publishing resumed"
                 )
@@ -1428,7 +1464,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
             if home_action == "asleep":
                 asleep = db.is_buyer_asleep()
-                db.set_buyer_asleep(not asleep)
+                await db.run_async(db.set_buyer_asleep, not asleep)
                 await event.answer(
                     "😴 Asleep — footer added to new posts" if not asleep
                     else "☀️ Awake — footer removed"
@@ -1494,9 +1530,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if not s:
                 await event.answer("Source not found.", alert=True)
                 return
-            db.set_supplier_active(s["channel_username"], not s["active"])
-            db.record_audit(
-                "supplier_toggle", None, actor_id=ADMIN_USER_ID, detail=str(sid)
+            await db.run_async(db.set_supplier_active, s["channel_username"], not s["active"])
+            await db.run_async(
+                db.record_audit,
+                "supplier_toggle",
+                None,
+                actor_id=ADMIN_USER_ID,
+                detail=str(sid),
             )
             refreshed = next(
                 (x for x in db.list_suppliers(active_only=False) if x["id"] == sid),
@@ -1534,9 +1574,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if not s:
                 await event.answer("Source not found.", alert=True)
                 return
-            db.delete_supplier(sid)
-            db.record_audit(
-                "supplier_deleted", None, actor_id=ADMIN_USER_ID, detail=str(sid)
+            await db.run_async(db.delete_supplier, sid)
+            await db.run_async(
+                db.record_audit,
+                "supplier_deleted",
+                None,
+                actor_id=ADMIN_USER_ID,
+                detail=str(sid),
             )
             try:
                 await event.delete()
@@ -1565,11 +1609,15 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             try:
                 raw = os.environ.get("SOURCE_CHANNELS", "")
                 channels = [ch.strip() for ch in raw.split(",") if ch.strip()]
-                db.clear_env_seed_completed()
-                n = db.seed_suppliers_from_env(channels, DEFAULT_MULTIPLIER)
-                db.mark_env_seed_completed()
-                db.record_audit(
-                    "env_reseed", None, actor_id=ADMIN_USER_ID, detail=f"re-seeded {n} supplier(s)"
+                await db.run_async(db.clear_env_seed_completed)
+                n = await db.run_async(db.seed_suppliers_from_env, channels)
+                await db.run_async(db.mark_env_seed_completed)
+                await db.run_async(
+                    db.record_audit,
+                    "env_reseed",
+                    None,
+                    actor_id=ADMIN_USER_ID,
+                    detail=f"re-seeded {n} supplier(s)",
                 )
                 try:
                     await event.delete()
@@ -1602,9 +1650,17 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if not username:
                 await event.answer("Invalid reference.", alert=True)
                 return
-            sid = db.add_supplier(username, channel_id=None, markup_multiplier=DEFAULT_MULTIPLIER)
-            db.record_audit(
-                "supplier_added_unresolved", sid, actor_id=ADMIN_USER_ID, detail=raw
+            sid = await db.run_async(
+                db.add_supplier,
+                username,
+                channel_id=None,
+            )
+            await db.run_async(
+                db.record_audit,
+                "supplier_added_unresolved",
+                sid,
+                actor_id=ADMIN_USER_ID,
+                detail=raw,
             )
             try:
                 await event.delete()
@@ -1719,8 +1775,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if listing["status"] not in ("failed", "error"):
                 await event.answer(f"Already processed (status: {listing['status']})", alert=True)
                 return
-            ok = db.requeue_listing(listing_id)
-            db.record_audit("requeue", listing_id, actor_id=event.sender_id)
+            ok = await db.run_async(db.requeue_listing, listing_id)
+            await db.run_async(db.record_audit, "requeue", listing_id, actor_id=event.sender_id)
             if ok:
                 try:
                     await event.delete()
@@ -1750,8 +1806,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         if action == "reject":
             _drafts.pop(listing_id, None)
-            db.update_listing_status(listing_id, "rejected")
-            db.record_audit("rejected", listing_id, actor_id=event.sender_id)
+            await db.run_async(db.update_listing_status, listing_id, "rejected")
+            await db.run_async(db.record_audit, "rejected", listing_id, actor_id=event.sender_id)
             await event.answer("❌ Rejected")
             try:
                 await event.delete()
@@ -1810,10 +1866,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             except Exception:
                 pass
 
-            post_number = db.next_post_number()
+            post_number = await db.run_async(db.next_post_number)
             republished_text, entities = parser.build_ai_message(
                 content_lines=content_lines,
-                our_price=None,
                 platform=platform_name,
                 contact_username=CONTACT_USERNAME,
                 intent=intent,
@@ -1829,17 +1884,25 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await publish_guard.throttle()
                 published_msg_id = None
                 try:
-                    sent_msg = await user_client_ref.send_message(
-                        DEST_CHANNEL, republished_text,
-                        formatting_entities=entities
+                    sent_msg = await publish_guard.run_with_floodwait_retry(
+                        lambda text=republished_text, ent=entities: user_client_ref.send_message(
+                            DEST_CHANNEL, text,
+                            formatting_entities=ent
+                        ),
+                        f"approve send listing #{listing_id}",
+                        max_total_sleep=APPROVE_FLOODWAIT_BUDGET_SECONDS,
                     )
                     published_msg_id = sent_msg.id
                 except Exception as e:
                     logger.exception("Send failed for listing #%s via user_client: %s", listing_id, e)
                     # Nothing was sent — safe to re-queue for the worker.
-                    db.update_listing_status(listing_id, "approved")
-                    db.record_audit(
-                        "approved_queued", listing_id, actor_id=event.sender_id, detail=str(e)[:200]
+                    await db.run_async(db.update_listing_status, listing_id, "approved")
+                    await db.run_async(
+                        db.record_audit,
+                        "approved_queued",
+                        listing_id,
+                        actor_id=event.sender_id,
+                        detail=str(e)[:200],
                     )
                     try:
                         await event.client.send_message(
@@ -1855,15 +1918,19 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
                 # Message IS on the channel now — under no circumstance re-queue it.
                 try:
-                    db.update_listing_status(
+                    await db.run_async(
+                        db.update_listing_status,
                         listing_id=listing_id,
                         status="published",
                         published_message_id=published_msg_id,
                         post_number=post_number,
                     )
-                    db.record_audit(
-                        "published_admin", listing_id,
-                        actor_id=event.sender_id, detail=published_msg_id,
+                    await db.run_async(
+                        db.record_audit,
+                        "published_admin",
+                        listing_id,
+                        actor_id=event.sender_id,
+                        detail=published_msg_id,
                     )
                 except Exception as exc:
                     logger.exception(
@@ -1871,7 +1938,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         listing_id, published_msg_id, exc,
                     )
                     try:
-                        db.update_listing_status(
+                        await db.run_async(
+                            db.update_listing_status,
                             listing_id=listing_id,
                             status="published",
                             published_message_id=published_msg_id,
@@ -1894,9 +1962,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     pass
                 return
             else:
-                db.update_listing_status(listing_id, "approved")
-                db.record_audit(
-                    "approved", listing_id, actor_id=event.sender_id,
+                await db.run_async(db.update_listing_status, listing_id, "approved")
+                await db.run_async(
+                    db.record_audit,
+                    "approved",
+                    listing_id,
+                    actor_id=event.sender_id,
                     detail="queued for worker publish",
                 )
                 try:

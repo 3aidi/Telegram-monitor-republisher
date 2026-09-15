@@ -1,0 +1,6 @@
+# Lint config for CI (deploy.yml) and local `ruff check`.
+# Minimal scope: F (pyflakes: unused imports/vars, undefined names) + E9
+# (syntax-level errors) — real bugs only, no style churn on the existing code.
+[lint]
+select = ["F", "E9"]
+exclude = ["venv", "venv_check_ruff", ".opencode", ".git", "__pycache__"]

@@ -6,6 +6,21 @@
 
 ---
 
+## Later changeset (2026-09-16) — Verification queue P1–P9, deploy hardening, pricing removal
+
+**Verification:** `python -m unittest test_system` **128/128 OK**; `ruff check .` (F+E9) **clean**.
+
+1. **P1 — Deduplication (DEDUP)**: unique `(supplier_id, source_message_id)` index on `listings`; fresh insert conflict-resistant; dedup fingerprint includes `(platform, rounded price, normalized text)`; `find_recent_similar_listing` keeps the 48h window, excludes self, ignores stale `received` rows; concurrency test proves two true twins can never both publish.
+2. **P2 — Type-safety**: `db.get_supplier_by_chat()` never returns `None` where the caller expects a row.
+3. **P3 — Concurrent-safety**: per-message in-flight locks (`_processing_locks`) serialize identical concurrent messages and release on completion (no leaking entries).
+4. **P4 — Bounded rephrase sweep**: `db.get_unpublished_listings(limit, min_age_seconds)`; startup rephrase loop is time/age bounded via `REPHRASE_SWEEP_LIMIT` / `REPHRASE_SWEEP_MIN_AGE_SECONDS`.
+5. **P5 — FloodWait handling**: one shared `publish_guard.run_with_floodwait_retry()` helper (honors `FloodWaitError`, bounded retry budgets for the admin-bot edit/approve paths so floods can't hang the loop).
+6. **P6/P7 — Deploy hardening**: `deploy.yml` runs the full test suite in CI *and* on the server, with automatic rollback on test failure or an unhealthy restart; `run.ps1` / `start_aws.ps1` / `stop_aws.ps1` now read `AWS_SSH_HOST` / `AWS_SSH_KEY` from the environment instead of hardcoded values.
+7. **P8 — Runtime health**: the health-check log line reports uptime, last inbound activity, last publish, worker heartbeats, and last failure.
+8. **P9 — Pricing system removed**: `original_price`, `our_price`, `markup_multiplier`, `PRICE_MULTIPLIER`, `MAX_PRICE`, `db.set_supplier_rule()`, and `parser.apply_pricing_rule()` / `_format_price()` are gone. Fresh databases never create the pricing columns (schema v9); production databases keep them dormant — a full table rebuild is unsafe while `PRAGMA foreign_keys` is enabled inside an open migration transaction. Every published post always carries the static `Price: DM` footer.
+
+---
+
 ## Summary of Changes
 
 | # | File | Type | What |
@@ -124,7 +139,7 @@ emoji==2.15.0
   - **Sources** — `SOURCE_CHANNELS`
   - **AI (Groq)** — `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_TEMPERATURE`, `GROQ_MAX_TOKENS`, `GROQ_TIMEOUT`, `GROQ_MAX_RETRIES`, `GROQ_MAX_CONCURRENCY`
   - **AI fallback (OpenRouter)** — `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_TIMEOUT`, `OPENROUTER_COOLDOWN_SECONDS`
-  - **Behavior tuning** — `BACKFILL_ON_START`, `PUBLISH_INTERVAL`, `PUBLISH_MAX_RETRIES`, `DEDUP_HOURS`, `AI_CACHE_TTL_HOURS`, `PRE_FILTER_CHATTER`, `DETERMINISTIC_FALLBACK`, `MAX_PRICE`, `PRICE_MULTIPLIER`
+  - **Behavior tuning** — `BACKFILL_ON_START`, `PUBLISH_INTERVAL`, `PUBLISH_MAX_RETRIES`, `DEDUP_HOURS`, `AI_CACHE_TTL_HOURS`, `PRE_FILTER_CHATTER`, `DETERMINISTIC_FALLBACK`
   - **Storage** — `DB_PATH`
 - Each variable carries its code-default value and a one-line comment, so `cp .env.example .env` gives a working starting point. No real secrets are included.
 
@@ -186,7 +201,7 @@ script: |
 
 These were observed during the audit and deliberately **left unchanged** to keep this changeset risk-free:
 
-1. **Vestigial price system** — `our_price` is always `None` and the published footer is the static `Price: DM` line. `db.set_supplier_rule()` and `parser.apply_pricing_rule()` are dead code kept for schema compatibility. `PRICE_MULTIPLIER` is only used for env-seeding.
+1. **Pricing system removed (2026-09-16)** — the vestigial `our_price`/`original_price`/`markup_multiplier` machinery no longer exists in code or for fresh databases (see the later changeset section above); legacy columns stay dormant in existing databases for FK-safety.
 2. **Auth is solid** — admin user-ID checks are present on both the `NewMessage` and `CallbackQuery` handler paths in `admin_bot.py`.
 3. **Single-instance guard** — the Windows named-mutex guard correctly avoids false positives from the venv launcher shim.
 4. **Publishing is centralized** — all destination publishes (auto, worker, admin-approve) route through `publish_guard.throttle()`, so rate limiting is serialized under one lock.
