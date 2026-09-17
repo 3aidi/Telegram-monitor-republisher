@@ -462,7 +462,7 @@ def build_ai_message(
         cursor += _utf16_len(leader) + _utf16_len(alt) + 1
 
     # ── Divider
-    divider = "────────\n"
+    divider = "──────────\n"
     parts.append(divider)
     cursor += _utf16_len(divider)
 
