@@ -1256,8 +1256,16 @@ def get_listing_by_source(
 def get_listing_by_id(
     listing_id: int, db_path: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
+    query = """
+        SELECT l.*, s.channel_username as supplier_username,
+               s.channel_id as supplier_channel_id,
+               s.display_name as supplier_display_name
+        FROM listings l
+        LEFT JOIN suppliers s ON l.supplier_id = s.id
+        WHERE l.id = ?
+    """
     with db_session(db_path) as conn:
-        row = conn.execute("SELECT * FROM listings WHERE id = ?", (listing_id,)).fetchone()
+        row = conn.execute(query, (listing_id,)).fetchone()
         return dict(row) if row else None
 
 

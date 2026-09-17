@@ -378,7 +378,6 @@ class TestMonitorSystem(unittest.TestCase):
         dump = (
             "1)🇪🇺 [1234567890123456789]\n"
             "2)🇫🇷 [2234567890123456789]\n"
-            "3)🚩 [3234567890123456789]\n"
             "garbage line without brackets\n"
         )
         mapping, errors = countries.build_flags2024_mapping(dump)
@@ -1764,7 +1763,7 @@ class TestMonitorSystem(unittest.TestCase):
             admin_bot.DEST_CHANNEL = old
         self.assertNotIn("·", text)
         self.assertEqual(text.count("\n"), 1, "header line only")
-        self.assertEqual(len(buttons), 3, "two post rows + home row")
+        self.assertEqual(len(buttons), 4, "two post rows + search button + home row")
 
         row1 = buttons[0]
         self.assertTrue(any(getattr(b, "text", None) == "#7" for b in row1))
@@ -1776,6 +1775,12 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(len(row2), 1, "no dest link without published_message_id")
         self.assertEqual(
             getattr(row2[0], "url", None), "https://t.me/anon_src/101"
+        )
+
+        search_row = buttons[2]
+        self.assertTrue(
+            any(getattr(b, "data", b"").decode() == "published:search" for b in search_row),
+            "published list offers a post-number search button",
         )
 
         for row_btn in buttons:

@@ -112,6 +112,7 @@ async def send_approval_prompt(
             Button.inline("❌ Reject",  data=f"reject:{listing_id}"),
         ]
     ]
+    buttons.extend(_channel_view_buttons(listing))
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
@@ -172,24 +173,13 @@ async def send_published_alert(
 
     text = (
         f"✅ **Auto-Published — Post {post_disp}**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━\n"
         f"{platform.title() if platform else 'Platform ?'}\n"
-        f"Price    : DM\n"
         f"Supplier : {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        + (f"Find it later with `/post {post_number}`." if post_number is not None else "")
+        f"━━━━━━━━━━━━━━━━━\n"
     )
 
-    buttons = []
-    src_url = _source_url(listing)
-    dest_url = _destination_url(listing)
-    if src_url or dest_url:
-        row = []
-        if src_url:
-            row.append(Button.url("📥 View in source channel", src_url))
-        if dest_url:
-            row.append(Button.url("📝 View in my channel", dest_url))
-        buttons.append(row)
+    buttons = _channel_view_buttons(listing)
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
@@ -310,7 +300,7 @@ def _skip_notification(k: dict) -> Tuple[str, List[List[object]]]:
         "source_message_id": k.get("message_id"),
     })
     if src_url:
-        buttons[0].append(Button.url("📥 View in source channel", src_url))
+        buttons[0].append(Button.url("View in Buyer channel", src_url))
     return text, buttons
 
 
@@ -413,7 +403,7 @@ def _home_keyboard() -> List[List[object]]:
     return [
         [Button.text("📊 Status", resize=True), Button.text("⏳ Pending", resize=True), Button.text("⚠️ Failed", resize=True)],
         [Button.text("📋 Sources", resize=True), Button.text(DESTINATIONS_BTN, resize=True), Button.text(pause_label, resize=True)],
-        [Button.text("🚫 Skipped", resize=True), Button.text("📜 Published", resize=True), Button.text(_asleep_label(), resize=True)],
+        [Button.text("🚫 Skipped", resize=True), Button.text("✅ Published", resize=True), Button.text(_asleep_label(), resize=True)],
         [Button.text("❓ Help", resize=True)],
     ]
 
@@ -453,6 +443,24 @@ def _destination_url(listing: dict) -> Optional[str]:
     return _tgram_chat_link(ref, listing.get("published_message_id"))
 
 
+def _channel_view_buttons(listing: dict) -> List[List[object]]:
+    """URL row: 'View in Buyer channel' (the original source post) and
+    'View in my channel' (the republished post), each only when resolvable.
+
+    Shared by the auto-published alert, the manual-review cards, previews, the
+    approve confirmation and post lookups so every publish-related DM offers
+    the same one-tap links.
+    """
+    row = []
+    src_url = _source_url(listing)
+    dest_url = _destination_url(listing)
+    if src_url:
+        row.append(Button.url("View in Buyer channel", src_url))
+    if dest_url:
+        row.append(Button.url("View in my channel", dest_url))
+    return [row] if row else []
+
+
 def _asleep_label() -> str:
     """Label for the 'I'm Asleep' toggle button (mirrors the pause label)."""
     return "☀️ I'm Awake" if db.is_buyer_asleep() else "😴 I'm Asleep"
@@ -483,18 +491,26 @@ async def _message_delete_send(
         logger.exception("Failed to send fresh message after delete-and-refresh")
 
 
-def _listing_action_buttons(listing_id: int, status: str) -> List[List[object]]:
+def _listing_action_buttons(listing: dict) -> List[List[object]]:
     """Inline actions shown with a preview: failed listings can be retried,
-    pending ones can be edited, then approved or rejected."""
+    pending ones can be edited, then approved or rejected. A 'View in Buyer
+    channel' link is appended whenever the original source post resolves."""
+    listing_id = listing["id"]
+    status = listing["status"]
     if status in ("failed", "error"):
-        return [[Button.inline("🔁 Retry", data=f"retry:{listing_id}")]]
-    return [
-        [
-            Button.inline("✏️ Edit", data=f"edit:{listing_id}"),
-            Button.inline("✅ Approve", data=f"approve:{listing_id}"),
-            Button.inline("❌ Reject", data=f"reject:{listing_id}"),
+        buttons: List[List[object]] = [
+            [Button.inline("🔁 Retry", data=f"retry:{listing_id}")]
         ]
-    ]
+    else:
+        buttons = [
+            [
+                Button.inline("✏️ Edit", data=f"edit:{listing_id}"),
+                Button.inline("✅ Approve", data=f"approve:{listing_id}"),
+                Button.inline("❌ Reject", data=f"reject:{listing_id}"),
+            ]
+        ]
+    buttons.extend(_channel_view_buttons(listing))
+    return buttons
 
 
 # Wizard state: sender_id -> {"step": "add" | "edit", ...}
@@ -773,14 +789,11 @@ def _destination_label(d: dict) -> str:
 def _destinations_menu_text(destinations: List[dict]) -> str:
     if not destinations:
         return (
-            "No destinations configured — every bot post currently goes only to "
-            "the main channel.\n\nTap **➕ Add Destination** to start forwarding "
+            "No destinations configured — \n\nTap **➕ Add Destination** to start forwarding "
             "posts there too."
         )
     return (
-        f"**{len(destinations)} destination(s) configured.** "
-        "Tap one to manage it.\n\n"
-        "🟢 active — bot posts are forwarded here · 🔴 disabled — skipped"
+        "\nTap a destination below to manage it.\n\n"
     )
 
 
@@ -802,15 +815,12 @@ async def _edit_destination_menu(event, d: dict) -> None:
     did = d["id"]
     icon = _destination_icon(d)
     label = _destination_label(d)
-    toggle_label = "⏸ Disable" if d["active"] else "▶ Enable"
+    toggle_label = "⏸ Pause " if d["active"] else "▶ Resume"
     await _message_delete_send(
         event,
         f"{icon} **{label}**\n"
         f"Status: `{'Active' if d['active'] else 'Disabled'}`\n"
         f"ID: `{d['chat_id']}`\n\n"
-        f"• **Active** destinations receive a copy of every successfully published "
-        f"bot post.\n"
-        f"• **Disabled** destinations are skipped (posts already queued are dropped).\n\n"
         f"What would you like to do?",
         buttons=[
             [Button.inline(toggle_label, data=f"desttoggle:{did}")],
@@ -1102,7 +1112,15 @@ def _skipped_digest(skips: List[dict]) -> Tuple[str, List[List[object]]]:
         label = f"{_skip_reason_icon(k.get('reason'))} {reason} · {src}"
         if age:
             label += f" · {age}"
-        buttons.append([Button.inline(label, data=f"reskip:{k['skip_id']}")])
+        row = [Button.inline(label, data=f"reskip:{k['skip_id']}")]
+        src_url = _source_url({
+            "supplier_username": k.get("channel_username"),
+            "supplier_channel_id": None,
+            "source_message_id": k.get("message_id"),
+        })
+        if src_url:
+            row.append(Button.url("View in Buyer channel", src_url))
+        buttons.append(row)
     if reopenable:
         text = "—"
         dropped = len(skips) - len(reopenable)
@@ -1138,8 +1156,32 @@ def _published_digest(rows: List[dict]) -> Tuple[str, List[List[object]]]:
             row.append(Button.url(src_disp, src_url))
         if row:
             buttons.append(row)
+    buttons.append([Button.inline("🔢 Search Post", data="published:search")])
     buttons.extend(_home_button_row())
     return text, buttons
+
+
+def _post_card(post: dict) -> Tuple[str, List[List[object]]]:
+    """Render one published-post lookup card (shared by /post and the Published
+    screen's 'Search Post' button)."""
+    post_number = post.get("post_number")
+    platform = (post.get("platform_name") or post.get("game_name") or "?").title()
+    supplier = _pretty_source(post.get("supplier_username"), post.get("supplier_display_name"))
+    if not supplier or supplier == "?":
+        supplier = f"channel {post.get('supplier_channel_id')}"
+    published = (post.get("published_at") or "")[:16].replace("T", " ")
+    lines = [
+        f"🔢 **Post #{post_number}**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Platform : {platform}",
+        "Price    : DM",
+        f"Supplier : {supplier}",
+        f"Published: {published}",
+        f"Listing  : `#{post.get('id')}`",
+    ]
+    buttons = _channel_view_buttons(post)
+    buttons.append([Button.inline("🏠 Home", data="menu:home")])
+    return "\n".join(lines), buttons
 
 
 def setup_admin_handlers(bot: TelegramClient) -> None:
@@ -1191,9 +1233,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         await db.run_async(db.set_paused, not paused)
         state_label = "⏸ **Paused**" if not paused else "▶ **Resumed**"
         await event.reply(
-            f"{state_label}. New listings are still captured and shown here for review. "
-            f"Automatic publishing is {'stopped' if not paused else 'running'} — "
-            f"but manual **Approve** taps always publish immediately.",
+            f"{state_label}. New listings are captured, "
+            f"Automatic publishing is {'stopped' if not paused else 'running'}. "
+            f"**Approve** to publish now.",
             buttons=_home_keyboard(),
             parse_mode="markdown",
         )
@@ -1498,28 +1540,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 buttons=_home_keyboard(),
             )
             return
-        platform = (post.get("platform_name") or post.get("game_name") or "?").title()
-        supplier = post.get("supplier_username")
-        supplier_chat = post.get("supplier_channel_id")
-        src_disp = _pretty_source(supplier, post.get("supplier_display_name"))
-        if not src_disp or src_disp == "?":
-            src_disp = f"channel {supplier_chat}"
-        published = (post.get("published_at") or "")[:16].replace("T", " ")
-        lines = [
-            f"🔢 **Post #{arg}**",
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"Platform : {platform}",
-            "Price    : DM",
-            f"Supplier : {src_disp}",
-            f"Published: {published}",
-            f"Listing  : `#{post.get('id')}`",
-        ]
-        buttons = []
-        src_url = _source_url(post)
-        if src_url:
-            buttons.append([Button.url("📥 View in source channel", src_url)])
-        buttons.append([Button.inline("🏠 Home", data="menu:home")])
-        await event.reply("\n".join(lines), buttons=buttons, parse_mode="markdown")
+        text, buttons = _post_card(post)
+        await event.reply(text, buttons=buttons, parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/retry(?:[ \t]+(\d+))?"))
     async def handle_retry(event):
@@ -1579,7 +1601,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 f"📄 **Preview of Listing #{arg}**\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"{preview_text}",
-                buttons=_listing_action_buttons(listing["id"], listing["status"]),
+                buttons=_listing_action_buttons(listing),
             )
         except Exception as exc:
             logger.warning("Preview too long to send for listing #%s: %s", arg, exc)
@@ -1734,6 +1756,27 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 text, buttons = _published_digest(rows)
                 await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
+            return
+
+        if data_str == "published:search":
+            _wizard_state[ADMIN_USER_ID] = {"step": "post_search"}
+            try:
+                sent = await event.client.send_message(
+                    ADMIN_USER_ID,
+                    "🔢 **Search a published post** — send the **post number** "
+                    "(the `#N` on each published card), e.g. `12`.",
+                    buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
+                    parse_mode="markdown",
+                )
+                prompt_id = getattr(sent, "id", None)
+                if prompt_id:
+                    _wizard_state[ADMIN_USER_ID]["prompt_message_id"] = prompt_id
+            except Exception:
+                logger.exception("Failed to send post search prompt")
+            try:
+                await event.delete()
+            except Exception:
+                pass
             return
 
         if data_str == "wiz:cancel":
@@ -2101,7 +2144,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 f"Source: {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))} · Status: `{listing['status']}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"{preview_text}",
-                buttons=_listing_action_buttons(listing_id, listing["status"]),
+                buttons=_listing_action_buttons(listing),
                 parse_mode="markdown",
             )
             return
@@ -2339,8 +2382,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         f"Channel: {DEST_CHANNEL}\n"
                         f"Price: `DM`"
                     )
+                    published_view = dict(listing)
+                    published_view["published_message_id"] = published_msg_id
                     await event.client.send_message(
-                        ADMIN_USER_ID, confirmation, parse_mode="markdown",
+                        ADMIN_USER_ID,
+                        confirmation,
+                        buttons=_channel_view_buttons(published_view),
+                        parse_mode="markdown",
                     )
                 except Exception:
                     pass
@@ -2453,9 +2501,35 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 f"then Approve or Edit again.\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"{preview_text}",
-                buttons=_listing_action_buttons(listing_id, listing["status"]),
+                buttons=_listing_action_buttons(listing),
                 parse_mode="markdown",
             )
+            return
+
+        if state["step"] == "post_search":
+            if not text.isdigit():
+                await event.reply(
+                    f"❌ `{text}` isn't a post number — send a number like `12` "
+                    f"(or `/post 12`).",
+                    buttons=_home_keyboard(),
+                    parse_mode="markdown",
+                )
+                return
+            post = db.get_post_by_number(int(text))
+            if not post:
+                await event.reply(
+                    f"❌ No published post with number `#{text}`.",
+                    buttons=_home_keyboard(),
+                    parse_mode="markdown",
+                )
+                return
+            if prompt_message_id:
+                try:
+                    await bot.delete_messages(ADMIN_USER_ID, [prompt_message_id])
+                except Exception:
+                    pass
+            card, buttons = _post_card(post)
+            await event.reply(card, buttons=buttons, parse_mode="markdown")
             return
 
 
