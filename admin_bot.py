@@ -1157,7 +1157,10 @@ def _post_card(post: dict) -> Tuple[str, List[List[object]]]:
     src_url = _source_url(post)
     if src_url:
         buttons.append([Button.url("📥 View in source channel", src_url)])
-    buttons.append([Button.inline("🏠 Home", data="menu:home")])
+    buttons.append([
+        Button.inline("⬅️ Back", data="home:published"),
+        Button.inline("🏠 Home", data="menu:home"),
+    ])
     return "\n".join(lines), buttons
 
 
