@@ -112,6 +112,7 @@ async def send_approval_prompt(
             Button.inline("❌ Reject",  data=f"reject:{listing_id}"),
         ]
     ]
+    buttons.extend(_channel_view_buttons(listing))
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
@@ -151,6 +152,7 @@ async def send_failed_alert(
             Button.inline("🔁 Retry", data=f"retry:{listing_id}"),
         ]
     ]
+    buttons.extend(_channel_view_buttons(listing))
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
@@ -178,16 +180,7 @@ async def send_published_alert(
         f"━━━━━━━━━━━━━━━━━\n"
     )
 
-    buttons = []
-    src_url = _source_url(listing)
-    dest_url = _destination_url(listing)
-    if src_url or dest_url:
-        row = []
-        if src_url:
-            row.append(Button.url("View in Buyer channel", src_url))
-        if dest_url:
-            row.append(Button.url("View in my channel", dest_url))
-        buttons.append(row)
+    buttons = _channel_view_buttons(listing)
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
@@ -308,7 +301,7 @@ def _skip_notification(k: dict) -> Tuple[str, List[List[object]]]:
         "source_message_id": k.get("message_id"),
     })
     if src_url:
-        buttons[0].append(Button.url("📥 View in source channel", src_url))
+        buttons[0].append(Button.url("View in Buyer channel", src_url))
     return text, buttons
 
 
@@ -451,9 +444,25 @@ def _destination_url(listing: dict) -> Optional[str]:
     return _tgram_chat_link(ref, listing.get("published_message_id"))
 
 
+def _channel_view_buttons(listing: dict) -> List[List[object]]:
+    """One URL row linking back to the source ('Buyer channel') and, once a
+    post is live, forward to the republished copy in the destination channel.
+    Empty list when neither URL can be resolved."""
+    row = []
+    src_url = _source_url(listing)
+    if src_url:
+        row.append(Button.url("View in Buyer channel", src_url))
+    dest_url = _destination_url(listing)
+    if dest_url:
+        row.append(Button.url("View in my channel", dest_url))
+    if not row:
+        return []
+    return [row]
+
+
 def _asleep_label() -> str:
     """Label for the 'I'm Asleep' toggle button (mirrors the pause label)."""
-    return "☀️ I'm Awake" if db.is_buyer_asleep() else "😴 I'm Asleep"
+    return "☀️ I'm Awake" if db.is_buyer_asleep() else "💤 I'm Asleep"
 
 
 async def _message_delete_send(
@@ -481,18 +490,24 @@ async def _message_delete_send(
         logger.exception("Failed to send fresh message after delete-and-refresh")
 
 
-def _listing_action_buttons(listing_id: int, status: str) -> List[List[object]]:
+def _listing_action_buttons(listing: dict) -> List[List[object]]:
     """Inline actions shown with a preview: failed listings can be retried,
-    pending ones can be edited, then approved or rejected."""
+    pending ones can be edited, then approved or rejected. A 'View in Buyer
+    channel' link is appended when the source post resolves to a t.me URL."""
+    listing_id = listing["id"]
+    status = listing["status"]
     if status in ("failed", "error"):
-        return [[Button.inline("🔁 Retry", data=f"retry:{listing_id}")]]
-    return [
-        [
-            Button.inline("✏️ Edit", data=f"edit:{listing_id}"),
-            Button.inline("✅ Approve", data=f"approve:{listing_id}"),
-            Button.inline("❌ Reject", data=f"reject:{listing_id}"),
+        buttons = [[Button.inline("🔁 Retry", data=f"retry:{listing_id}")]]
+    else:
+        buttons = [
+            [
+                Button.inline("✏️ Edit", data=f"edit:{listing_id}"),
+                Button.inline("✅ Approve", data=f"approve:{listing_id}"),
+                Button.inline("❌ Reject", data=f"reject:{listing_id}"),
+            ]
         ]
-    ]
+    buttons.extend(_channel_view_buttons(listing))
+    return buttons
 
 
 # Wizard state: sender_id -> {"step": "add" | "edit", ...}
@@ -971,7 +986,7 @@ def _help_text() -> str:
         "• **📋 Sources** — add, manage, remove sources\n"
         f"• **{DESTINATIONS_BTN}** — add groups to forward copies of every bot post to\n"
         "• **✅ Published** — every post with its **#Post number** + channel & source links\n"
-        "• **🔢 /post 12** — jump straight to post #12\n"
+        "• ** /post 12** — jump straight to post #12\n"
         "• **⏸ All Stop / ▶ All Start** — pause or resume AUTOMATIC publishing only. "
         "Manual Approve taps still publish immediately.\n\n"
         "Slash shortcuts still work if you prefer typing them."
@@ -1058,50 +1073,39 @@ def _relative_time(iso_ts: Optional[str]) -> str:
     return f"{days // 7}w ago"
 
 
-# Per-reason icon map for the /skipped screen: reasons are scannable without
-# reading text. Every reason produced by the codebase (filters.py constants +
-# main.py's log_skip call sites) is covered; unknown/legacy rows get a neutral
-# fallback. Keep in sync with filters.REASON_* and main.py log_skip callers.
-SKIP_REASON_ICONS = {
-    "duplicate": "🔁",      # fingerprint duplicate within DEDUP_HOURS
-    "not_a_listing": "💬",  # AI judged the message as not a listing
-    "chatter": "🗨️",        # obvious chatter: rule posts, welcomes, pins
-    "no_content": "⬜",     # empty / whitespace-only body
-    "self_echo": "🔄",      # our own destination output looped back to a source
-}
-
-
-def _skip_reason_icon(reason: Optional[str]) -> str:
-    """Distinct icon per skip reason ('📄' for anything unmapped)."""
-    return SKIP_REASON_ICONS.get((reason or "").strip(), "📄")
-
-
 def _skipped_digest(skips: List[dict]) -> Tuple[str, List[List[object]]]:
     """Buttons-only recent-skips list.
 
-    The body is intentionally empty (a single em-dash placeholder): the "Skipped"
-    context already reads from the button that opened the screen, and each
-    Re-review button label carries a reason icon + reason + supplier + age
-    ('🔁 duplicate · @kycgroupke · 2h ago') so you can pick the right one at a
-    glance instead of reading a wall. Skips with no linked listing can't be
-    reopened, so those drop to a one-line count instead of a dead text entry."""
+    The body is intentionally short: each Re-review button label carries
+    reason -- supplier -- age ('duplicate -- @kycgroupke -- 2h ago') plus a
+    'View in Buyer channel' link back to the source post. Skips with no linked
+    listing can't be reopened, so those drop to a one-line count instead of a
+    dead text entry."""
     reopenable = [k for k in skips if k.get("listing_id")]
     buttons = []
     for k in reopenable:
         reason = (k.get("reason") or "unknown").replace("_", " ")
         src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
         age = _relative_time(k.get("timestamp"))
-        label = f"{_skip_reason_icon(k.get('reason'))} {reason} · {src}"
+        label = f"{reason} -- {src}"
         if age:
-            label += f" · {age}"
-        buttons.append([Button.inline(label, data=f"reskip:{k['skip_id']}")])
+            label += f" -- {age}"
+        row = [Button.inline(label, data=f"reskip:{k['skip_id']}")]
+        src_url = _source_url({
+            "supplier_username": k.get("channel_username"),
+            "supplier_channel_id": None,
+            "source_message_id": k.get("message_id"),
+        })
+        if src_url:
+            row.append(Button.url("View in Buyer channel", src_url))
+        buttons.append(row)
+    text = "🚫 **Skipped posts** — tap a button to open a post:\n"
     if reopenable:
-        text = "—"
         dropped = len(skips) - len(reopenable)
         if dropped:
             text += f"\n_({dropped} more recent skip(s) not re-reviewable — no listing linked.)_"
     else:
-        text = "**Skipped** — none of the recent skips can be re-opened."
+        text += "\n_None of the recent skips can be re-opened._"
     buttons.extend(_home_button_row())
     return text, buttons
 
@@ -1112,7 +1116,7 @@ def _published_digest(rows: List[dict]) -> Tuple[str, List[List[object]]]:
     Button A links the post's #number to the published post in our channel;
     Button B links the source group/channel name to the original source post.
     No text lines: the button labels carry all the meaning."""
-    text = "📜 **Published posts** — tap a button to open a post:\n"
+    text = " ✅ **Published posts** — tap a button to open a post:\n"
     buttons = []
     for p in rows:
         post_num = p.get("post_number")
@@ -1143,20 +1147,16 @@ def _post_card(post: dict) -> Tuple[str, List[List[object]]]:
     supplier = _pretty_source(post.get("supplier_username"), post.get("supplier_display_name"))
     if not supplier or supplier == "?":
         supplier = f"channel {post.get('supplier_channel_id')}"
-    published = (post.get("published_at") or "")[:16].replace("T", " ")
     lines = [
-        f"🔢 **Post #{post_number}**",
-        "━━━━━━━━━━━━━━━━━━━━",
+        f"**Post #{post_number}**",
+        "━━━━━━━━━",
         f"Platform : {platform}",
-        "Price    : DM",
         f"Supplier : {supplier}",
-        f"Published: {published}",
-        f"Listing  : `#{post.get('id')}`",
     ]
     buttons = []
     src_url = _source_url(post)
     if src_url:
-        buttons.append([Button.url("📥 View in source channel", src_url)])
+        buttons.append([Button.url("View in Buyer channel", src_url)])
     buttons.append([
         Button.inline("⬅️ Back", data="home:published"),
         Button.inline("🏠 Home", data="menu:home"),
@@ -1220,7 +1220,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             parse_mode="markdown",
         )
 
-    @bot.on(events.NewMessage(pattern=r"^(?:😴 I'm Asleep|☀️ I'm Awake)$"))
+    @bot.on(events.NewMessage(pattern=r"^(?:💤 I'm Asleep|☀️ I'm Awake)$"))
     async def handle_asleep_toggle(event):
         if not await check_admin(event):
             return
@@ -1228,7 +1228,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         await db.run_async(db.set_buyer_asleep, not asleep)
         if not asleep:
             state_label = (
-                "😴 **Asleep** — every new post now carries the footer\n"
+                "💤 **Asleep** — every new post now carries the footer\n"
                 "`Buyer away, back shortly`\n"
                 "Use the button again to switch it back off."
             )
@@ -1581,7 +1581,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 f"📄 **Preview of Listing #{arg}**\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"{preview_text}",
-                buttons=_listing_action_buttons(listing["id"], listing["status"]),
+                buttons=_listing_action_buttons(listing),
             )
         except Exception as exc:
             logger.warning("Preview too long to send for listing #%s: %s", arg, exc)
@@ -1707,7 +1707,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 asleep = db.is_buyer_asleep()
                 await db.run_async(db.set_buyer_asleep, not asleep)
                 await event.answer(
-                    "😴 Asleep — footer added to new posts" if not asleep
+                    "💤 Asleep — footer added to new posts" if not asleep
                     else "☀️ Awake — footer removed"
                 )
                 await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
@@ -2362,8 +2362,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         f"Channel: {DEST_CHANNEL}\n"
                         f"Price: `DM`"
                     )
+                    approved_view = dict(listing)
+                    approved_view["published_message_id"] = published_msg_id
                     await event.client.send_message(
-                        ADMIN_USER_ID, confirmation, parse_mode="markdown",
+                        ADMIN_USER_ID,
+                        confirmation,
+                        buttons=_channel_view_buttons(approved_view),
+                        parse_mode="markdown",
                     )
                 except Exception:
                     pass
@@ -2421,7 +2426,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         # Menu taps must not be swallowed while a wizard is waiting
         if text in ("📊 Status", "⏳ Pending", "⚠️ Failed", "📋 Sources", DESTINATIONS_BTN,
                     "⏸ All Stop", "▶ All Start", "❓ Help", "✅ Published",
-                    "😴 I'm Asleep", "☀️ I'm Awake"):
+                    "💤 I'm Asleep", "☀️ I'm Awake"):
             _wizard_state.pop(ADMIN_USER_ID, None)
             return
 

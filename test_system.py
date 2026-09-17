@@ -1683,7 +1683,7 @@ class TestMonitorSystem(unittest.TestCase):
         try:
             db.DEFAULT_DB_PATH = TEST_DB
             db.set_buyer_asleep(False, db_path=TEST_DB)
-            self.assertEqual(admin_bot._asleep_label(), "😴 I'm Asleep")
+            self.assertEqual(admin_bot._asleep_label(), "💤 I'm Asleep")
             db.set_buyer_asleep(True, db_path=TEST_DB)
             self.assertEqual(admin_bot._asleep_label(), "☀️ I'm Awake")
             db.set_buyer_asleep(False, db_path=TEST_DB)
@@ -1849,10 +1849,10 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("⬅️ Back", buttons[3][1].text)
 
     def test_skipped_digest_buttons_only(self):
-        """/skipped is buttons-first: empty body (em-dash placeholder), no
-        numbered/snippet wall; each Re-review button label carries
-        reason-icon · reason · supplier · age; non-reopenable skips drop to a
-        one-line count."""
+        """/skipped is buttons-first: short caption header, no numbered/snippet
+        wall; each Re-review button label carries reason -- supplier -- age and
+        a 'View in Buyer channel' link back to the source post; non-reopenable
+        skips drop to a one-line count."""
         import admin_bot
         from datetime import datetime, timedelta, timezone
 
@@ -1860,70 +1860,55 @@ class TestMonitorSystem(unittest.TestCase):
         skips = [
             {"skip_id": 42, "listing_id": 7, "reason": "duplicate",
              "channel_username": "kycgroupke", "display_name": None,
+             "message_id": 9001,
              "timestamp": (now - timedelta(hours=2)).isoformat(),
              "raw_text": "WTS Bybit account $100"},
             {"skip_id": 41, "listing_id": 6, "reason": "no_content",
              "channel_username": "src_b", "display_name": None,
+             "message_id": 9002,
              "timestamp": (now - timedelta(minutes=5)).isoformat(),
              "raw_text": "hello group"},
             {"skip_id": 40, "listing_id": None, "reason": "chatter",  # not reopenable
              "channel_username": "src_c", "display_name": None,
+             "message_id": 9003,
              "timestamp": (now - timedelta(hours=1)).isoformat(),
              "raw_text": "wassup"},
         ]
         text, buttons = admin_bot._skipped_digest(skips)
 
-        # Empty body: no redundant "Skipped — tap one..." line, no numbering,
-        # no snippet, no "Recently skipped", no emoji-heavy header.
-        self.assertTrue(text.strip().startswith("—"), text)
+        # Short caption header: no redundant "tap one to re-review", no
+        # numbering, no snippet, no "Recently skipped".
+        self.assertTrue(
+            text.strip().startswith("🚫 **Skipped posts** — tap a button to open a post:"),
+            text,
+        )
         self.assertNotIn("tap one to re-review", text)
-        self.assertNotIn("**Skipped**", text)
         self.assertNotIn("1.", text)
         self.assertNotIn("WTS Bybit", text)
         self.assertNotIn("hello group", text)
         self.assertNotIn("Recently skipped", text)
-        self.assertNotIn("🚫", text)
 
-        # Buttons carry reason-icon · reason · supplier · age, and only for
-        # reopenable skips.
+        # Buttons carry reason -- supplier -- age (no reason emojis), each with
+        # a 'View in Buyer channel' link, and only for reopenable skips.
         self.assertEqual(len(buttons), 3, "two skip rows + home row")
         labels = [b[0].text for b in buttons[:2]]
-        self.assertTrue(any(
-            l.startswith("🔁") and "duplicate" in l and "@kycgroupke" in l and "2h ago" in l
-            for l in labels
-        ))
-        self.assertTrue(any(
-            l.startswith("⬜") and "no content" in l and "@src_b" in l and "5m ago" in l
-            for l in labels
-        ))
+        self.assertIn("duplicate -- @kycgroupke -- 2h ago", labels)
+        self.assertIn("no content -- @src_b -- 5m ago", labels)
+        self.assertFalse(any(c in "".join(labels) for c in "🔁⬜💬🗨️🔄📄"),
+                         "no reason emojis in skipped-list labels")
         self.assertFalse(any("chatter" in l for l in labels), "non-reopenable skip has no button")
+
+        buyer_urls = [getattr(b, "url", None) for b in buttons[0]]
+        self.assertIn("View in Buyer channel", [b.text for b in buttons[0]])
+        self.assertIn("https://t.me/kycgroupke/9001", buyer_urls)
+        self.assertIn("https://t.me/src_b/9002",
+                      [getattr(b, "url", None) for b in buttons[1]])
 
         # Dropped skip is surfaced as a one-line count, not a dead screen entry.
         self.assertIn("1 more recent skip(s) not re-reviewable", text)
 
         home = buttons[-1][0].text
         self.assertTrue(home.startswith("🏠"))
-
-    def test_skip_reason_icon_mapping(self):
-        """Every production skip reason has its own distinct icon; unmapped
-        ones fall back to a neutral glyph."""
-        import admin_bot
-
-        self.assertEqual(
-            set(admin_bot.SKIP_REASON_ICONS),
-            {"duplicate", "not_a_listing", "chatter", "no_content", "self_echo"},
-            "icon map must cover every reason emitted by filters.py / main.py",
-        )
-        icons = list(admin_bot.SKIP_REASON_ICONS.values())
-        self.assertEqual(len(icons), len(set(icons)), "icons must all be distinct")
-        self.assertEqual(admin_bot._skip_reason_icon("duplicate"), "🔁")
-        self.assertEqual(admin_bot._skip_reason_icon("not_a_listing"), "💬")
-        self.assertEqual(admin_bot._skip_reason_icon("chatter"), "🗨️")
-        self.assertEqual(admin_bot._skip_reason_icon("no_content"), "⬜")
-        self.assertEqual(admin_bot._skip_reason_icon("self_echo"), "🔄")
-        self.assertEqual(admin_bot._skip_reason_icon("legacy_unknown"), "📄")
-        self.assertEqual(admin_bot._skip_reason_icon(""), "📄")
-        self.assertEqual(admin_bot._skip_reason_icon(None), "📄")
 
     def test_skipped_digest_buttons_only_none_reopenable(self):
         """When no recent skip can be reopened, say so instead of showing an
@@ -1935,7 +1920,8 @@ class TestMonitorSystem(unittest.TestCase):
              "channel_username": "src_c", "display_name": None,
              "timestamp": None, "raw_text": "x"},
         ])
-        self.assertIn("none of the recent skips can be re-opened", text)
+        self.assertIn("🚫 **Skipped posts**", text)
+        self.assertIn("None of the recent skips can be re-opened", text)
         self.assertEqual(len(buttons), 1, "just the home row")
         self.assertTrue(buttons[0][0].text.startswith("🏠"))
 
