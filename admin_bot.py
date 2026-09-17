@@ -1130,8 +1130,35 @@ def _published_digest(rows: List[dict]) -> Tuple[str, List[List[object]]]:
             row.append(Button.url(src_disp, src_url))
         if row:
             buttons.append(row)
+    buttons.append([Button.inline("Search Post", data="published:search")])
     buttons.extend(_home_button_row())
     return text, buttons
+
+
+def _post_card(post: dict) -> Tuple[str, List[List[object]]]:
+    """Render one published-post lookup card (shared by /post and the Published
+    screen's 'Search Post' button)."""
+    post_number = post.get("post_number")
+    platform = (post.get("platform_name") or post.get("game_name") or "?").title()
+    supplier = _pretty_source(post.get("supplier_username"), post.get("supplier_display_name"))
+    if not supplier or supplier == "?":
+        supplier = f"channel {post.get('supplier_channel_id')}"
+    published = (post.get("published_at") or "")[:16].replace("T", " ")
+    lines = [
+        f"🔢 **Post #{post_number}**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Platform : {platform}",
+        "Price    : DM",
+        f"Supplier : {supplier}",
+        f"Published: {published}",
+        f"Listing  : `#{post.get('id')}`",
+    ]
+    buttons = []
+    src_url = _source_url(post)
+    if src_url:
+        buttons.append([Button.url("📥 View in source channel", src_url)])
+    buttons.append([Button.inline("🏠 Home", data="menu:home")])
+    return "\n".join(lines), buttons
 
 
 def setup_admin_handlers(bot: TelegramClient) -> None:
@@ -1490,28 +1517,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 buttons=_home_keyboard(),
             )
             return
-        platform = (post.get("platform_name") or post.get("game_name") or "?").title()
-        supplier = post.get("supplier_username")
-        supplier_chat = post.get("supplier_channel_id")
-        src_disp = _pretty_source(supplier, post.get("supplier_display_name"))
-        if not src_disp or src_disp == "?":
-            src_disp = f"channel {supplier_chat}"
-        published = (post.get("published_at") or "")[:16].replace("T", " ")
-        lines = [
-            f"🔢 **Post #{arg}**",
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"Platform : {platform}",
-            "Price    : DM",
-            f"Supplier : {src_disp}",
-            f"Published: {published}",
-            f"Listing  : `#{post.get('id')}`",
-        ]
-        buttons = []
-        src_url = _source_url(post)
-        if src_url:
-            buttons.append([Button.url("📥 View in source channel", src_url)])
-        buttons.append([Button.inline("🏠 Home", data="menu:home")])
-        await event.reply("\n".join(lines), buttons=buttons, parse_mode="markdown")
+        text, buttons = _post_card(post)
+        await event.reply(text, buttons=buttons, parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/retry(?:[ \t]+(\d+))?"))
     async def handle_retry(event):
@@ -1726,6 +1733,27 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 text, buttons = _published_digest(rows)
                 await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
+            return
+
+        if data_str == "published:search":
+            _wizard_state[ADMIN_USER_ID] = {"step": "post_search"}
+            try:
+                sent = await event.client.send_message(
+                    ADMIN_USER_ID,
+                    "Search a published post — send the **post number** "
+                    "(the `#N` on each published card), e.g. `12`.",
+                    buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
+                    parse_mode="markdown",
+                )
+                prompt_id = getattr(sent, "id", None)
+                if prompt_id:
+                    _wizard_state[ADMIN_USER_ID]["prompt_message_id"] = prompt_id
+            except Exception:
+                logger.exception("Failed to send post search prompt")
+            try:
+                await event.delete()
+            except Exception:
+                pass
             return
 
         if data_str == "wiz:cancel":
@@ -2448,6 +2476,32 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 buttons=_listing_action_buttons(listing_id, listing["status"]),
                 parse_mode="markdown",
             )
+            return
+
+        if state["step"] == "post_search":
+            if not text.isdigit():
+                await event.reply(
+                    f"`{text}` isn't a post number — send a number like `12` "
+                    f"(or `/post 12`).",
+                    buttons=_home_keyboard(),
+                    parse_mode="markdown",
+                )
+                return
+            post = db.get_post_by_number(int(text))
+            if not post:
+                await event.reply(
+                    f"❌ No published post with number `#{text}`.",
+                    buttons=_home_keyboard(),
+                    parse_mode="markdown",
+                )
+                return
+            if prompt_message_id:
+                try:
+                    await bot.delete_messages(ADMIN_USER_ID, [prompt_message_id])
+                except Exception:
+                    pass
+            card, buttons = _post_card(post)
+            await event.reply(card, buttons=buttons, parse_mode="markdown")
             return
 
 
