@@ -1077,10 +1077,9 @@ def _skipped_digest(skips: List[dict]) -> Tuple[str, List[List[object]]]:
     """Buttons-only recent-skips list.
 
     The body is intentionally short: each Re-review button label carries
-    reason -- supplier -- age ('duplicate -- @kycgroupke -- 2h ago') plus a
-    'View in Buyer channel' link back to the source post. Skips with no linked
-    listing can't be reopened, so those drop to a one-line count instead of a
-    dead text entry."""
+    reason -- supplier -- age ('duplicate -- @kycgroupke -- 2h ago'). Skips
+    with no linked listing can't be reopened, so those drop to a one-line
+    count instead of a dead text entry."""
     reopenable = [k for k in skips if k.get("listing_id")]
     buttons = []
     for k in reopenable:
@@ -1090,15 +1089,7 @@ def _skipped_digest(skips: List[dict]) -> Tuple[str, List[List[object]]]:
         label = f"{reason} -- {src}"
         if age:
             label += f" -- {age}"
-        row = [Button.inline(label, data=f"reskip:{k['skip_id']}")]
-        src_url = _source_url({
-            "supplier_username": k.get("channel_username"),
-            "supplier_channel_id": None,
-            "source_message_id": k.get("message_id"),
-        })
-        if src_url:
-            row.append(Button.url("View in Buyer channel", src_url))
-        buttons.append(row)
+        buttons.append([Button.inline(label, data=f"reskip:{k['skip_id']}")])
     text = "🚫 **Skipped posts** — tap a button to open a post:\n"
     if reopenable:
         dropped = len(skips) - len(reopenable)

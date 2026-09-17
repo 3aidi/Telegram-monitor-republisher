@@ -1850,9 +1850,8 @@ class TestMonitorSystem(unittest.TestCase):
 
     def test_skipped_digest_buttons_only(self):
         """/skipped is buttons-first: short caption header, no numbered/snippet
-        wall; each Re-review button label carries reason -- supplier -- age and
-        a 'View in Buyer channel' link back to the source post; non-reopenable
-        skips drop to a one-line count."""
+        wall; each Re-review button label carries reason -- supplier -- age;
+        non-reopenable skips drop to a one-line count."""
         import admin_bot
         from datetime import datetime, timedelta, timezone
 
@@ -1860,17 +1859,14 @@ class TestMonitorSystem(unittest.TestCase):
         skips = [
             {"skip_id": 42, "listing_id": 7, "reason": "duplicate",
              "channel_username": "kycgroupke", "display_name": None,
-             "message_id": 9001,
              "timestamp": (now - timedelta(hours=2)).isoformat(),
              "raw_text": "WTS Bybit account $100"},
             {"skip_id": 41, "listing_id": 6, "reason": "no_content",
              "channel_username": "src_b", "display_name": None,
-             "message_id": 9002,
              "timestamp": (now - timedelta(minutes=5)).isoformat(),
              "raw_text": "hello group"},
             {"skip_id": 40, "listing_id": None, "reason": "chatter",  # not reopenable
              "channel_username": "src_c", "display_name": None,
-             "message_id": 9003,
              "timestamp": (now - timedelta(hours=1)).isoformat(),
              "raw_text": "wassup"},
         ]
@@ -1888,8 +1884,8 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertNotIn("hello group", text)
         self.assertNotIn("Recently skipped", text)
 
-        # Buttons carry reason -- supplier -- age (no reason emojis), each with
-        # a 'View in Buyer channel' link, and only for reopenable skips.
+        # Buttons carry reason -- supplier -- age (no reason emojis), one
+        # button per row, and only for reopenable skips.
         self.assertEqual(len(buttons), 3, "two skip rows + home row")
         labels = [b[0].text for b in buttons[:2]]
         self.assertIn("duplicate -- @kycgroupke -- 2h ago", labels)
@@ -1897,12 +1893,8 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertFalse(any(c in "".join(labels) for c in "🔁⬜💬🗨️🔄📄"),
                          "no reason emojis in skipped-list labels")
         self.assertFalse(any("chatter" in l for l in labels), "non-reopenable skip has no button")
-
-        buyer_urls = [getattr(b, "url", None) for b in buttons[0]]
-        self.assertIn("View in Buyer channel", [b.text for b in buttons[0]])
-        self.assertIn("https://t.me/kycgroupke/9001", buyer_urls)
-        self.assertIn("https://t.me/src_b/9002",
-                      [getattr(b, "url", None) for b in buttons[1]])
+        self.assertEqual(len(buttons[:2][0]), 1, "one button per skip row")
+        self.assertEqual(len(buttons[:2][1]), 1)
 
         # Dropped skip is surfaced as a one-line count, not a dead screen entry.
         self.assertIn("1 more recent skip(s) not re-reviewable", text)
