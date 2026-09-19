@@ -561,15 +561,33 @@ def _channel_id_from_fwd(fwd) -> Optional[int]:
 def _supplier_ref_from_text(text: str) -> Tuple[Optional[str], Optional[int]]:
     """Parse a channel reference -> (username_str, numeric_id_or_None).
 
-    Accepts '@handle', bare 'handle', 't.me/handle' links and numeric ids like
-    '-1001234567890'. Usernames are lowercased and stripped of '@'; numeric ids
-    are returned as ints.
+    Accepts '@handle', bare 'handle', 't.me/handle' links, private chat links like
+    't.me/c/1234567890/123', and numeric ids like '-1001234567890'.
+    Usernames are lowercased and stripped of '@'; numeric ids are returned as ints.
     """
     ref = (text or "").strip()
     if not ref:
         return None, None
+    # Support t.me/c/1234567890/123 private channel links
+    m_c = re.match(
+        r"(?:https?://)?(?:t\.me|telegram\.me)/c/(\d+)(?:/\d+)?/?$",
+        ref,
+        re.IGNORECASE,
+    )
+    if m_c:
+        bare_id = int(m_c.group(1))
+        marked = db.normalize_channel_id(bare_id)
+        return str(marked), marked
+    # Support t.me/+hash or t.me/joinchat/hash invite links
+    m_inv = re.match(
+        r"(?:https?://)?(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_-]+)/?$",
+        ref,
+        re.IGNORECASE,
+    )
+    if m_inv:
+        return ref, None
     m = re.match(
-        r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)$",
+        r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)/?$",
         ref,
         re.IGNORECASE,
     )
@@ -851,7 +869,11 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             try:
                 entity = await user_client_ref.get_entity(chat_ref)
             except Exception:
-                entity = None
+                try:
+                    await user_client_ref.get_dialogs(limit=50)
+                    entity = await user_client_ref.get_entity(chat_ref)
+                except Exception:
+                    entity = None
         display = _entity_display(entity, fallback=f"chat {chat_ref}")
         await db.run_async(db.add_destination, chat_ref, display, True)
         await db.run_async(
@@ -869,7 +891,8 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
         return
 
     username, numeric = _supplier_ref_from_text(text)
-    if not username:
+    raw_text = (text or "").strip()
+    if not username and not raw_text.startswith("http"):
         await event.reply(
             "I couldn't read a chat reference from that. Send a group username "
             "(e.g. `@mygroup`), a numeric ID (e.g. `-1001234567890`), or forward "
@@ -880,22 +903,27 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
 
     entity = None
     if user_client_ref and user_client_ref.is_connected():
-        reference = int(numeric) if numeric is not None else username
+        reference = int(numeric) if numeric is not None else (username or raw_text)
         try:
             entity = await user_client_ref.get_entity(reference)
         except Exception as exc:
-            logger.warning("Could not resolve destination reference %r: %s", username, exc)
+            logger.warning("Could not resolve destination reference %r: %s", reference, exc)
+            try:
+                await user_client_ref.get_dialogs(limit=50)
+                entity = await user_client_ref.get_entity(reference)
+            except Exception:
+                pass
 
     if entity is not None:
         entity_id = db.normalize_channel_id(entity)
         entity_username = (
             (getattr(entity, "username", None) or "").strip().lstrip("@") or None
         )
-        display = _entity_display(entity, fallback=username)
+        display = _entity_display(entity, fallback=username or raw_text)
         store_ref = (
             f"@{entity_username.lower()}"
             if entity_username
-            else (str(entity_id) if entity_id else username)
+            else (str(entity_id) if entity_id else username or raw_text)
         )
         await db.run_async(db.add_destination, store_ref, display, True)
         await db.run_async(
@@ -913,17 +941,19 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
         return
 
     if numeric is not None:
-        display = f"chat {numeric}"
-        await db.run_async(db.add_destination, numeric, display, True)
+        marked_id = db.normalize_channel_id(numeric)
+        display = f"chat {marked_id}"
+        await db.run_async(db.add_destination, marked_id, display, True)
         await db.run_async(
             db.record_audit,
             "destination_added",
             None,
             actor_id=ADMIN_USER_ID,
-            detail=f"{numeric} (numeric) -> {display}",
+            detail=f"{marked_id} (numeric) -> {display}",
         )
         await event.reply(
-            f"✅ **Destination added**: `{display}` (ID `{numeric}`)",
+            f"✅ **Destination added**: `{display}` (ID `{marked_id}`)\n"
+            f"Every bot post published from now on will be forwarded here.",
             buttons=_home_keyboard(),
         )
         return
@@ -2275,10 +2305,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 # auto-publish path so admin-approve and worker never interleave.
                 await publish_guard.throttle()
                 published_msg_id = None
+                dest_peer = db.to_peer_reference(DEST_CHANNEL)
                 try:
                     sent_msg = await publish_guard.run_with_floodwait_retry(
                         lambda text=republished_text, ent=entities: user_client_ref.send_message(
-                            DEST_CHANNEL, text,
+                            dest_peer, text,
                             formatting_entities=ent
                         ),
                         f"approve send listing #{listing_id}",

@@ -539,9 +539,10 @@ async def publish_to_destination(
     await publish_guard.throttle()
     delay = 3
     last_error = "unknown error"
+    dest_peer = db.to_peer_reference(DEST_CHANNEL)
     for attempt in range(1, PUBLISH_MAX_RETRIES + 1):
         try:
-            sent = await client.send_message(DEST_CHANNEL, text, formatting_entities=entities)
+            sent = await client.send_message(dest_peer, text, formatting_entities=entities)
             _mark_publish()
             return sent.id
         except asyncio.CancelledError:
@@ -637,13 +638,37 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
     pending = await db.run_async(db.get_pending_forwardings, 10)
     for row in pending:
         fwd_id = row["id"]
+        to_peer = db.to_peer_reference(row["destination_chat_id"])
+        from_peer = db.to_peer_reference(row["published_chat_id"])
+
+        async def _forward_call():
+            try:
+                return await client.forward_messages(
+                    to_peer,
+                    messages=[row["published_message_id"]],
+                    from_peer=from_peer,
+                )
+            except (ValueError, ChannelInvalidError) as res_err:
+                # If the peer wasn't cached in this session yet (e.g. private group),
+                # refresh dialogs to fetch entity access_hash and retry once.
+                logger.info(
+                    "Destination peer %s not resolved (%s); refreshing dialogs and retrying...",
+                    row["destination_chat_id"],
+                    res_err,
+                )
+                try:
+                    await client.get_dialogs(limit=50)
+                except Exception as diag_err:
+                    logger.debug("Failed refreshing dialogs during forward retry: %s", diag_err)
+                return await client.forward_messages(
+                    to_peer,
+                    messages=[row["published_message_id"]],
+                    from_peer=from_peer,
+                )
+
         try:
             await publish_guard.run_with_floodwait_retry(
-                lambda _row=row: client.forward_messages(
-                    _row["destination_chat_id"],
-                    messages=[_row["published_message_id"]],
-                    from_peer=_row["published_chat_id"],
-                ),
+                _forward_call,
                 f"forward listing #{row['listing_id']} "
                 f"msg {row['published_message_id']} to {row['destination_chat_id']}",
                 max_total_sleep=FORWARD_FLOODWAIT_BUDGET_SECONDS,
@@ -1248,9 +1273,10 @@ async def process_edited_message(client: TelegramClient, event) -> None:
     )
 
     published_msg_id = existing["published_message_id"]
+    dest_peer = db.to_peer_reference(DEST_CHANNEL)
     try:
         await client.edit_message(
-            DEST_CHANNEL, published_msg_id, updated_text,
+            dest_peer, published_msg_id, updated_text,
             formatting_entities=entities
         )
         await db.run_async(
@@ -1560,6 +1586,12 @@ async def main() -> None:
         db.prune_ai_cache(AI_CACHE_TTL_HOURS)
     except Exception:
         logger.exception("Could not prune AI analysis cache at startup")
+    try:
+        unresolved_reset = db.reset_unresolved_forwardings()
+        if unresolved_reset:
+            logger.info("Reset %d forwardings with resolution errors for immediate retry.", unresolved_reset)
+    except Exception:
+        logger.exception("Could not reset unresolved forwardings at startup")
     env_seed_notice = db.validate_env_seed_config(SOURCE_CHANNELS_RAW)
     if env_seed_notice:
         logger.warning("%s", env_seed_notice)
@@ -1633,6 +1665,11 @@ async def main() -> None:
                 logger.exception("Unhandled error processing deleted message")
 
     await user_client.start()
+    try:
+        await user_client.get_dialogs(limit=50)
+        logger.debug("Warmed up user client dialogs cache.")
+    except Exception:
+        logger.debug("Could not pre-warm user client dialogs cache.")
     if MANUAL_MODE:
         # Manual mode: no supplier resolution, no ingestion, no auto-publish —
         # just the user client + admin bot ready for approval/repair work.

@@ -378,6 +378,7 @@ class TestMonitorSystem(unittest.TestCase):
         dump = (
             "1)🇪🇺 [1234567890123456789]\n"
             "2)🇫🇷 [2234567890123456789]\n"
+            "3)🚩 [3234567890123456789]\n"
             "garbage line without brackets\n"
         )
         mapping, errors = countries.build_flags2024_mapping(dump)
@@ -2934,7 +2935,7 @@ class TestDestinationsForwarding(unittest.TestCase):
 
         class _FakeClient:
             async def forward_messages(self, to_entity, messages, from_peer):
-                if to_entity == "-100712":
+                if to_entity in (-100712, "-100712"):
                     raise _flood_err()
                 delivered.append(to_entity)
                 return object()
@@ -2953,7 +2954,7 @@ class TestDestinationsForwarding(unittest.TestCase):
         finally:
             db.DEFAULT_DB_PATH = old_default
 
-        self.assertEqual(delivered, ["-100710"], "non-flooded destination still delivered")
+        self.assertEqual(delivered, [-100710], "non-flooded destination still delivered")
         self.assertGreaterEqual(calls["n"], 1, "the flooded destination was attempted")
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
@@ -2978,7 +2979,7 @@ class TestDestinationsForwarding(unittest.TestCase):
 
         class _FakeClient:
             async def forward_messages(self, to_entity, messages, from_peer):
-                if to_entity == "-100812":
+                if to_entity in (-100812, "-100812"):
                     raise ChatWriteForbiddenError(request=None)
                 delivered.append(to_entity)
                 return object()
@@ -2993,7 +2994,7 @@ class TestDestinationsForwarding(unittest.TestCase):
         finally:
             db.DEFAULT_DB_PATH = old_default
 
-        self.assertEqual(delivered, ["-100810"])
+        self.assertEqual(delivered, [-100810])
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -3082,6 +3083,84 @@ class TestDestinationsForwarding(unittest.TestCase):
             re.compile(admin_mod.DESTINATIONS_ROUTE_RE).match("📋 Sources"),
             "Sources text must not be swallowed by the Destinations router",
         )
+
+    def test_to_peer_reference_numeric_and_username(self):
+        """to_peer_reference must convert numeric strings to int, leaving usernames as str."""
+        self.assertEqual(db.to_peer_reference("-1004444128274"), -1004444128274)
+        self.assertEqual(db.to_peer_reference("4444128274"), 4444128274)
+        self.assertEqual(db.to_peer_reference(-1004444128274), -1004444128274)
+        self.assertEqual(db.to_peer_reference("@mygroup"), "@mygroup")
+        self.assertEqual(db.to_peer_reference("  @MyGroup  "), "@MyGroup")
+        self.assertIsNone(db.to_peer_reference(None))
+
+    def test_reset_unresolved_forwardings(self):
+        """reset_unresolved_forwardings resets rows with resolution errors to pending."""
+        db_path = self._fresh_db("reset_fwd.db")
+        db.add_destination("-100999", "Group", db_path=db_path)
+        db.queue_forwarding(1, "@chan", 100, db_path=db_path)
+        pending = db.get_pending_forwardings(db_path=db_path)
+        fwd_id = pending[0]["id"]
+        db.mark_forward_failed(
+            fwd_id,
+            'Cannot find any entity corresponding to "-100999"',
+            permanent=False,
+            db_path=db_path,
+        )
+        row = self._sql(fwd_id, db_path=db_path)
+        self.assertEqual(row["retry_count"], 1)
+        self.assertIsNotNone(row["retry_at"])
+
+        count = db.reset_unresolved_forwardings(db_path=db_path)
+        self.assertEqual(count, 1)
+        row = self._sql(fwd_id, db_path=db_path)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["retry_count"], 0)
+        self.assertIsNone(row["retry_at"])
+        os.remove(db_path)
+
+    def test_forward_queue_drain_retries_with_dialog_refresh(self):
+        """When an entity is not cached in the session, _drain_forward_queue refreshes dialogs and retries."""
+        db_path = self._fresh_db("dest_dialog_refresh.db")
+        db.add_destination("-1004444128274", "Private Group", db_path=db_path)
+        db.queue_forwarding(1, "@chan", 900, db_path=db_path)
+
+        calls = {"forward": 0, "dialogs": 0}
+
+        class _MockClient:
+            async def get_dialogs(self, limit=50):
+                calls["dialogs"] += 1
+
+            async def forward_messages(self, to_entity, messages, from_peer):
+                calls["forward"] += 1
+                if calls["forward"] == 1:
+                    raise ValueError('Cannot find any entity corresponding to "-1004444128274"')
+                return object()
+
+        import asyncio
+        import main as _main
+        old_default = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = db_path
+        try:
+            asyncio.run(_main._drain_forward_queue(_MockClient()))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+
+        self.assertEqual(calls["dialogs"], 1, "get_dialogs must be called to refresh entity cache")
+        self.assertEqual(calls["forward"], 2, "forward_messages must retry after get_dialogs")
+        row = self._sql(1, db_path=db_path)
+        self.assertEqual(row["status"], "forwarded")
+        os.remove(db_path)
+
+    def test_supplier_ref_from_text_private_chat_links(self):
+        """_supplier_ref_from_text handles t.me/c/<id>/<msg> and t.me/+hash invite links."""
+        import admin_bot as admin_mod
+        str_ref, num_ref = admin_mod._supplier_ref_from_text("https://t.me/c/4444128274/123")
+        self.assertEqual(num_ref, -1004444128274)
+        self.assertEqual(str_ref, "-1004444128274")
+
+        str_inv, num_inv = admin_mod._supplier_ref_from_text("https://t.me/+AbCdEf_123")
+        self.assertIsNone(num_inv)
+        self.assertEqual(str_inv, "https://t.me/+AbCdEf_123")
 
 
 if __name__ == "__main__":

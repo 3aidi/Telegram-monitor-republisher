@@ -1,4 +1,4 @@
-﻿"""Database layer for Telegram Monitor & Republisher using SQLite."""
+"""Database layer for Telegram Monitor & Republisher using SQLite."""
 
 import asyncio
 import hashlib
@@ -1956,6 +1956,49 @@ def prune_ai_cache(max_age_hours: float = 48, db_path: Optional[str] = None) -> 
 # Conceptually the forwarding twin of sources: same management semantics
 # (add / list / enable-disable / remove) but used purely as forward targets.
 # ---------------------------------------------------------------------------
+
+
+def to_peer_reference(chat_id: Any) -> Any:
+    """Convert a stored chat/channel reference to the type expected by Telethon.
+
+    Telethon expects integer IDs as `int` (bare or -100 marked) so it can look
+    them up in its session entity cache. Passing numeric strings (e.g. '-1004444128274')
+    causes Telethon to attempt username/phone string lookup and fail with
+    'Cannot find any entity corresponding to ...'. Public usernames ('@handle')
+    remain strings.
+    """
+    if chat_id is None:
+        return None
+    if isinstance(chat_id, int):
+        return chat_id
+    if isinstance(chat_id, str):
+        s = chat_id.strip()
+        if is_numeric_identifier(s):
+            return int(s)
+        return s
+    return chat_id
+
+
+def reset_unresolved_forwardings(db_path: Optional[str] = None) -> int:
+    """Reset forwardings that were blocked by entity resolution string errors.
+
+    When destinations or channels were stored as strings like '-100...',
+    Telethon failed with 'Cannot find any entity corresponding to ...'.
+    Resetting them to 'pending' with retry_count=0 and retry_at=NULL allows
+    the forwarder to retry them with proper integer peer resolution immediately.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        cur = conn.execute(
+            """
+            UPDATE forwardings
+            SET status = 'pending', retry_count = 0, retry_at = NULL, updated_at = ?
+            WHERE error LIKE '%Cannot find any entity%'
+               OR error LIKE '%Could not find the input entity%'
+            """,
+            (now_iso,),
+        )
+        return cur.rowcount
 
 
 def _destination_chat_ref(chat_id) -> Optional[str]:
