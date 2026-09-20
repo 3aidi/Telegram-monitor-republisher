@@ -1210,7 +1210,7 @@ def requeue_listing(listing_id: int, db_path: Optional[str] = None) -> bool:
 
 
 def get_failed_listings(
-    limit: int = 10, db_path: Optional[str] = None
+    limit: int = 10, offset: int = 0, db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """Return failed listings (DLQ) ordered oldest-first.
 
@@ -1226,11 +1226,23 @@ def get_failed_listings(
             LEFT JOIN suppliers s ON l.supplier_id = s.id
             WHERE l.status IN ('failed', 'error')
             ORDER BY l.updated_at ASC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (limit,),
+            (limit, offset),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def count_failed_listings(db_path: Optional[str] = None) -> int:
+    """Total failed listings (same filter as get_failed_listings)."""
+    with db_session(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM listings
+            WHERE status IN ('failed', 'error')
+            """
+        ).fetchone()
+        return int(row["c"])
 
 
 def get_listing_by_source(
@@ -1428,7 +1440,7 @@ def get_skip_reasons_today(db_path: Optional[str] = None) -> Dict[str, int]:
 
 
 def get_skipped_listings(
-    limit: int = 10, db_path: Optional[str] = None
+    limit: int = 10, offset: int = 0, db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """Most recent skipped messages, joined with their supplier (and the linked
     listing row, when one exists) for the admin /skipped review screen."""
@@ -1442,11 +1454,18 @@ def get_skipped_listings(
         LEFT JOIN listings l ON l.supplier_id = k.supplier_id
                             AND l.source_message_id = k.message_id
         ORDER BY k.id DESC
-        LIMIT ?
+        LIMIT ? OFFSET ?
     """
     with db_session(db_path) as conn:
-        rows = conn.execute(query, (limit,)).fetchall()
+        rows = conn.execute(query, (limit, offset)).fetchall()
         return [dict(row) for row in rows]
+
+
+def count_skipped_listings(db_path: Optional[str] = None) -> int:
+    """Total skipped messages (same filter as get_skipped_listings)."""
+    with db_session(db_path) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM skips").fetchone()
+        return int(row["c"])
 
 
 def reopen_skipped(
@@ -1581,7 +1600,7 @@ def get_today_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
 
 
 def get_pending_listings(
-    limit: int = 10, db_path: Optional[str] = None
+    limit: int = 10, offset: int = 0, db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """Retrieve listings pending admin approval."""
     query = """
@@ -1591,11 +1610,23 @@ def get_pending_listings(
         LEFT JOIN suppliers s ON l.supplier_id = s.id
         WHERE l.status IN ('pending_approval', 'pending_review')
         ORDER BY l.id ASC
-        LIMIT ?
+        LIMIT ? OFFSET ?
     """
     with db_session(db_path) as conn:
-        rows = conn.execute(query, (limit,)).fetchall()
+        rows = conn.execute(query, (limit, offset)).fetchall()
         return [dict(row) for row in rows]
+
+
+def count_pending_listings(db_path: Optional[str] = None) -> int:
+    """Total listings pending approval (same filter as get_pending_listings)."""
+    with db_session(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM listings
+            WHERE status IN ('pending_approval', 'pending_review')
+            """
+        ).fetchone()
+        return int(row["c"])
 
 
 def get_unpublished_listings(
@@ -1647,7 +1678,7 @@ def get_approved_listings_to_publish(
 
 
 def get_published_listings(
-    limit: int = 10, db_path: Optional[str] = None
+    limit: int = 10, offset: int = 0, db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Recently published listings (with channel post ids) plus their supplier,
@@ -1662,11 +1693,23 @@ def get_published_listings(
         WHERE l.status = 'published'
           AND l.published_message_id IS NOT NULL
         ORDER BY l.post_number IS NULL, l.post_number DESC, l.id DESC
-        LIMIT ?
+        LIMIT ? OFFSET ?
     """
     with db_session(db_path) as conn:
-        rows = conn.execute(query, (limit,)).fetchall()
+        rows = conn.execute(query, (limit, offset)).fetchall()
         return [dict(row) for row in rows]
+
+
+def count_published_listings(db_path: Optional[str] = None) -> int:
+    """Total published listings (same filter as get_published_listings)."""
+    with db_session(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM listings
+            WHERE status = 'published' AND published_message_id IS NOT NULL
+            """
+        ).fetchone()
+        return int(row["c"])
 
 
 def next_post_number(db_path: Optional[str] = None) -> int:

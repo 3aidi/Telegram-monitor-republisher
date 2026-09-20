@@ -765,18 +765,69 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
     )
 
 
-def _sources_menu_text(suppliers: List[dict]) -> str:
+_PAGE_SIZE = 6
+
+
+def _page_window(total: int, page: int) -> Tuple[int, int, int, bool, bool]:
+    """Compute pagination indices for a zero-based ``page``.
+
+    Returns ``(start, end, page_count, has_prev, has_next)``. Negative pages
+    clamp to 0; pages past the final page clamp to the last valid page;
+    ``total=0`` yields an empty first page so callers render the normal empty
+    result instead of crashing. The returned ``start`` is always ``page * _PAGE_SIZE``
+    for the clamped page.
+    """
+    if total <= 0:
+        return 0, 0, 1, False, False
+    page_count = (total + _PAGE_SIZE - 1) // _PAGE_SIZE
+    page = max(0, min(int(page), page_count - 1))
+    start = page * _PAGE_SIZE
+    end = min(start + _PAGE_SIZE, total)
+    return start, end, page_count, page > 0, end < total
+
+
+def _nav_row(kind: str, page: int, page_count: int) -> List[List[object]]:
+    """Pagination row: [⬅️ Prev] [2/4] [➡️ Next]; empty when single-page.
+
+    The center indicator is a self-referencing inline button so it renders as a
+    static label while still satisfying Telegram's inline-button requirement."""
+    if page_count <= 1:
+        return []
+    row = []
+    if page > 0:
+        row.append(Button.inline("⬅️ Prev", data=f"{kind}:page:{page - 1}"))
+    row.append(Button.inline(f"{page + 1}/{page_count}", data=f"{kind}:page:{page}"))
+    if page + 1 < page_count:
+        row.append(Button.inline("➡️ Next", data=f"{kind}:page:{page + 1}"))
+    return [row]
+
+
+def _page_footer(page: int, page_count: int) -> str:
+    """'Page X of Y' for multi-page lists; '' for a single page."""
+    if page_count <= 1:
+        return ""
+    return f"Page {page + 1} of {page_count}"
+
+
+def _sources_menu_text(suppliers: List[dict], page: int = 0) -> str:
     if not suppliers:
         return "No sources configured yet."
-    return "Tap a source below to manage it."
+    _, _, page_count, _, _ = _page_window(len(suppliers), page)
+    footer = _page_footer(page, page_count)
+    msg = "Tap a source below to manage it."
+    if footer:
+        msg += f"\n\n{footer}"
+    return msg
 
 
-def _sources_buttons(suppliers: List[dict]) -> List[List[object]]:
+def _sources_buttons(suppliers: List[dict], page: int = 0) -> List[List[object]]:
+    start, end, page_count, _, _ = _page_window(len(suppliers), page)
     buttons = []
-    for s in suppliers[:12]:
+    for s in suppliers[start:end]:
         icon = _source_status_icon(s)
         label = f"{icon} {_pretty_source(s.get('channel_username'), s.get('display_name'))}"
         buttons.append([Button.inline(label, data=f"sup:{s['id']}")])
+    buttons.extend(_nav_row("sup", page, page_count))
     buttons.append([
         Button.inline("➕ Add Source", data="supadd"),
         Button.inline("⬅️ Back", data="menu:home"),
@@ -801,23 +852,28 @@ def _destination_label(d: dict) -> str:
     return ref or "?"
 
 
-def _destinations_menu_text(destinations: List[dict]) -> str:
+def _destinations_menu_text(destinations: List[dict], page: int = 0) -> str:
     if not destinations:
         return (
             "No destinations configured — \n\nTap **➕ Add Destination** to start forwarding "
             "posts there too."
         )
-    return (
-        "\nTap a destination below to manage it.\n\n"
-    )
+    _, _, page_count, _, _ = _page_window(len(destinations), page)
+    footer = _page_footer(page, page_count)
+    msg = "\nTap a destination below to manage it.\n\n"
+    if footer:
+        msg += footer + "\n"
+    return msg
 
 
-def _destinations_buttons(destinations: List[dict]) -> List[List[object]]:
+def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[object]]:
+    start, end, page_count, _, _ = _page_window(len(destinations), page)
     buttons = []
-    for d in destinations[:12]:
+    for d in destinations[start:end]:
         icon = _destination_icon(d)
         label = f"{icon} {_destination_label(d)}"
         buttons.append([Button.inline(label, data=f"dest:{d['id']}")])
+    buttons.extend(_nav_row("dest", page, page_count))
     buttons.append([
         Button.inline("➕ Add Destination", data="destadd"),
         Button.inline("⬅️ Back", data="menu:home"),
@@ -1058,7 +1114,9 @@ def _status_report_text() -> str:
     return msg
 
 
-def _failed_digest(failed: List[dict]) -> Tuple[str, List[List[object]]]:
+def _failed_digest(
+    failed: List[dict], page: int = 0, total: Optional[int] = None
+) -> Tuple[str, List[List[object]]]:
     lines = ["⚠️ **Failed Listings (DLQ)** — tap an action below:\n"]
     for i, l in enumerate(failed, 1):
         lines.append(_format_listing(i, l))
@@ -1071,6 +1129,13 @@ def _failed_digest(failed: List[dict]) -> Tuple[str, List[List[object]]]:
             Button.inline(f"👁️ #{l['id']} Preview", data=f"preview:{l['id']}"),
             Button.inline(f"🔁 #{l['id']} Retry", data=f"retry:{l['id']}"),
         ])
+    if total is not None:
+        total = max(int(total), len(failed))
+        _, _, page_count, _, _ = _page_window(total, page)
+        footer = _page_footer(page, page_count)
+        if footer:
+            lines.append(f"\n{footer}")
+        buttons.extend(_nav_row("fail", page, page_count))
     buttons.extend(_home_button_row())
     return "\n".join(lines), buttons
 
@@ -1103,7 +1168,9 @@ def _relative_time(iso_ts: Optional[str]) -> str:
     return f"{days // 7}w ago"
 
 
-def _skipped_digest(skips: List[dict]) -> Tuple[str, List[List[object]]]:
+def _skipped_digest(
+    skips: List[dict], page: int = 0, total: Optional[int] = None
+) -> Tuple[str, List[List[object]]]:
     """Buttons-only recent-skips list.
 
     The body is intentionally short: each Re-review button label carries
@@ -1127,11 +1194,20 @@ def _skipped_digest(skips: List[dict]) -> Tuple[str, List[List[object]]]:
             text += f"\n_({dropped} more recent skip(s) not re-reviewable — no listing linked.)_"
     else:
         text += "\n_None of the recent skips can be re-opened._"
+    if total is not None:
+        total = max(int(total), len(skips))
+        _, _, page_count, _, _ = _page_window(total, page)
+        footer = _page_footer(page, page_count)
+        if footer:
+            text += f"\n\n{footer}"
+        buttons.extend(_nav_row("skip", page, page_count))
     buttons.extend(_home_button_row())
     return text, buttons
 
 
-def _published_digest(rows: List[dict]) -> Tuple[str, List[List[object]]]:
+def _published_digest(
+    rows: List[dict], page: int = 0, total: Optional[int] = None
+) -> Tuple[str, List[List[object]]]:
     """Buttons-only published list: per post ONE row of two no-emoji URL buttons.
 
     Button A links the post's #number to the published post in our channel;
@@ -1155,9 +1231,44 @@ def _published_digest(rows: List[dict]) -> Tuple[str, List[List[object]]]:
             row.append(Button.url(src_disp, src_url))
         if row:
             buttons.append(row)
+    if total is not None:
+        total = max(int(total), len(rows))
+        _, _, page_count, _, _ = _page_window(total, page)
+        footer = _page_footer(page, page_count)
+        if footer:
+            text += f"\n\n{footer}"
+        buttons.extend(_nav_row("pub", page, page_count))
     buttons.append([Button.inline("Search Post", data="published:search")])
     buttons.extend(_home_button_row())
     return text, buttons
+
+
+async def _send_pending_page(event, page: int = 0) -> None:
+    """Render one page of the pending queue: header + nav + up to 6 approval cards.
+
+    Replaces the tapped message with a fresh page header (carrying the
+    ``pend:page:N`` Prev/Next navigation) and sends one approval card per
+    listing on the page. Approval cards themselves stay untouched."""
+    total = db.count_pending_listings()
+    start, end, page_count, _, _ = _page_window(total, page)
+    page = start // _PAGE_SIZE
+    pending = db.get_pending_listings(limit=_PAGE_SIZE, offset=start)
+    if not pending:
+        await _message_delete_send(
+            event,
+            "✅ No listings pending approval right now.",
+            buttons=_home_button_row(),
+        )
+        return
+    text = f"⏳ Found {total} listing(s) pending review:"
+    footer = _page_footer(page, page_count)
+    if footer:
+        text += f"\n\n{footer}"
+    buttons = list(_nav_row("pend", page, page_count))
+    buttons.extend(_home_button_row())
+    await _message_delete_send(event, text, buttons=buttons)
+    for l in pending:
+        await send_approval_prompt(bot, ADMIN_USER_ID, l)
 
 
 def _post_card(post: dict) -> Tuple[str, List[List[object]]]:
@@ -1399,39 +1510,30 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
     async def handle_pending(event):
         if not await check_admin(event):
             return
-        pending = db.get_pending_listings(limit=5)
-        if not pending:
-            await event.reply("✅ No listings pending approval right now.", buttons=_home_keyboard())
-            return
-
-        await event.reply(
-            f"Found {len(pending)} listing(s) pending review:", buttons=_home_keyboard()
-        )
-        for l in pending:
-            await send_approval_prompt(bot, ADMIN_USER_ID, l)
+        await _send_pending_page(event, 0)
 
     @bot.on(events.NewMessage(pattern=r"^(?:/failed|⚠️ Failed)"))
     async def handle_failed(event):
         if not await check_admin(event):
             return
-        failed = db.get_failed_listings(limit=10)
+        failed = db.get_failed_listings(limit=_PAGE_SIZE, offset=0)
         if not failed:
             await event.reply("✅ No failed publishes in the queue.", buttons=_home_keyboard())
             return
 
-        text, buttons = _failed_digest(failed)
+        text, buttons = _failed_digest(failed, 0, db.count_failed_listings())
         await event.reply(text, buttons=buttons, parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^(?:/skipped|🚫 Skipped)"))
     async def handle_skipped(event):
         if not await check_admin(event):
             return
-        skips = db.get_skipped_listings(limit=15)
+        skips = db.get_skipped_listings(limit=_PAGE_SIZE, offset=0)
         if not skips:
             await event.reply("✅ No skipped messages logged.", buttons=_home_keyboard())
             return
 
-        text, buttons = _skipped_digest(skips)
+        text, buttons = _skipped_digest(skips, 0, db.count_skipped_listings())
         await event.reply(text, buttons=buttons, parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/repair(?:\s+(do|list))?"))
@@ -1513,12 +1615,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
     async def handle_published(event):
         if not await check_admin(event):
             return
-        rows = db.get_published_listings(limit=10)
+        rows = db.get_published_listings(limit=_PAGE_SIZE, offset=0)
         if not rows:
             await event.reply("📜 No published posts yet.", buttons=_home_keyboard())
             return
 
-        text, buttons = _published_digest(rows)
+        text, buttons = _published_digest(rows, 0, db.count_published_listings())
         await event.reply(text, buttons=buttons, parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/post(?:[ \t]+(\d+))?"))
@@ -1685,24 +1787,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await _message_delete_send(event, _status_report_text(), buttons=_home_button_row())
                 return
             if home_action == "pending":
-                pending = db.get_pending_listings(limit=5)
-                if not pending:
-                    await _message_delete_send(
-                        event,
-                        "✅ No listings pending approval right now.",
-                        buttons=_home_button_row(),
-                    )
-                    return
-                await _message_delete_send(
-                    event,
-                    f"Found {len(pending)} listing(s) pending review:",
-                    buttons=_home_button_row(),
-                )
-                for l in pending:
-                    await send_approval_prompt(bot, ADMIN_USER_ID, l)
+                await _send_pending_page(event, 0)
                 return
             if home_action == "failed":
-                failed = db.get_failed_listings(limit=10)
+                failed = db.get_failed_listings(limit=_PAGE_SIZE, offset=0)
                 if not failed:
                     await _message_delete_send(
                         event,
@@ -1710,7 +1798,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         buttons=_home_button_row(),
                     )
                     return
-                text, buttons = _failed_digest(failed)
+                text, buttons = _failed_digest(failed, 0, db.count_failed_listings())
                 await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
             if home_action == "help":
@@ -1734,7 +1822,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
                 return
             if home_action == "skipped":
-                skips = db.get_skipped_listings(limit=15)
+                skips = db.get_skipped_listings(limit=_PAGE_SIZE, offset=0)
                 if not skips:
                     await _message_delete_send(
                         event,
@@ -1742,11 +1830,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         buttons=_home_button_row(),
                     )
                     return
-                text, buttons = _skipped_digest(skips)
+                text, buttons = _skipped_digest(skips, 0, db.count_skipped_listings())
                 await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
             if home_action == "published":
-                rows = db.get_published_listings(limit=10)
+                rows = db.get_published_listings(limit=_PAGE_SIZE, offset=0)
                 if not rows:
                     await _message_delete_send(
                         event,
@@ -1754,7 +1842,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         buttons=_home_button_row(),
                     )
                     return
-                text, buttons = _published_digest(rows)
+                text, buttons = _published_digest(rows, 0, db.count_published_listings())
                 await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
             return
@@ -1787,6 +1875,74 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await event.delete()
             except Exception:
                 pass
+            return
+
+        # ---- List pagination ----------------------------------------------
+        supage_match = re.match(r"^sup:page:(-?\d+)$", data_str)
+        if supage_match:
+            raw_page = int(supage_match.group(1))
+            suppliers = db.list_suppliers(active_only=False)
+            start, _, _, _, _ = _page_window(len(suppliers), raw_page)
+            page = start // _PAGE_SIZE
+            await _message_delete_send(
+                event,
+                _sources_menu_text(suppliers, page),
+                buttons=_sources_buttons(suppliers, page),
+                parse_mode=None,
+            )
+            return
+
+        destpage_match = re.match(r"^dest:page:(-?\d+)$", data_str)
+        if destpage_match:
+            raw_page = int(destpage_match.group(1))
+            destinations = db.list_destinations(active_only=False)
+            start, _, _, _, _ = _page_window(len(destinations), raw_page)
+            page = start // _PAGE_SIZE
+            await _message_delete_send(
+                event,
+                _destinations_menu_text(destinations, page),
+                buttons=_destinations_buttons(destinations, page),
+                parse_mode=None,
+            )
+            return
+
+        failpage_match = re.match(r"^fail:page:(-?\d+)$", data_str)
+        if failpage_match:
+            raw_page = int(failpage_match.group(1))
+            total = db.count_failed_listings()
+            start, _, _, _, _ = _page_window(total, raw_page)
+            page = start // _PAGE_SIZE
+            failed = db.get_failed_listings(limit=_PAGE_SIZE, offset=start)
+            text, buttons = _failed_digest(failed, page, total)
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
+            return
+
+        skippage_match = re.match(r"^skip:page:(-?\d+)$", data_str)
+        if skippage_match:
+            raw_page = int(skippage_match.group(1))
+            total = db.count_skipped_listings()
+            start, _, _, _, _ = _page_window(total, raw_page)
+            page = start // _PAGE_SIZE
+            skips = db.get_skipped_listings(limit=_PAGE_SIZE, offset=start)
+            text, buttons = _skipped_digest(skips, page, total)
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
+            return
+
+        pubpage_match = re.match(r"^pub:page:(-?\d+)$", data_str)
+        if pubpage_match:
+            raw_page = int(pubpage_match.group(1))
+            total = db.count_published_listings()
+            start, _, _, _, _ = _page_window(total, raw_page)
+            page = start // _PAGE_SIZE
+            rows = db.get_published_listings(limit=_PAGE_SIZE, offset=start)
+            text, buttons = _published_digest(rows, page, total)
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
+            return
+
+        pendpage_match = re.match(r"^pend:page:(-?\d+)$", data_str)
+        if pendpage_match:
+            raw_page = int(pendpage_match.group(1))
+            await _send_pending_page(event, raw_page)
             return
 
         # ---- Suppliers submenu ---------------------------------------------

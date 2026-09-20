@@ -1849,6 +1849,304 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("➕ Add Source", buttons[3][0].text)
         self.assertIn("⬅️ Back", buttons[3][1].text)
 
+    def test_page_window_boundaries(self):
+        """_page_window clamps pages and reports nav state correctly."""
+        import admin_bot
+
+        self.assertEqual(admin_bot._page_window(0, 0), (0, 0, 1, False, False))
+        self.assertEqual(admin_bot._page_window(1, 0), (0, 1, 1, False, False))
+        self.assertEqual(admin_bot._page_window(6, 0), (0, 6, 1, False, False))
+        self.assertEqual(admin_bot._page_window(7, 0), (0, 6, 2, False, True))
+        self.assertEqual(admin_bot._page_window(7, 1), (6, 7, 2, True, False))
+        self.assertEqual(admin_bot._page_window(12, 0), (0, 6, 2, False, True))
+        self.assertEqual(admin_bot._page_window(12, 1), (6, 12, 2, True, False))
+        self.assertEqual(admin_bot._page_window(13, 2), (12, 13, 3, True, False))
+        # negative page clamps to the first page
+        self.assertEqual(admin_bot._page_window(13, -5), (0, 6, 3, False, True))
+        # page beyond the last clamps to the final page
+        self.assertEqual(admin_bot._page_window(13, 3), (12, 13, 3, True, False))
+        self.assertEqual(admin_bot._page_window(13, 999999), (12, 13, 3, True, False))
+
+    def test_nav_row_and_footer(self):
+        """Nav row shows Prev/Next only when they exist; single page = no row."""
+        import admin_bot
+
+        self.assertEqual(admin_bot._nav_row("sup", 0, 1), [], "no nav row on a single page")
+        self.assertEqual(admin_bot._page_footer(0, 1), "")
+        self.assertEqual(admin_bot._page_footer(1, 3), "Page 2 of 3")
+
+        row = admin_bot._nav_row("sup", 0, 3)[0]
+        self.assertEqual([b.text for b in row], ["1/3", "➡️ Next"])
+        self.assertEqual([b.data.decode() for b in row], ["sup:page:0", "sup:page:1"])
+        row = admin_bot._nav_row("sup", 1, 3)[0]
+        self.assertEqual([b.text for b in row], ["⬅️ Prev", "2/3", "➡️ Next"])
+        self.assertEqual([b.data.decode() for b in row], ["sup:page:0", "sup:page:1", "sup:page:2"])
+        row = admin_bot._nav_row("dest", 2, 3)[0]
+        self.assertEqual([b.text for b in row], ["⬅️ Prev", "3/3"])
+        self.assertEqual([b.data.decode() for b in row], ["dest:page:1", "dest:page:2"])
+
+    def test_sources_buttons_pagination(self):
+        """13 sources → 6/6/1 across pages, nav only where needed."""
+        import admin_bot
+
+        suppliers = [
+            {"id": i, "channel_username": f"chan{i}", "display_name": None,
+             "channel_id": -1000000 - i, "active": True}
+            for i in range(1, 14)
+        ]
+
+        b0 = admin_bot._sources_buttons(suppliers, 0)
+        self.assertEqual(len(b0), 8, "6 supplier rows + Next nav + Add/Back")
+        self.assertEqual([x.text for x in b0[6]], ["1/3", "➡️ Next"])
+        self.assertEqual(b0[6][1].data.decode(), "sup:page:1")
+
+        b1 = admin_bot._sources_buttons(suppliers, 1)
+        self.assertEqual(len(b1), 8)
+        self.assertEqual([x.text for x in b1[6]], ["⬅️ Prev", "2/3", "➡️ Next"])
+        self.assertEqual([x.data.decode() for x in b1[6]],
+                         ["sup:page:0", "sup:page:1", "sup:page:2"])
+
+        b2 = admin_bot._sources_buttons(suppliers, 2)
+        self.assertEqual(len(b2), 3, "1 supplier row + Prev nav + Add/Back")
+        self.assertEqual(b2[0][0].data.decode(), "sup:13")
+        self.assertEqual([x.text for x in b2[1]], ["⬅️ Prev", "3/3"])
+        self.assertEqual(b2[1][0].data.decode(), "sup:page:1")
+
+        small = admin_bot._sources_buttons(suppliers[:3], 0)
+        self.assertEqual(len(small), 4, "single page keeps the exact old layout")
+        self.assertEqual(small[3][0].text, "➕ Add Source")
+
+    def test_sources_menu_text_pagination(self):
+        """Menu text gains 'Page X of Y' only for multi-page lists."""
+        import admin_bot
+
+        many = [{"id": i, "channel_username": f"c{i}", "display_name": None,
+                 "channel_id": None, "active": True} for i in range(7)]
+        self.assertIn("Page 1 of 2", admin_bot._sources_menu_text(many, 0))
+        self.assertIn("Page 2 of 2", admin_bot._sources_menu_text(many, 1))
+        few = many[:6]
+        self.assertEqual(admin_bot._sources_menu_text(few, 0),
+                         "Tap a source below to manage it.")
+        self.assertEqual(admin_bot._sources_menu_text([], 0),
+                         "No sources configured yet.")
+
+    def test_destinations_buttons_pagination(self):
+        """13 destinations → 6/6/1 across pages with dest:page:N nav."""
+        import admin_bot
+
+        dests = [
+            {"id": i, "title": f"Group {i}", "chat_id": -100000000 - i, "active": True}
+            for i in range(1, 14)
+        ]
+        b0 = admin_bot._destinations_buttons(dests, 0)
+        self.assertEqual(len(b0), 8)
+        self.assertEqual([x.text for x in b0[6]], ["1/3", "➡️ Next"])
+        self.assertEqual([x.data.decode() for x in b0[6]], ["dest:page:0", "dest:page:1"])
+
+        b1 = admin_bot._destinations_buttons(dests, 1)
+        self.assertEqual([x.text for x in b1[6]], ["⬅️ Prev", "2/3", "➡️ Next"])
+
+        b2 = admin_bot._destinations_buttons(dests, 2)
+        self.assertEqual(len(b2), 3)
+        self.assertEqual([x.text for x in b2[1]], ["⬅️ Prev", "3/3"])
+
+        small = admin_bot._destinations_buttons(dests[:3], 0)
+        self.assertEqual(len(small), 4, "single page keeps the exact old layout")
+        self.assertEqual(small[3][1].text, "⬅️ Back")
+
+    def _failed_rows(self, n):
+        return [
+            {"id": 100 + i, "status": "failed", "platform_name": "P",
+             "created_at": "2026-01-01T00:00:00",
+             "supplier_username": "src", "supplier_display_name": None,
+             "updated_at": "2026-01-01T00:00:00", "last_error": None}
+            for i in range(n)
+        ]
+
+    def test_failed_digest_pagination(self):
+        """failed digest gets fail:page:N nav + footer only when total is given."""
+        import admin_bot
+
+        text, buttons = admin_bot._failed_digest(self._failed_rows(6), 0, total=6)
+        self.assertNotIn("Page", text)
+        self.assertFalse(any(r and getattr(r[0], "data", b"").decode().startswith("fail:page:")
+                             for r in buttons))
+
+        text, buttons = admin_bot._failed_digest(self._failed_rows(6), 1, total=13)
+        self.assertIn("Page 2 of 3", text)
+        nav = buttons[-2]
+        self.assertEqual([x.text for x in nav], ["⬅️ Prev", "2/3", "➡️ Next"])
+        self.assertEqual([x.data.decode() for x in nav],
+                         ["fail:page:0", "fail:page:1", "fail:page:2"])
+        self.assertEqual(buttons[-1][0].data.decode(), "menu:home")
+
+    def test_skipped_digest_pagination(self):
+        """skipped digest gets skip:page:N nav + footer when total is given."""
+        import admin_bot
+
+        skips = [
+            {"skip_id": 10 + i, "listing_id": 100 + i, "reason": "duplicate",
+             "channel_username": "src", "display_name": None,
+             "timestamp": "2026-01-01T00:00:00", "raw_text": "x"}
+            for i in range(6)
+        ]
+        text, buttons = admin_bot._skipped_digest(skips, 0, total=6)
+        self.assertNotIn("Page", text)
+        self.assertFalse(any(r and getattr(r[0], "data", b"").decode().startswith("skip:page:")
+                             for r in buttons))
+
+        text, buttons = admin_bot._skipped_digest(skips, 0, total=13)
+        self.assertIn("Page 1 of 3", text)
+        self.assertEqual([x.text for x in buttons[-2]], ["1/3", "➡️ Next"])
+        self.assertEqual([x.data.decode() for x in buttons[-2]], ["skip:page:0", "skip:page:1"])
+        self.assertEqual(buttons[-1][0].data.decode(), "menu:home")
+
+        text, buttons = admin_bot._skipped_digest(skips, 2, total=13)
+        self.assertIn("Page 3 of 3", text)
+        self.assertEqual([x.text for x in buttons[-2]], ["⬅️ Prev", "3/3"])
+
+    def test_published_digest_pagination(self):
+        """published nav row sits BEFORE the Search Post row, uses pub:page:N."""
+        import admin_bot
+
+        old = admin_bot.DEST_CHANNEL
+        try:
+            admin_bot.DEST_CHANNEL = "@mychannel"
+            rows = [
+                {"id": 50 + i, "post_number": 100 + i, "status": "published",
+                 "published_message_id": 1000 + i, "clean_text": "OK", "raw_text": "OK",
+                 "supplier_username": "src", "supplier_display_name": None,
+                 "platform_name": None, "game_name": None}
+                for i in range(6)
+            ]
+            text, buttons = admin_bot._published_digest(rows, 1, total=13)
+            self.assertIn("Page 2 of 3", text)
+            nav_idx = next(
+                i for i, r in enumerate(buttons)
+                if r and getattr(r[0], "data", b"").decode().startswith("pub:page:")
+            )
+            self.assertEqual(buttons[nav_idx + 1][0].data.decode(), "published:search",
+                             "nav must precede Search Post")
+            self.assertEqual(buttons[nav_idx + 1][0].text, "Search Post")
+
+            text1, buttons1 = admin_bot._published_digest(rows[:3], 0, total=3)
+            self.assertNotIn("Page", text1)
+            self.assertFalse(any(r and getattr(r[0], "data", b"").decode().startswith("pub:page:")
+                                 for r in buttons1))
+        finally:
+            admin_bot.DEST_CHANNEL = old
+
+    def test_stale_page_clamps(self):
+        """Out-of-range page taps clamp to the last valid page, never empty."""
+        import admin_bot
+
+        suppliers = [
+            {"id": i, "channel_username": f"c{i}", "display_name": None,
+             "channel_id": None, "active": True} for i in range(1, 14)
+        ]
+        # 13 items → 3 pages. Items shrink to 12 → old page index 2 clamps to 1.
+        shrunk = suppliers[:12]
+        start, _, page_count, has_prev, has_next = admin_bot._page_window(len(shrunk), 2)
+        self.assertEqual((start, page_count, has_prev, has_next), (6, 2, True, False))
+        page = start // admin_bot._PAGE_SIZE
+        self.assertEqual(page, 1)
+        buttons = admin_bot._sources_buttons(shrunk, page)
+        self.assertEqual(len(buttons[0]), 1)
+        self.assertEqual([x.text for x in buttons[6]], ["⬅️ Prev", "2/2"])
+        # total=0 is safe (empty queue after last page tapped)
+        self.assertEqual(admin_bot._page_window(0, 42), (0, 0, 1, False, False))
+
+    def test_db_pagination_offset_and_count(self):
+        """LIMIT/OFFSET pages concatenate to the full ordered result; counts match."""
+        temp_db = "test_pagination.db"
+        if os.path.exists(temp_db):
+            os.remove(temp_db)
+        try:
+            db.init_db(temp_db)
+            db.add_supplier("@page_src_db", channel_id=-100777, db_path=temp_db)
+            sup_id = db.get_supplier_by_chat(username="page_src_db", db_path=temp_db)["id"]
+
+            # ---- failed queue (ORDER BY updated_at ASC) ---------------------
+            fail_ids = [
+                db.insert_listing(supplier_id=sup_id, source_message_id=80000 + i,
+                                  game_name=None, rank_tier=None, status="failed",
+                                  raw_text="t", clean_text="t", db_path=temp_db)
+                for i in range(7)
+            ]
+            self.assertEqual(db.count_failed_listings(db_path=temp_db), 7)
+            self.assertTrue(all(
+                l["id"] in set(fail_ids)
+                for l in db.get_failed_listings(limit=6, offset=0, db_path=temp_db)
+                + db.get_failed_listings(limit=6, offset=6, db_path=temp_db)
+            ))
+            all_failed = db.get_failed_listings(limit=1000, offset=0, db_path=temp_db)
+            self.assertEqual(
+                db.get_failed_listings(limit=6, offset=0, db_path=temp_db)
+                + db.get_failed_listings(limit=6, offset=6, db_path=temp_db),
+                all_failed,
+                "failed OFFSET pages slice the same ordered result",
+            )
+
+            # ---- pending queue (ORDER BY id ASC) ----------------------------
+            pend_ids = [
+                db.insert_listing(supplier_id=sup_id, source_message_id=81000 + i,
+                                  game_name=None, rank_tier=None, status="pending_approval",
+                                  raw_text="t", clean_text="t", db_path=temp_db)
+                for i in range(7)
+            ]
+            self.assertEqual(db.count_pending_listings(db_path=temp_db), 7)
+            all_pend = db.get_pending_listings(limit=1000, offset=0, db_path=temp_db)
+            self.assertEqual([l["id"] for l in all_pend], sorted(pend_ids),
+                             "pending ordered by id ASC")
+            self.assertEqual(
+                db.get_pending_listings(limit=6, offset=0, db_path=temp_db)
+                + db.get_pending_listings(limit=6, offset=6, db_path=temp_db),
+                all_pend,
+            )
+
+            # ---- skips queue (ORDER BY k.id DESC) ---------------------------
+            skip_ids = [
+                db.log_skip(sup_id, 90000 + i, "duplicate", "x", db_path=temp_db)
+                for i in range(7)
+            ]
+            self.assertEqual(db.count_skipped_listings(db_path=temp_db), 7)
+            all_skips = db.get_skipped_listings(limit=1000, offset=0, db_path=temp_db)
+            self.assertEqual(
+                [r["skip_id"] for r in all_skips],
+                sorted(skip_ids, reverse=True),
+                "skips ordered newest-first by id DESC",
+            )
+            self.assertEqual(
+                db.get_skipped_listings(limit=6, offset=0, db_path=temp_db)
+                + db.get_skipped_listings(limit=6, offset=6, db_path=temp_db),
+                all_skips,
+            )
+
+            # ---- published queue (ORDER BY post_number DESC, id DESC) -------
+            pub_ids = []
+            for i in range(7):
+                lid = db.insert_listing(
+                    supplier_id=sup_id, source_message_id=82000 + i, game_name=None,
+                    rank_tier=None, status="published", raw_text="t", clean_text="t",
+                    published_message_id=20000 + i, db_path=temp_db,
+                )
+                db.update_listing_status(lid, "published",
+                                         published_message_id=20000 + i,
+                                         post_number=500 + i, db_path=temp_db)
+                pub_ids.append(lid)
+            self.assertEqual(db.count_published_listings(db_path=temp_db), 7)
+            all_pub = db.get_published_listings(limit=1000, offset=0, db_path=temp_db)
+            self.assertEqual([l["id"] for l in all_pub], list(reversed(pub_ids)),
+                             "post numbers 500..506 order post_number DESC")
+            self.assertEqual(
+                db.get_published_listings(limit=6, offset=0, db_path=temp_db)
+                + db.get_published_listings(limit=6, offset=6, db_path=temp_db),
+                all_pub,
+            )
+        finally:
+            if os.path.exists(temp_db):
+                os.remove(temp_db)
+
     def test_skipped_digest_buttons_only(self):
         """/skipped is buttons-first: short caption header, no numbered/snippet
         wall; each Re-review button label carries reason -- supplier -- age;
