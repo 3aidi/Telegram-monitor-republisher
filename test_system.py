@@ -3461,5 +3461,947 @@ class TestDestinationsForwarding(unittest.TestCase):
         self.assertEqual(str_inv, "https://t.me/+AbCdEf_123")
 
 
+# =====================================================================
+# PHASE 5 — real handler-level tests (no source-inspection)
+# =====================================================================
+# These tests execute the ACTUAL nested admin handlers (via a FakeBot that
+# captures every @bot.on(...) registration) and the ACTUAL main worker /
+# recovery / drain / pipeline functions (via a FakeTelegramClient), then
+# assert all three layers the audit cares about:
+#   1. the Telegram-side call (what the client was asked to send/forward),
+#   2. the database state (statuses, claims, forwarding rows),
+#   3. the user-visible response (admin answers, Deletes, replies, cards).
+#
+# Their job is to prove the F1/F2 admin fixes, the F3 publish-once claim,
+# the F6 forward-once claim, and the media-only/self-echo/next_post_number
+# small fixes behave correctly at runtime — not that the source text "looks"
+# correct. So a test can never be satisfied by inspecting these modules'
+# source; it must drive real handlers end to end against a fake Telegram.
+import asyncio
+import itertools as _itertools
+import re as _re
+import types as _types
+
+_P5_SEQ = _itertools.count(1)
+
+
+class _P5FakeMsg:
+    """Stand-in for a Telethon Message / ChatMessage used by handlers."""
+
+    def __init__(self, mid, text=None, fwd_from=None, media=None, chat=None):
+        self.id = mid
+        self.text = text
+        self.fwd_from = fwd_from
+        self.media = media
+        self.chat = chat
+
+
+class _P5FakeFwdFrom:
+    """Stand-in for MessageFwdHeader: channel_post proves a forward origin."""
+
+    def __init__(self, channel_post=None):
+        self.channel_post = channel_post
+
+
+class _P5FakeUserClient:
+    """User-listener client stand-in. Records every publish/forward and can be
+    scanned like the live destination channel (get_messages is what
+    publish_guard.confirm_message_on_destination and
+    main._confirm_forward_on_destination read through)."""
+
+    def __init__(self):
+        self.sent = []
+        self.forwarded = []
+        self.forward_calls = 0
+        self.scan = {}
+        self.dialogs_called = 0
+        self.fail_forward = None
+        self._connected = True
+        self._send_ids = 100
+
+    def set_channel(self, peer, msgs):
+        self.scan[peer] = list(msgs)
+
+    def is_connected(self):
+        return self._connected
+
+    async def send_message(self, peer, text, formatting_entities=None, **kw):
+        self._send_ids += 1
+        m = _P5FakeMsg(self._send_ids, text=text)
+        self.scan.setdefault(peer, []).insert(0, m)
+        self.sent.append({"peer": peer, "text": text})
+        return m
+
+    async def get_messages(self, peer, limit=None):
+        return list(self.scan.get(peer, []))[:limit]
+
+    async def forward_messages(self, to_peer, messages=None, from_peer=None, **kw):
+        self.forward_calls += 1
+        if self.fail_forward is not None:
+            raise self.fail_forward
+        self.forwarded.append({"to": to_peer, "msgs": messages, "from": from_peer})
+        m = _P5FakeMsg(9000 + len(self.forwarded))
+        self.scan.setdefault(to_peer, []).insert(0, m)
+        return [m]
+
+    async def get_dialogs(self, limit=50):
+        self.dialogs_called += 1
+        return []
+
+
+class _P5FakeBot:
+    """Admin bot client stand-in: captures every @bot.on(...) decorator and
+    records the messages it was asked to send to the admin."""
+
+    def __init__(self):
+        self.handlers = []
+        self.sent = []
+        self.deleted = []
+        self.log = []
+        self._n = 0
+
+    def on(self, filt):
+        def deco(fn):
+            self.handlers.append((filt, fn))
+            return fn
+
+        return deco
+
+    async def send_message(self, peer, text, buttons=None, parse_mode=None):
+        self._n += 1
+        self.sent.append({
+            "peer": peer, "text": text,
+            "buttons": buttons or [], "parse_mode": parse_mode,
+        })
+        self.log.append(("send", text))
+        return _P5FakeMsg(self._n, text=text)
+
+    async def delete_messages(self, peer, ids):
+        self.deleted.append((peer, list(ids)))
+
+    def callbacks(self):
+        from telethon import events
+
+        return [
+            fn for filt, fn in self.handlers
+            if getattr(filt, "__name__", None) == "CallbackQuery"
+            or type(filt).__name__ == "CallbackQuery"
+            or (isinstance(filt, type) and issubclass(filt, events.CallbackQuery))
+        ]
+
+    def new_message_handlers(self):
+        return [
+            (filt, fn) for filt, fn in self.handlers
+            if getattr(filt, "__name__", None) == "NewMessage"
+            or type(filt).__name__ == "NewMessage"
+        ]
+
+
+class _P5FakeEvent:
+    """Stand-in for the events the handlers consume: sender, data (bytes),
+    text, reply/answer/delete capabilities and a client (the FakeBot)."""
+
+    def __init__(self, sender_id, data=None, text=None, message=None, bot=None):
+        self.sender_id = sender_id
+        self.data = data.encode("utf-8") if isinstance(data, str) else (data or b"")
+        self.raw_text = text or ""
+        self.text = text or ""
+        self.message = message
+        self.client = bot
+        self.bot = bot
+        self.pattern_match = None
+        self._answered = []
+        self._replies = []
+        self._deleted = 0
+
+    @property
+    def answers(self):
+        return [a[0] for a in self._answered]
+
+    @property
+    def replies(self):
+        return self._replies
+
+    async def answer(self, text="OK", alert=False):
+        self._answered.append((text, alert))
+
+    async def delete(self):
+        self._deleted += 1
+        if self.bot is not None:
+            self.bot.log.append(("event.delete",))
+
+    async def reply(self, text, buttons=None, parse_mode=None):
+        self._replies.append({
+            "text": text, "buttons": buttons or [], "parse_mode": parse_mode,
+        })
+        if self.bot is not None:
+            self.bot.log.append(("reply", text))
+
+
+async def _dispatch_callback(bot, data, sender_id):
+    """Run the real CallbackQuery handler with an event carrying `data`."""
+    callbacks = bot.callbacks()
+    assert callbacks, "no CallbackQuery handler registered"
+    event = _P5FakeEvent(sender_id, data=data, bot=bot)
+    await callbacks[0](event)
+    return event
+
+
+async def _dispatch_message(bot, text, sender_id=None, message=None):
+    """Run the real NewMessage handler whose compiled regex matches `text`."""
+    for filt, fn in bot.new_message_handlers():
+        pat = getattr(filt, "pattern", None)
+        if pat is None:
+            continue
+        try:
+            m = pat(text)
+        except Exception:
+            m = None
+        if m is not None:
+            event = _P5FakeEvent(sender_id, text=text, message=message, bot=bot)
+            event.pattern_match = m
+            await fn(event)
+            return event
+    raise AssertionError(f"No NewMessage handler matched {text!r}")
+
+
+async def _dispatch_wizard(bot, text, sender_id=None):
+    """Run the bare NewMessage() wizard fallback handler (registered last)."""
+    for filt, fn in bot.new_message_handlers():
+        if getattr(filt, "pattern", None) is None:
+            event = _P5FakeEvent(sender_id, text=text, bot=bot)
+            await fn(event)
+            return event
+    raise AssertionError("no catch-all NewMessage wizard handler registered")
+
+
+def _button_datas(msg):
+    out = []
+    for rows in msg.get("buttons") or []:
+        for b in rows:
+            data = getattr(b, "data", None)
+            if data is not None:
+                out.append(data.decode("utf-8") if isinstance(data, bytes) else str(data))
+    return out
+
+
+def _all_button_datas(bot):
+    out = []
+    for m in bot.sent:
+        out.extend(_button_datas(m))
+    return out
+
+
+class TestPhase5Handlers(unittest.TestCase):
+    """Real handler-level (never source-inspection) tests for the F1/F2/F3/F6
+    fixes and the smaller Phase-4 items. Runs the ACTUAL nested admin handlers
+    and ACTUAL main worker/recovery/drain functions against fake Telegram."""
+
+    ADMIN = 777001
+
+    def setUp(self):
+        import admin_bot
+        import main
+
+        self.admin_mod = admin_bot
+        self.main_mod = main
+        self._seq = next(_P5_SEQ)
+
+        # ---- a FRESH database per test: every handler/worker call below routes
+        # through db.DEFAULT_DB_PATH (db_path=None), so each test is fully
+        # isolated from the shared TEST_DB and from every other test. ----
+        self._db_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), f"test_p5_{self._seq}.db"
+        )
+        db.init_db(self._db_path)
+
+        # ---- save state for tearDown ----
+        self._old_admin_bot_id = admin_bot.ADMIN_USER_ID
+        self._old_main_admin_id = main.ADMIN_USER_ID
+        self._old_main_dest = main.DEST_CHANNEL
+        self._old_admin_dest = admin_bot.DEST_CHANNEL
+        self._old_main_grace = main.PUBLISH_CLAIM_GRACE_SECONDS
+        self._old_db_default = db.DEFAULT_DB_PATH
+        self._old_interval = publish_guard.PUBLISH_INTERVAL
+        self._old_lock = publish_guard._publish_lock
+        self._old_user_ref = admin_bot.user_client_ref
+
+        # ---- isolate from the rest of the suite ----
+        db.DEFAULT_DB_PATH = self._db_path
+        publish_guard.set_publish_interval(0.0)
+        publish_guard._publish_lock = asyncio.Lock()
+        admin_bot.ADMIN_USER_ID = self.ADMIN
+        main.ADMIN_USER_ID = self.ADMIN
+        main.DEST_CHANNEL = "-1007770001"
+        admin_bot.DEST_CHANNEL = "-1007770001"
+        main.PUBLISH_CLAIM_GRACE_SECONDS = 300
+        main._self_echo_pattern = None
+        admin_bot._wizard_state.clear()
+        admin_bot._drafts.clear()
+
+        self.dest_chat = "-1007770001"
+        self.dest_peer = -1007770001
+
+        self.user_client = _P5FakeUserClient()
+        admin_bot.set_user_client(self.user_client)
+        self.bot = _P5FakeBot()
+        admin_bot.setup_admin_handlers(self.bot)
+
+    def tearDown(self):
+        import admin_bot
+        import main
+
+        admin_bot.set_user_client(self._old_user_ref)
+        admin_bot._wizard_state.clear()
+        admin_bot._drafts.clear()
+        admin_bot.ADMIN_USER_ID = self._old_admin_bot_id
+        main.ADMIN_USER_ID = self._old_main_admin_id
+        main.DEST_CHANNEL = self._old_main_dest
+        admin_bot.DEST_CHANNEL = self._old_admin_dest
+        main.PUBLISH_CLAIM_GRACE_SECONDS = self._old_main_grace
+        db.DEFAULT_DB_PATH = self._old_db_default
+        publish_guard.set_publish_interval(self._old_interval)
+        publish_guard._publish_lock = self._old_lock
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(self._db_path + suffix)
+            except OSError:
+                pass
+
+    # ---------------- helpers ----------------------------------------
+    def _new_supplier_id(self, label):
+        return db.add_supplier(
+            f"@p5_{label}_{self._seq}",
+            channel_id=-1008830000 + self._seq * 10,
+        )
+
+    def _add_supplier(self, label):
+        self._new_supplier_id(label)
+        return db.get_supplier_by_chat(username=f"p5_{label}_{self._seq}")
+
+    def _src_id(self):
+        return 510000 + self._seq * 1000 + self._seq
+
+    def _add_listing(self, status="pending_approval", text="WTS Bybit verified account $100",
+                     supplier_id=None):
+        if supplier_id is None:
+            supplier_id = self._new_supplier_id(f"l{self._seq}")
+        src_msg_id = self._src_id()
+        return db.insert_listing(
+            supplier_id,
+            src_msg_id,
+            game_name="Bybit",
+            rank_tier=None,
+            status=status,
+            raw_text=text,
+            clean_text=text,
+            fingerprint=db.make_listing_fingerprint(text, price=100.0),
+        )
+
+    def _add_destination(self):
+        chat = f"-10077700{40 + self._seq}"
+        db.add_destination(chat, f"Dest{self._seq}")
+        return chat
+
+    def _forward_rows(self, listing_id):
+        with db.db_session() as conn:
+            rows = conn.execute(
+                "SELECT * FROM forwardings WHERE listing_id = ?", (listing_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def _age_row(self, table, row_id, seconds=400):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+        with db.db_session() as conn:
+            conn.execute(f"UPDATE {table} SET updated_at = ? WHERE id = ?", (old, row_id))
+
+    async def _drain_worker_once(self, client):
+        """Run one full iteration of the real approved_listings_worker loop and
+        then stop it (the loop always processes BEFORE waiting on stop)."""
+        stop = asyncio.Event()
+        task = asyncio.create_task(self.main_mod.approved_listings_worker(client, stop, None))
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if client.sent or not db.get_approved_listings_to_publish():
+                break
+            await asyncio.sleep(0.02)
+        stop.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    # ---------------- publish-once crash windows (F3) ----------------
+    def test_two_workers_cannot_both_claim_a_listing(self):
+        """A second claim on the same listing loses atomically — the once-only
+        guard that stops two workers (or a worker + admin) double-publishing."""
+        lid = self._add_listing(status="approved")
+        pn = db.next_post_number()
+        self.assertTrue(db.claim_listing_for_publish(lid, pn))
+        self.assertFalse(
+            db.claim_listing_for_publish(lid, pn + 1),
+            "the second claimer must lose",
+        )
+        self.assertEqual(db.get_approved_listings_to_publish(), [],
+                         "claimed rows must not be re-drainable")
+        self.assertTrue(db.release_publish_claim(lid))
+        reopened = db.get_approved_listings_to_publish()
+        self.assertEqual([r["id"] for r in reopened], [lid],
+                         "releasing the claim must put the listing back on the queue")
+
+    def test_stale_claim_with_message_verified_recovered_no_resend(self):
+        """Claim -> send lands -> process crashes before bookkeeping. Recovery
+        must verify the exact deterministic text on the channel and record it as
+        published — NEVER send a second copy."""
+
+        async def _run():
+            lid = self._add_listing(status="approved")
+            pn = db.next_post_number()
+            self.assertTrue(db.claim_listing_for_publish(lid, pn))
+            self._age_row("listings", lid)
+
+            self.main_mod.PUBLISH_CLAIM_GRACE_SECONDS = 0
+            listing = db.get_listing_by_id(lid)
+            content_lines = [
+                ln.strip() for ln in (listing["clean_text"] or "").split("\n") if ln.strip()
+            ]
+            expected_text, _ = parser.build_ai_message(
+                content_lines=content_lines,
+                platform=None,
+                contact_username=self.main_mod.CONTACT_USERNAME,
+                intent="neutral",
+                header_word=None,
+                listing_seed=lid,
+                post_number=pn,
+                source_text=None,
+            )
+            self.user_client.set_channel(self.dest_peer, [_P5FakeMsg(55555, text=expected_text)])
+
+            await self.main_mod._recover_stale_publish_claims(self.user_client)
+
+            row = db.get_listing_by_id(lid)
+            self.assertEqual(row["status"], "published")
+            self.assertEqual(row["published_message_id"], 55555)
+            self.assertIsNotNone(row["post_number"])
+            self.assertEqual(self.user_client.sent, [],
+                             "recovery must never re-send an already-landed post")
+
+        asyncio.run(_run())
+
+    def test_stale_claim_without_message_released_for_retry(self):
+        """Claim -> crash before the send left the app. Recovery finds nothing on
+        the channel and releases the claim so the normal drain republishes it."""
+
+        async def _run():
+            lid = self._add_listing(status="approved")
+            pn = db.next_post_number()
+            self.assertTrue(db.claim_listing_for_publish(lid, pn))
+            self._age_row("listings", lid)
+            self.main_mod.PUBLISH_CLAIM_GRACE_SECONDS = 0
+
+            await self.main_mod._recover_stale_publish_claims(self.user_client)
+
+            row = db.get_listing_by_id(lid)
+            self.assertEqual(row["status"], "approved", "claim must be released")
+            self.assertIsNone(row["published_message_id"])
+            self.assertEqual(self.user_client.sent, [])
+            self.assertEqual(
+                [r["id"] for r in db.get_approved_listings_to_publish()],
+                [lid],
+            )
+
+        asyncio.run(_run())
+
+    def test_worker_publishes_approved_listing_once(self):
+        """A full real worker tick publishes one approved listing exactly once
+        and a second tick must not re-publish it."""
+
+        async def _run():
+            self._add_destination()
+            lid = self._add_listing(status="approved")
+            await self._drain_worker_once(self.user_client)
+
+            row = db.get_listing_by_id(lid)
+            self.assertEqual(row["status"], "published")
+            self.assertEqual(len(self.user_client.sent), 1, "exactly one send")
+            sent_text = self.user_client.sent[0]["text"]
+            self.assertIn("DM", sent_text, "price must surface as DM, never as a number")
+            self.assertIn("Contact", sent_text)
+            self.assertNotRegex(sent_text, r"Price\s*\d",
+                                "the structured price line must never carry a number")
+            self.assertEqual(len(self._forward_rows(lid)), 1,
+                             "one forwarding row per active destination")
+
+            await self._drain_worker_once(self.user_client)
+            self.assertEqual(len(self.user_client.sent), 1, "worker must not re-publish")
+
+        asyncio.run(_run())
+
+    def test_bookkeeping_failure_after_send_recovered_without_duplicate(self):
+        """Publish ok -> DB bookkeeping fails twice (listing stuck 'publishing')
+        -> restart -> recovery verifies the message and records it as published.
+        Total Telegram sends across the whole saga: ONE."""
+
+        async def _run():
+            lid = self._add_listing(status="approved")
+            with mock.patch.object(
+                db, "update_listing_status",
+                side_effect=[RuntimeError("db boom"), RuntimeError("db boom")],
+            ):
+                await self._drain_worker_once(self.user_client)
+
+            row = db.get_listing_by_id(lid)
+            self.assertEqual(row["status"], "publishing", "failed bookkeeping leaves the claim")
+            self.assertEqual(len(self.user_client.sent), 1)
+
+            self._age_row("listings", lid)
+            self.main_mod.PUBLISH_CLAIM_GRACE_SECONDS = 0
+            await self.main_mod._recover_stale_publish_claims(self.user_client)
+
+            row = db.get_listing_by_id(lid)
+            self.assertEqual(row["status"], "published")
+            self.assertIsNotNone(row["published_message_id"])
+            self.assertEqual(len(self.user_client.sent), 1,
+                             "recovery must never resend an already-landed post")
+
+            await self._drain_worker_once(self.user_client)
+            self.assertEqual(len(self.user_client.sent), 1)
+
+        asyncio.run(_run())
+
+    def test_admin_approve_and_worker_race_publishes_once(self):
+        """Admin Approve wins the race (claims + publishes). A concurrent worker
+        tick afterwards finds nothing to claim and never sends a second copy."""
+
+        async def _run():
+            lid = self._add_listing(status="pending_approval")
+            await _dispatch_callback(self.bot, f"approve:{lid}", self.ADMIN)
+
+            row = db.get_listing_by_id(lid)
+            self.assertEqual(row["status"], "published")
+            self.assertEqual(len(self.user_client.sent), 1)
+
+            await self._drain_worker_once(self.user_client)
+            self.assertEqual(len(self.user_client.sent), 1, "worker must stay silent")
+
+            self.assertFalse(
+                db.claim_listing_for_publish(lid, 99999),
+                "the claim guard must reject a late worker claim on a published row",
+            )
+
+        asyncio.run(_run())
+
+    # ---------------- forwarding claim (F6) --------------------------
+    def _seed_published_and_forward(self, published_msg_id=556, post_number=9):
+        dest_chat = self._add_destination()
+        supplier_id = self._new_supplier_id(f"fw{self._seq}")
+        lid = self._add_listing(status="published", supplier_id=supplier_id)
+        db.update_listing_status(lid, "published", published_message_id=published_msg_id,
+                                 post_number=post_number)
+        db.queue_forwarding(lid, dest_chat, published_msg_id)
+        rows = db.get_pending_forwardings()
+        row = next(r for r in rows if r["published_message_id"] == published_msg_id)
+        return lid, row["id"], row, dest_chat
+
+    def test_forward_crash_recovery_verifies_and_does_not_resend(self):
+        """Forward landed -> crash before bookkeeping -> row reset with the
+        stale_claim_reset marker -> drain VERIFIES by fwd_from.channel_post and
+        records it; the forward is NEVER sent a second time."""
+
+        async def _run():
+            lid, fid, _, dest_chat = self._seed_published_and_forward()
+            self.assertTrue(db.claim_forwarding(fid))
+            self._age_row("forwardings", fid)
+            self.assertEqual(db.reset_stale_forward_claims(grace_seconds=0), 1)
+
+            dest_peer = db.to_peer_reference(dest_chat)
+            self.user_client.set_channel(
+                dest_peer, [_P5FakeMsg(1234, fwd_from=_P5FakeFwdFrom(556))]
+            )
+
+            await self.main_mod._drain_forward_queue(self.user_client)
+
+            self.assertEqual(self.user_client.forwarded, [],
+                             "a verified landing must never be re-forwarded")
+            rows = self._forward_rows(lid)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "forwarded")
+
+        asyncio.run(_run())
+
+    def test_forward_stale_without_match_forwarded_once(self):
+        """Stale claim with the message provably ABSENT is forwarded exactly
+        once and marked forwarded."""
+
+        async def _run():
+            lid, fid, _, _ = self._seed_published_and_forward()
+            self.assertTrue(db.claim_forwarding(fid))
+            self._age_row("forwardings", fid)
+            self.assertEqual(db.reset_stale_forward_claims(grace_seconds=0), 1)
+
+            await self.main_mod._drain_forward_queue(self.user_client)
+
+            self.assertEqual(len(self.user_client.forwarded), 1, "absent -> re-forward once")
+            rows = self._forward_rows(lid)
+            self.assertEqual(rows[0]["status"], "forwarded")
+
+        asyncio.run(_run())
+
+    def test_forward_ambiguous_failure_verified_as_forwarded(self):
+        """A lost-response forward error is VERIFIED against the destination: a
+        match marks it forwarded (never re-sent by a retry)."""
+
+        async def _run():
+            lid, fid, _, dest_chat = self._seed_published_and_forward()
+            dest_peer = db.to_peer_reference(dest_chat)
+            self.user_client.set_channel(
+                dest_peer, [_P5FakeMsg(4321, fwd_from=_P5FakeFwdFrom(556))]
+            )
+            self.user_client.fail_forward = RuntimeError("network timeout")
+
+            await self.main_mod._drain_forward_queue(self.user_client)
+
+            rows = self._forward_rows(lid)
+            self.assertEqual(rows[0]["status"], "forwarded",
+                             "verified landing after ambiguous error = forwarded")
+            self.assertEqual(self.user_client.forward_calls, 1,
+                             "one forward attempt happened before the failure")
+
+        asyncio.run(_run())
+
+    def test_forward_ambiguous_failure_not_on_dest_requeues(self):
+        """Ambiguous failure + provably absent = transient mark_forward_failed:
+        the row goes back to pending with a retry; never a permanent failure for
+        a mere network timeout."""
+
+        async def _run():
+            lid, fid, _, _ = self._seed_published_and_forward()
+            self.user_client.fail_forward = RuntimeError("network timeout")
+
+            await self.main_mod._drain_forward_queue(self.user_client)
+
+            with db.db_session() as conn:
+                row = conn.execute("SELECT * FROM forwardings WHERE id = ?", (fid,)).fetchone()
+            self.assertEqual(row["status"], "pending")
+            self.assertEqual(row["retry_count"], 1)
+            self.assertIsNotNone(row["retry_at"])
+            self.assertIn("network timeout", row["error"] or "")
+
+        asyncio.run(_run())
+
+    # ---------------- admin handlers (F1 / F2) -----------------------
+    def test_admin_pending_command_renders_page_and_cards(self):
+        """/pending renders the page header and one approval card per listing.
+        Regression for F2 (the page renderer must be handed the bot)."""
+
+        async def _run():
+            lid = self._add_listing(status="pending_approval")
+            ev = await _dispatch_message(self.bot, "/pending", self.ADMIN)
+            self.assertTrue(
+                any("listing(s) pending review" in m["text"] for m in self.bot.sent),
+                "pending header must be sent",
+            )
+            self.assertTrue(
+                f"approve:{lid}" in _all_button_datas(self.bot),
+                "approval card must carry an Approve button",
+            )
+            self.assertEqual(ev._deleted, 1)
+
+        asyncio.run(_run())
+
+    def test_admin_home_pending_button_renders_page(self):
+        """Tapping Pending on the home inline keyboard renders the page (the
+        second F2 call site)."""
+
+        async def _run():
+            lid = self._add_listing(status="pending_approval")
+            await _dispatch_callback(self.bot, "home:pending", self.ADMIN)
+            self.assertTrue(
+                any("listing(s) pending review" in m["text"] for m in self.bot.sent)
+            )
+            self.assertTrue(f"approve:{lid}" in _all_button_datas(self.bot))
+
+        asyncio.run(_run())
+
+    def test_admin_pending_pagination_callback(self):
+        """pend:page:N routes through the same page renderer (third F2 call site)."""
+
+        async def _run():
+            self._add_listing(status="pending_approval")
+            await _dispatch_callback(self.bot, "pend:page:0", self.ADMIN)
+            self.assertTrue(
+                any("listing(s) pending review" in m["text"] for m in self.bot.sent)
+            )
+
+        asyncio.run(_run())
+
+    def test_admin_preview_sends_replacement_before_delete(self):
+        """👁️ Preview: the replacement preview is sent BEFORE the tapped card is
+        deleted (no silent card loss). Regression for F1: the card's action
+        buttons are built from the full listing dict."""
+
+        async def _run():
+            lid = self._add_listing(status="pending_review")
+            ev = await _dispatch_callback(self.bot, f"preview:{lid}", self.ADMIN)
+            self.assertIn("Building preview of Listing", ev.answers[-1])
+            self.assertTrue(
+                any(f"Preview of Listing #{lid}" in m["text"] for m in self.bot.sent),
+                "replacement preview must be sent",
+            )
+            self.assertEqual(ev._deleted, 1)
+            send_at = next(i for i, entry in enumerate(self.bot.log) if entry[0] == "send")
+            delete_at = next(i for i, entry in enumerate(self.bot.log) if entry[0] == "event.delete")
+            self.assertLess(send_at, delete_at, "send MUST happen before delete")
+            data = _all_button_datas(self.bot)
+            self.assertTrue(
+                {f"edit:{lid}", f"approve:{lid}", f"reject:{lid}"} <= set(data),
+                "the F1 fix must build Edit/Approve/Reject from the listing dict",
+            )
+
+        asyncio.run(_run())
+
+    def test_admin_edit_draft_then_approve_publishes_draft(self):
+        """The full wizard: Edit -> type a draft -> the draft preview carries
+        a working Approve button (the second F1 call site) -> Approve publishes
+        the DRAFT content, not the original."""
+
+        async def _run():
+            self._add_destination()
+            lid = self._add_listing(status="pending_approval", text="WTS Bybit full $100")
+            await _dispatch_callback(self.bot, f"edit:{lid}", self.ADMIN)
+
+            ev = await _dispatch_wizard(self.bot, "KYC CURVE PAY\nANY EU", self.ADMIN)
+            draft_card = ev.replies[-1]
+            self.assertIn("Draft for Listing", draft_card["text"])
+            self.assertIn(f"approve:{lid}",
+                          [d for d in _button_datas({"buttons": draft_card["buttons"]})])
+            self.assertEqual(admin_mod_drafts(), {lid: "KYC CURVE PAY\nANY EU"})
+
+            await _dispatch_callback(self.bot, f"approve:{lid}", self.ADMIN)
+
+            row = db.get_listing_by_id(lid)
+            self.assertEqual(row["status"], "published")
+            self.assertEqual(len(self.user_client.sent), 1)
+            self.assertIn("KYC CURVE PAY", self.user_client.sent[0]["text"],
+                          "Approving a drafted listing must publish the DRAFT")
+            self.assertTrue(any("Published!" in m["text"] for m in self.bot.sent))
+
+        asyncio.run(_run())
+
+    def test_admin_wizard_cancel_drops_draft(self):
+        """Cancelling the edit wizard must ALSO drop the half-typed draft, so a
+        later Approve can never resurrect stale text (wizard-draft leak fix)."""
+
+        async def _run():
+            lid = self._add_listing(status="pending_approval", text="WTS Bybit full $100")
+            await _dispatch_callback(self.bot, f"edit:{lid}", self.ADMIN)
+            await _dispatch_wizard(self.bot, "KYC CURVE PAY\nANY EU", self.ADMIN)
+            self.assertIn(lid, admin_mod_drafts())
+
+            # Re-open the wizard (its prompt still carries the Cancel button)
+            # and cancel there — the wizard's step is still 'edit'.
+            await _dispatch_callback(self.bot, f"edit:{lid}", self.ADMIN)
+            await _dispatch_callback(self.bot, "wiz:cancel", self.ADMIN)
+
+            self.assertEqual(admin_mod_drafts(), {}, "cancel must clear the saved draft")
+            await _dispatch_callback(self.bot, f"approve:{lid}", self.ADMIN)
+            published_text = self.user_client.sent[0]["text"] if self.user_client.sent else ""
+            self.assertNotIn("CURVE", published_text,
+                             "stale draft must NOT be published after cancel")
+
+        asyncio.run(_run())
+
+    def test_admin_double_tap_approve_publishes_once(self):
+        """Fast double-tap on Approve: the listing is claimed once, published
+        once; the second tap is answered 'Already processed' and never sends."""
+
+        async def _run():
+            self._add_destination()
+            lid = self._add_listing(status="pending_approval")
+            await _dispatch_callback(self.bot, f"approve:{lid}", self.ADMIN)
+            self.assertEqual(len(self.user_client.sent), 1)
+            self.assertEqual(db.get_listing_by_id(lid)["status"], "published")
+
+            ev = await _dispatch_callback(self.bot, f"approve:{lid}", self.ADMIN)
+            self.assertTrue(any("Already processed" in a for a in ev.answers))
+            self.assertEqual(len(self.user_client.sent), 1, "second tap must not re-publish")
+            self.assertEqual(len(self._forward_rows(lid)), 1, "no duplicate forwarding rows")
+
+        asyncio.run(_run())
+
+    def test_admin_double_tap_reject_no_resend(self):
+        """Double-tap Reject: the listing is rejected once; the second tap is
+        answered 'Already processed' and nothing is ever published."""
+
+        async def _run():
+            lid = self._add_listing(status="pending_approval")
+            await _dispatch_callback(self.bot, f"reject:{lid}", self.ADMIN)
+            self.assertEqual(db.get_listing_by_id(lid)["status"], "rejected")
+
+            ev = await _dispatch_callback(self.bot, f"reject:{lid}", self.ADMIN)
+            self.assertTrue(any("Already processed" in a for a in ev.answers))
+            self.assertEqual(self.user_client.sent, [], "a rejected listing is never published")
+            self.assertTrue(any("rejected" in m["text"].lower() for m in self.bot.sent))
+
+        asyncio.run(_run())
+
+    def test_admin_retry_requeues_failed_listing(self):
+        """A failed listing's Retry button re-queues it for the worker."""
+
+        async def _run():
+            lid = self._add_listing(status="failed")
+            await _dispatch_callback(self.bot, f"retry:{lid}", self.ADMIN)
+            self.assertEqual(db.get_listing_by_id(lid)["status"], "approved")
+            self.assertTrue(any("re-queued" in m["text"] for m in self.bot.sent))
+
+        asyncio.run(_run())
+
+    def test_admin_reskip_reopens_skipped_listing(self):
+        """A skipped listing's Re-review button reopens it to pending_approval
+        and re-sends the approval prompt card."""
+
+        async def _run():
+            sid = self._new_supplier_id(f"r{self._seq}")
+            lid = self._add_listing(status="skipped_duplicate", supplier_id=sid)
+            skip_id = db.log_skip(sid, self._src_id(), "duplicate", "noise")
+
+            await _dispatch_callback(self.bot, f"reskip:{skip_id}", self.ADMIN)
+
+            self.assertEqual(db.get_listing_by_id(lid)["status"], "pending_approval")
+            self.assertTrue(f"approve:{lid}" in _all_button_datas(self.bot),
+                            "re-reopened listing must get a fresh approval card")
+
+        asyncio.run(_run())
+
+    def test_admin_stale_callback_for_unknown_listing(self):
+        """A callback for a listing that no longer exists answers 'Listing not
+        found' instead of crashing."""
+
+        async def _run():
+            ev = await _dispatch_callback(self.bot, "approve:999991", self.ADMIN)
+            self.assertTrue(any("Listing not found" in a for a in ev.answers))
+            self.assertEqual(self.user_client.sent, [])
+
+        asyncio.run(_run())
+
+    # ---------------- pipeline small fixes (Phase 4) --------------
+    def test_media_only_post_routed_to_review_not_dropped(self):
+        """An image/screenshot ad with no caption is NEVER silently dropped: it
+        becomes a pending_review listing, gets an audit trail, a manual-review
+        prompt for the admin, and produces NO forwarding work."""
+
+        async def _run():
+            sup = self._add_supplier("media_src")
+            chat = _types.SimpleNamespace(id=-1009990001)
+            msg = _P5FakeMsg(610000 + self._seq, text="", media=object(), chat=chat)
+
+            await self.main_mod._process_supplier_message(
+                self.user_client, self.bot, sup, msg
+            )
+
+            listing = db.get_listing_by_source(sup["id"], 610000 + self._seq)
+            self.assertIsNotNone(listing, "media-only posts must never be dropped")
+            self.assertEqual(listing["status"], "pending_review")
+            self.assertEqual(self.user_client.sent, [], "media-only posts are never auto-published")
+            self.assertEqual(self._forward_rows(listing["id"]), [],
+                             "monitoring events must never create forwarding work")
+
+            with db.db_session() as conn:
+                audits = conn.execute(
+                    "SELECT COUNT(*) AS c FROM audit_log WHERE listing_id = ? AND action = 'media_only_review'",
+                    (listing["id"],),
+                ).fetchone()
+            self.assertEqual(audits["c"], 1)
+
+            self.assertTrue(
+                any(f"Listing #{listing['id']}" in m["text"] for m in self.bot.sent),
+                "admin must receive a manual-review prompt",
+            )
+
+        asyncio.run(_run())
+
+    def test_textless_medialess_message_still_dropped(self):
+        """Purely textless AND medialess noise remains dropped (an early return,
+        so no listing row and no admin spam)."""
+
+        async def _run():
+            sup = self._add_supplier("textless_src")
+            chat = _types.SimpleNamespace(id=123)
+            msg = _P5FakeMsg(620000 + self._seq, text="", media=None, chat=chat)
+            await self.main_mod._process_supplier_message(
+                self.user_client, self.bot, sup, msg
+            )
+            self.assertIsNone(
+                db.get_listing_by_source(sup["id"], 620000 + self._seq)
+            )
+            self.assertEqual(self.user_client.sent, [])
+
+        asyncio.run(_run())
+
+    def test_manual_routed_message_never_enters_forwarding_queue(self):
+        """The forwarding queue is created ONLY by the successful-publish path.
+        Processing arbitrary manual/channel content (here: a filter-skipped
+        duplicate) must not create any forwarding rows or publishes."""
+
+        async def _run():
+            self._add_destination()
+            sup = self._add_supplier("noise_src")
+            chat = _types.SimpleNamespace(id=-1009990002)
+            text = "WTS Bybit verified account $100"
+            sup_id = sup["id"]
+            sid_listing = db.insert_listing(
+                sup_id, 630000 + self._seq, game_name="Bybit", rank_tier=None,
+                status="published", raw_text=text, clean_text=text,
+                fingerprint=db.make_listing_fingerprint(text, price=100.0),
+            )
+            db.update_listing_status(sid_listing, "published",
+                                     published_message_id=700, post_number=70)
+            dedup_before = db.find_recent_similar_listing(text, price=100.0)
+            self.assertIsNotNone(dedup_before)
+            self.assertEqual(dedup_before["id"], sid_listing,
+                             "the seeded published listing must trip the duplicate filter")
+
+            msg = _P5FakeMsg(640000 + self._seq, text=text, media=None, chat=chat)
+            await self.main_mod._process_supplier_message(
+                self.user_client, self.bot, sup, msg
+            )
+
+            new_listing = db.get_listing_by_source(sup_id, 640000 + self._seq)
+            self.assertIsNotNone(new_listing)
+            self.assertTrue(str(new_listing["status"]).startswith("skipped_"))
+            self.assertEqual(self.user_client.sent, [], "never published")
+            self.assertEqual(self._forward_rows(new_listing["id"]), [],
+                             "skipped content must never be forwarded")
+
+        asyncio.run(_run())
+
+    def test_next_post_number_fresh_db_race_safe(self):
+        """next_post_number on a fresh database seeds its counter via ON CONFLICT
+        (no PK violation on concurrent first callers) and always increments."""
+        fresh = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "test_p5_next_post.db")
+        try:
+            db.init_db(fresh)
+            self.assertEqual(db.next_post_number(db_path=fresh), 1)
+            self.assertEqual(db.next_post_number(db_path=fresh), 2)
+            self.assertEqual(db.next_post_number(db_path=fresh), 3)
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(fresh + suffix)
+                except OSError:
+                    pass
+
+    def test_self_echo_pattern_normalized_matching(self):
+        """The self-echo regex tolerates spacing/case/@-prefix reformatting that
+        the old exact-string match let slip through."""
+        pat = _re.compile(r"contact\s*:\s*@?bybitbot", _re.IGNORECASE)
+        self.assertIsNotNone(pat.search("Price : DM\nContact  : @bybitbot"))
+        self.assertIsNotNone(pat.search("PRICE : DM\nCONTACT:@BybitBot"))
+        self.assertIsNone(pat.search("Price : DM\nSeller : @bybitbot"))
+
+
+def admin_mod_drafts():
+    import admin_bot
+    return admin_bot._drafts
+
+
 if __name__ == "__main__":
     unittest.main()

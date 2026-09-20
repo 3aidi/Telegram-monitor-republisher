@@ -77,3 +77,35 @@ async def run_with_floodwait_retry(
             )
             await asyncio.sleep(wait)
             total_slept += wait
+
+
+async def confirm_message_on_destination(
+    client, peer, expected_text: str, limit: int = 20
+) -> Optional[int]:
+    """Confirm whether a message with the exact expected text exists on ``peer``.
+
+    The destination channel is bot-managed (only this bot posts there), so an
+    exact full-text match is definitive proof that a previous publish attempt,
+    even one Telethon reported as a timeout/error, actually landed. Returns the
+    found message id, or None.
+
+    A read failure (unresolved peer, flood, network) also returns None
+    ('cannot verify'). Callers MUST treat that as "ambiguous" and decide
+    deliberately — release-and-requeue, mark failed, or fall through to stale
+    recovery — never as a license to blindly resend.
+    """
+    want = (expected_text or "").strip()
+    if not want:
+        return None
+    try:
+        messages = await client.get_messages(peer, limit=limit)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Could not scan %r for message confirmation", peer)
+        return None
+    for m in messages:
+        text = getattr(m, "text", None)
+        if text is not None and text.strip() == want:
+            return getattr(m, "id", None)
+    return None

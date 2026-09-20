@@ -582,6 +582,28 @@ def _parse_analysis_json(text: str) -> Optional[dict]:
     def _as_str(v, default=None):
         return v.strip() if isinstance(v, str) and v.strip() else default
 
+    def _as_bool(v) -> bool:
+        """Strict-but-tolerant boolean coercion.
+
+        A JSON-STRINGIFIED boolean must be honored: ``"false"`` / ``"0"`` /
+        ``"no"`` are False, NOT truthy (``bool("false") == True`` silently
+        inverted the intent → a "false" listing could have been auto-published).
+        Any other non-empty string keeps the old permissive behavior so a
+        miscast token never silently discards a real listing.
+        """
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("true", "1", "yes"):
+                return True
+            if s in ("false", "0", "no"):
+                return False
+            return bool(v.strip())
+        if isinstance(v, (int, float)):
+            return v != 0
+        return False
+
     def _as_float(v):
         if isinstance(v, bool):
             return None
@@ -617,13 +639,13 @@ def _parse_analysis_json(text: str) -> Optional[dict]:
     header = sanitize_buyer_header(data.get("header"))
 
     return {
-        "is_listing": bool(data.get("is_listing")),
-        "blocked": bool(data.get("blocked")),
+        "is_listing": _as_bool(data.get("is_listing")),
+        "blocked": _as_bool(data.get("blocked")),
         "block_reason": _as_str(data.get("block_reason"), "") or "",
         "platform": platform,
         "price": _as_float(data.get("price")),
         "intent": intent,
-        "dm_request": bool(data.get("dm_request")),
+        "dm_request": _as_bool(data.get("dm_request")),
         "header": header,
         "content": content_lines,
     }

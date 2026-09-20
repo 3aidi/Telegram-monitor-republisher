@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -513,10 +514,19 @@ def make_listing_fingerprint(
     the same product re-posted at a different price is NOT treated as a
     duplicate, and a re-post that arrives with a new Telegram message id IS
     caught (identity follows the content, not the message id). The 30-char
-    prefix truncation is deliberately gone: it caused unrelated long texts to
+prefix truncation is deliberately gone: it caused unrelated long texts to
     collide.
     """
-    norm = re.sub(r"\s+", " ", (clean_text or "").strip().lower())
+    norm = unicodedata.normalize("NFKC", (clean_text or "").strip().lower())
+    # DEDUP-FN: collapse the punctuation variants that are visually identical to
+    # readers — em/en/2-em dashes and the minus sign become '-', smart quotes
+    # become straight ASCII, non-breaking spaces fold to a space. A re-post with
+    # cosmetic punctuation differences therefore produces the SAME fingerprint
+    # and is caught as a duplicate instead of slipping through.
+    norm = norm.replace("\u2212", "-").replace("--", "-")
+    norm = norm.replace("\u2018", "'").replace("\u2019", "'")
+    norm = norm.replace("\u201c", '"').replace("\u201d", '"')
+    norm = re.sub(r"[\s\u00a0]+", " ", norm)
     if price is not None:
         norm = f"{norm} | {price:g}"
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()
@@ -1677,6 +1687,87 @@ def get_approved_listings_to_publish(
         return [dict(row) for row in rows]
 
 
+def claim_listing_for_publish(
+    listing_id: int, post_number: int, db_path: Optional[str] = None
+) -> bool:
+    """Atomically claim a listing for one external Telegram publish (once-only).
+
+    The single-statement transition to the transient status 'publishing' IS the
+    claim (F3): the guard ``status IN ('approved','pending_approval',
+    'pending_review') AND published_message_id IS NULL`` means a second claimer
+    — a second worker, an admin double-tap, or a post-crash retry — sees the row
+    in a non-claimable state and returns False, so it cannot send another copy.
+
+    The reserved post number is persisted on the row at claim time so a crash
+    after the claim but before bookkeeping can be reconstructed byte-for-byte
+    during stale-claim recovery (same inputs -> same deterministic message).
+
+    Returns True only for the single winner.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE listings
+            SET status = 'publishing',
+                post_number = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND status IN ('approved', 'pending_approval', 'pending_review')
+              AND published_message_id IS NULL
+            """,
+            (post_number, now_iso, listing_id),
+        )
+        return cursor.rowcount > 0
+
+
+def get_stale_publish_claims(
+    grace_seconds: int = 300, limit: int = 10, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Claims stuck in 'publishing' longer than ``grace_seconds``.
+
+    ``updated_at`` is the claim timestamp (set by claim_listing_for_publish).
+    Recovery runs in the approved-listings worker: each stale row is verified
+    against the destination channel and either recorded as published (the send
+    actually landed) or released back to 'approved' (the send provably did not).
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=grace_seconds)).isoformat()
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM listings
+            WHERE status = 'publishing'
+              AND updated_at <= ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def release_publish_claim(
+    listing_id: int, status: str = "approved", db_path: Optional[str] = None
+) -> bool:
+    """Abandon a 'publishing' claim when the send provably did NOT reach the channel.
+
+    Used by the ambiguous-failure path (after destination verification returned
+    nothing) and by stale-claim recovery. Releasing puts the listing back where
+    the worker can claim it again on the next drain.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE listings
+            SET status = ?, updated_at = ?
+            WHERE id = ? AND status = 'publishing'
+            """,
+            (status, now_iso, listing_id),
+        )
+        return cursor.rowcount > 0
+
+
 def get_published_listings(
     limit: int = 10, offset: int = 0, db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
@@ -1718,24 +1809,29 @@ def next_post_number(db_path: Optional[str] = None) -> int:
     Backed by the 'post_seq' counter in app_settings (seeded by the v4
     migration with the count of already-published posts). Gaps are acceptable:
     a number reserved before a send that later fails is simply skipped.
+
+    The counter row is seeded via INSERT ... ON CONFLICT DO NOTHING so two
+    concurrent first-time callers on a fresh database can never both reach an
+    unguarded INSERT (which would have raised a PRIMARY KEY violation on the
+    loser). Each call then runs inside its own write transaction, so SQLite's
+    single-writer rule guarantees every caller sees a distinct value.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
-        cursor = conn.execute(
+        conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES ('post_seq', '0', ?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (now_iso,),
+        )
+        conn.execute(
             "UPDATE app_settings SET value = CAST(value AS INTEGER) + 1, updated_at = ? "
             "WHERE key = 'post_seq'",
             (now_iso,),
         )
-        if cursor.rowcount:
-            row = conn.execute(
-                "SELECT value FROM app_settings WHERE key = 'post_seq'"
-            ).fetchone()
-            return int(row["value"])
-        conn.execute(
-            "INSERT INTO app_settings (key, value, updated_at) VALUES ('post_seq', '1', ?)",
-            (now_iso,),
-        )
-        return 1
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = 'post_seq'"
+        ).fetchone()
+        return int(row["value"])
 
 
 # ---------------------------------------------------------------------------
@@ -2270,7 +2366,7 @@ def mark_forward_failed(
     retry count and stay 'pending' with a backoff (retry_at); after
     FORWARD_MAX_RETRIES they are marked failed permanently so a dead destination
     does not grind the queue forever.
-    """
+"""
     now_iso = datetime.now(timezone.utc).isoformat()
     if not permanent:
         with db_session(db_path) as conn:
@@ -2299,3 +2395,51 @@ def mark_forward_failed(
             """,
             (error[:500], now_iso, forwarding_id),
         )
+
+
+def claim_forwarding(forwarding_id: int, db_path: Optional[str] = None) -> bool:
+    """Atomically claim one pending forwarding row before the external forward.
+
+    The transient status 'forwarding' is the once-only claim (F6): the guard
+    ``status = 'pending'`` plus the backoff check means a second worker or a
+    post-crash retry sees the row non-claimable and cannot forward it again.
+    Returns True only for the single winner.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE forwardings
+            SET status = 'forwarding', updated_at = ?
+            WHERE id = ? AND status = 'pending'
+              AND (retry_at IS NULL OR retry_at <= ?)
+            """,
+            (now_iso, forwarding_id, now_iso),
+        )
+        return cursor.rowcount > 0
+
+
+def reset_stale_forward_claims(
+    grace_seconds: int = 300, db_path: Optional[str] = None
+) -> int:
+    """Release forward rows stuck in 'forwarding' (crash between claim + forward).
+
+    Runs at startup. Rows are restored to 'pending' with ``error`` set to the
+    marker ``'stale_claim_reset'`` so the drain loop KNOWS a previous attempt
+    may have actually landed and must VERIFY against the destination (by
+    ``fwd_from.channel_post``) before forwarding again — a blind resend could
+    duplicate a forward that succeeded right before the crash.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=grace_seconds)).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        cur = conn.execute(
+            """
+            UPDATE forwardings
+            SET status = 'pending', error = 'stale_claim_reset',
+                retry_at = NULL, updated_at = ?
+            WHERE status = 'forwarding' AND updated_at <= ?
+            """,
+            (now_iso, cutoff),
+        )
+        return cur.rowcount

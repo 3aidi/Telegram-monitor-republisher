@@ -8,6 +8,7 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,6 +47,13 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0") or 0)
 CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "")
 PUBLISH_INTERVAL = float(os.environ.get("PUBLISH_INTERVAL", "1.5"))
 PUBLISH_MAX_RETRIES = int(os.environ.get("PUBLISH_MAX_RETRIES", "4"))
+# F3: once a listing is claimed ('publishing'), how long before a crashed/stuck
+# claim is considered abandoned. The approved-listings worker then verifies the
+# destination channel and either records the (actually-landed) message or
+# releases the claim for a clean retry.
+PUBLISH_CLAIM_GRACE_SECONDS = int(
+    os.environ.get("PUBLISH_CLAIM_GRACE_SECONDS", "300") or 300
+)
 BACKFILL_ON_START = os.environ.get("BACKFILL_ON_START", "0").strip().lower() in ("1", "true", "yes")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 # Free-tier reliability toggles: the chatter pre-filter saves AI quota, and the
@@ -275,6 +283,28 @@ def _supplier_label(supplier: dict) -> str:
             return f"id {username}"
         return f"@{username}" if not username.startswith("@") else username
     return "?"
+
+
+_self_echo_pattern = None
+
+
+def _build_self_echo_pattern() -> Optional[re.Pattern]:
+    """Regex matching our own destination footer in a re-shared message.
+
+    The footer is ``Contact  : @<CONTACT_USERNAME>``; a re-share can reformat
+    it (extra spaces, case, '@' dropped), so the old exact-string match was
+    brittle enough to let an echo slip through and be re-published. The pattern
+    tolerates spacing/case/@-prefix while still anchoring on the word 'contact'
+    so it cannot misfire on unrelated posts.
+    """
+    global _self_echo_pattern
+    if _self_echo_pattern is None and CONTACT_USERNAME:
+        user = CONTACT_USERNAME.strip().lstrip("@")
+        if user:
+            _self_echo_pattern = re.compile(
+                rf"contact\s*:\s*@?{re.escape(user)}", re.IGNORECASE
+            )
+    return _self_echo_pattern
 
 
 def deterministic_fallback_publish_ok(
@@ -534,7 +564,12 @@ async def publish_to_destination(
     - Serialized + throttled through publish_guard (shared with admin_bot).
     - FloodWaitError is honored (sleeps the requested amount and continues).
     - Other failures retry up to PUBLISH_MAX_RETRIES with exponential backoff.
-    - Raises PublishError after exhausting retries.
+    - An ambiguous failure (a send that MAY have landed server-side before the
+      error surfaced) is verified against the destination channel FIRST: an
+      exact-text match returns that message id instead of resending, so a lost
+      response can never produce a duplicate publication (F3 / NET-AMB).
+    - Raises PublishError after exhausting retries (verification confirming the
+      message is genuinely absent from the destination).
     """
     await publish_guard.throttle()
     delay = 3
@@ -552,6 +587,7 @@ async def publish_to_destination(
             _record_failure("publish_to_destination", last_error)
             flood_seconds = getattr(exc, "seconds", 0) or 0
             if flood_seconds:
+                # FloodWait = nothing was sent; safe to sleep and retry blindly.
                 logger.warning(
                     "FloodWait %ss hit while publishing (attempt %d/%d); sleeping.",
                     flood_seconds,
@@ -560,8 +596,27 @@ async def publish_to_destination(
                 )
                 await asyncio.sleep(flood_seconds)
                 continue
+            # Ambiguous timeout/error: the message may have landed even though
+            # the response was lost. Confirm against the channel before retrying.
+            try:
+                existing_id = await publish_guard.confirm_message_on_destination(
+                    client, dest_peer, text
+                )
+            except asyncio.CancelledError:
+                raise
+            if existing_id is not None:
+                logger.warning(
+                    "Publish attempt %d/%d for listing reported %r but the message "
+                    "was already on the destination (msg id %s) — not resending.",
+                    attempt,
+                    PUBLISH_MAX_RETRIES,
+                    last_error,
+                    existing_id,
+                )
+                _mark_publish()
+                return existing_id
             logger.warning(
-                "Publish attempt %d/%d failed: %s",
+                "Publish attempt %d/%d failed (not on destination): %s",
                 attempt,
                 PUBLISH_MAX_RETRIES,
                 last_error,
@@ -626,6 +681,37 @@ async def enqueue_destination_forwardings(
     )
 
 
+async def _confirm_forward_on_destination(
+    client: TelegramClient, to_peer, expected_channel_post_id: int
+) -> Optional[int]:
+    """Check whether a forward of channel post ``expected_channel_post_id``
+    already exists in ``to_peer`` (F6 forward-verification).
+
+    Only messages published by the bot are ever forwarded, and
+    ``fwd_from.channel_post`` is the per-channel sequence id of the ORIGINAL
+    message, so an exact match is definitive proof that a previous forward
+    attempt actually landed even if its response was lost. Returns the message
+    id found, else None (including when the destination can't be scanned —
+    callers must treat that as ambiguous, never as license to blindly resend).
+    """
+    try:
+        messages = await client.get_messages(to_peer, limit=25)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "Could not scan destination %r for forward confirmation", to_peer
+        )
+        return None
+    for m in messages:
+        fwd = getattr(m, "fwd_from", None)
+        if fwd is None:
+            continue
+        if getattr(fwd, "channel_post", None) == expected_channel_post_id:
+            return getattr(m, "id", None)
+    return None
+
+
 async def _drain_forward_queue(client: TelegramClient) -> None:
     """One pass over the pending destination-forward batch.
 
@@ -633,19 +719,48 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
     isolated: one failing destination is marked and the next is still attempted.
     Uses the SAME FloodWait retry helper as publishing (TEL-1) with a bounded
     sleep budget so a long flood defers that destination instead of blocking
-    the others.
+    the others. Rows are CLAIMED ('forwarding') before the external forward so
+    two workers can never forward the same message, and an ambiguous failure is
+    VERIFIED against the destination before it is retried or failed (F6).
     """
     pending = await db.run_async(db.get_pending_forwardings, 10)
     for row in pending:
         fwd_id = row["id"]
         to_peer = db.to_peer_reference(row["destination_chat_id"])
         from_peer = db.to_peer_reference(row["published_chat_id"])
+        expected_post_id = int(row["published_message_id"])
+
+        claimed = await db.run_async(db.claim_forwarding, fwd_id)
+        if not claimed:
+            logger.info(
+                "Forward row #%s already claimed by another path; skipping.",
+                fwd_id,
+            )
+            continue
+
+        # A startup reset of a stale claim (crash between claim and forward)
+        # marks the row so we VERIFY before forwarding: the previous attempt may
+        # actually have landed, and a blind resend would duplicate it.
+        if (row.get("error") or "") == "stale_claim_reset":
+            already_there = await _confirm_forward_on_destination(
+                client, to_peer, expected_post_id
+            )
+            if already_there is not None:
+                await db.run_async(db.mark_forwarded, fwd_id)
+                logger.warning(
+                    "Forward row #%s (msg %s) was already forwarded before restart "
+                    "(msg id %s) — recorded, not re-sent.",
+                    fwd_id,
+                    expected_post_id,
+                    already_there,
+                )
+                continue
 
         async def _forward_call():
             try:
                 return await client.forward_messages(
                     to_peer,
-                    messages=[row["published_message_id"]],
+                    messages=[expected_post_id],
                     from_peer=from_peer,
                 )
             except (ValueError, ChannelInvalidError) as res_err:
@@ -662,7 +777,7 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
                     logger.debug("Failed refreshing dialogs during forward retry: %s", diag_err)
                 return await client.forward_messages(
                     to_peer,
-                    messages=[row["published_message_id"]],
+                    messages=[expected_post_id],
                     from_peer=from_peer,
                 )
 
@@ -670,13 +785,30 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
             await publish_guard.run_with_floodwait_retry(
                 _forward_call,
                 f"forward listing #{row['listing_id']} "
-                f"msg {row['published_message_id']} to {row['destination_chat_id']}",
+                f"msg {expected_post_id} to {row['destination_chat_id']}",
                 max_total_sleep=FORWARD_FLOODWAIT_BUDGET_SECONDS,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            permanent = isinstance(exc, PERMANENT_FORWARD_ERRORS)
+            raise_as_error = exc
+            # Ambiguous failure: the forward may have landed before the error
+            # surfaced (timeout/lost response). Verify BEFORE declaring failure,
+            # otherwise the retry below would forward the message a second time.
+            already_there = await _confirm_forward_on_destination(
+                client, to_peer, expected_post_id
+            )
+            if already_there is not None:
+                await db.run_async(db.mark_forwarded, fwd_id)
+                logger.warning(
+                    "Forward to %s reported %r but the message is already there "
+                    "(msg id %s) — recorded, not re-sent.",
+                    row["destination_chat_id"],
+                    str(exc)[:200],
+                    already_there,
+                )
+                continue
+            permanent = isinstance(raise_as_error, PERMANENT_FORWARD_ERRORS)
             await db.run_async(db.mark_forward_failed, fwd_id, str(exc)[:500], permanent)
             logger.warning(
                 "Forward to destination %s failed%s: %s",
@@ -832,9 +964,19 @@ async def _process_supplier_message(
     supplier_id = supplier["id"]
     source_msg_id = getattr(msg, "id", None)
     raw_text = msg.text or ""
+    has_media = bool(getattr(msg, "media", None))
 
-    if not source_msg_id or not raw_text.strip():
+    # Media-only posts (screenshot/image ads with no caption) must never be
+    # silently dropped: they are routed to manual review so the admin can see
+    # them and type an Edit body if they are a real listing. Purely textless,
+    # medialess noise (e.g. random emoji messages) is still dropped.
+    if not source_msg_id:
         return
+    if not raw_text.strip() and not has_media:
+        return
+    media_only = has_media and not raw_text.strip()
+    if media_only:
+        raw_text = "[📷 Media-only post — no text caption]"
 
     # Idempotency guard: if this source message is already recorded, ignore
     # re-deliveries so nothing is double-processed or double-published.
@@ -852,8 +994,10 @@ async def _process_supplier_message(
     # channel, don't re-analyze/re-publish it. Its footer carries the destination
     # contact signature; skipping stops repricing compounding (e.g. $60 -> $45 -> $34)
     # and duplicate re-posts. This is a *containment* measure for re-shares of our
-    # own posts, not a filter on real supplier ads.
-    if CONTACT_USERNAME and f"Contact  : @{CONTACT_USERNAME}" in raw_text:
+    # own posts, not a filter on real supplier ads. The footer match tolerates
+    # spacing/case/@-prefix variations introduced by re-sharing.
+    echo_pattern = _build_self_echo_pattern()
+    if echo_pattern and echo_pattern.search(raw_text):
         logger.info(
             "Source message %s from %s looks like our own destination output; skipping",
             source_msg_id,
@@ -889,6 +1033,30 @@ async def _process_supplier_message(
         clean_text=fallback_clean_text,
         fingerprint=fingerprint,
     )
+
+    # Media-only posts have no analyzable text: skip fingerprint/AI entirely and
+    # route straight to admin review (never silently dropped, never auto-published).
+    if media_only:
+        await db.run_async(db.update_listing_status, listing_id, "pending_review")
+        await db.run_async(
+            db.record_audit,
+            "media_only_review",
+            listing_id,
+            detail="Media-only post (no caption) routed for manual review",
+        )
+        logger.info(
+            "Listing #%s is a media-only post (no caption); routed to pending_review.",
+            listing_id,
+        )
+        if bot_client and ADMIN_USER_ID:
+            listing_dict = db.get_listing_by_id(listing_id)
+            if listing_dict:
+                listing_dict["supplier_username"] = supplier.get("channel_username")
+                listing_dict["_review_reason"] = "media_only"
+                await admin_bot.send_approval_prompt(
+                    bot_client, ADMIN_USER_ID, listing_dict
+                )
+        return
 
     # Step 1: Content-based filter check FIRST — plain-text fingerprint
     # (normalized text + parsed price), no AI needed. Skip identical listings
@@ -1343,6 +1511,71 @@ async def process_deleted_message(event) -> None:
 # ---------------------------------------------------------------------------
 # Background workers
 # ---------------------------------------------------------------------------
+async def _recover_stale_publish_claims(client: TelegramClient) -> None:
+    """Resolve publish claims abandoned mid-flight (F3 crash recovery).
+
+    A claim held while the process died leaves the listing in 'publishing'.
+    The claim timestamp (updated_at) plus PUBLISH_CLAIM_GRACE_SECONDS decides
+    abandonment. Every stale row is verified against the destination channel:
+
+    * message present -> the last attempt actually landed; record it as
+      published (exact same deterministic text as the crashed attempt, since
+      the post number was persisted at claim time) so it is NEVER re-sent;
+    * message absent  -> the crashed attempt never reached Telegram; release
+      the claim back to 'approved' so the normal drain claims + publishes it.
+    """
+    stale = await db.run_async(db.get_stale_publish_claims, PUBLISH_CLAIM_GRACE_SECONDS, 10)
+    for row in stale:
+        listing_id = row["id"]
+        content_text = row.get("clean_text") or row.get("raw_text") or ""
+        content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
+        try:
+            out_text, entities = parser.build_ai_message(
+                content_lines=content_lines,
+                platform=row.get("platform_name"),
+                contact_username=CONTACT_USERNAME,
+                intent=row.get("intent") or "neutral",
+                header_word=row.get("header_word"),
+                listing_seed=listing_id,
+                post_number=row.get("post_number"),
+                source_text=row.get("raw_text"),
+            )
+        except Exception:
+            logger.exception(
+                "Could not rebuild deterministic text for stale claim on listing #%s; "
+                "releasing claim.",
+                listing_id,
+            )
+            await db.run_async(db.release_publish_claim, listing_id, "approved")
+            continue
+
+        found_id = await publish_guard.confirm_message_on_destination(
+            client, db.to_peer_reference(DEST_CHANNEL), out_text
+        )
+        if found_id is not None:
+            await db.run_async(
+                db.update_listing_status,
+                listing_id=listing_id,
+                status="published",
+                published_message_id=found_id,
+                post_number=row.get("post_number"),
+            )
+            await enqueue_destination_forwardings(listing_id, found_id)
+            logger.warning(
+                "Recovered stale publish claim for listing #%s: message already on "
+                "destination (msg id %s) — recorded, not re-sent.",
+                listing_id,
+                found_id,
+            )
+        else:
+            await db.run_async(db.release_publish_claim, listing_id, "approved")
+            logger.warning(
+                "Released stale publish claim for listing #%s (no message on "
+                "destination); it will be re-claimed and published on the next drain.",
+                listing_id,
+            )
+
+
 async def approved_listings_worker(
     client: TelegramClient, stop_event: asyncio.Event, bot_client: Optional[TelegramClient]
 ) -> None:
@@ -1356,6 +1589,10 @@ async def approved_listings_worker(
     while not stop_event.is_set():
         _mark_worker_heartbeat("approved_worker")
         try:
+            # F3: first resolve claims that died mid-publish (crash between the
+            # claim and the DB bookkeeping). Verification-based recovery either
+            # records the message that actually landed or releases the claim.
+            await _recover_stale_publish_claims(client)
             approved = await db.run_async(db.get_approved_listings_to_publish, 5)
             for listing in approved:
                 listing_id = listing["id"]
@@ -1365,6 +1602,20 @@ async def approved_listings_worker(
                 content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
                 intent = listing.get("intent") or "neutral"
                 post_number = await db.run_async(db.next_post_number)
+
+                # F3: atomic claim BEFORE any external send. Only the single
+                # winner proceeds; a second worker, admin double-tap, or
+                # crash-retry sees status 'publishing' / non-NULL msg id here and
+                # must NOT send another Telegram message.
+                claimed = await db.run_async(
+                    db.claim_listing_for_publish, listing_id, post_number
+                )
+                if not claimed:
+                    logger.info(
+                        "Listing #%s already claimed for publishing by another path; skipping.",
+                        listing_id,
+                    )
+                    continue
 
                 out_text, entities = parser.build_ai_message(
                     content_lines=content_lines,
@@ -1592,6 +1843,16 @@ async def main() -> None:
             logger.info("Reset %d forwardings with resolution errors for immediate retry.", unresolved_reset)
     except Exception:
         logger.exception("Could not reset unresolved forwardings at startup")
+    try:
+        stale_forward_reset = db.reset_stale_forward_claims()
+        if stale_forward_reset:
+            logger.info(
+                "Reset %d stale forwarding claims (crash-recovered); they will be "
+                "verified against their destinations before any re-forward.",
+                stale_forward_reset,
+            )
+    except Exception:
+        logger.exception("Could not reset stale forwarding claims at startup")
     env_seed_notice = db.validate_env_seed_config(SOURCE_CHANNELS_RAW)
     if env_seed_notice:
         logger.warning("%s", env_seed_notice)

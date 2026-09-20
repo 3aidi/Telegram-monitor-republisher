@@ -1243,7 +1243,7 @@ def _published_digest(
     return text, buttons
 
 
-async def _send_pending_page(event, page: int = 0) -> None:
+async def _send_pending_page(event, bot, page: int = 0) -> None:
     """Render one page of the pending queue: header + nav + up to 6 approval cards.
 
     Replaces the tapped message with a fresh page header (carrying the
@@ -1510,7 +1510,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
     async def handle_pending(event):
         if not await check_admin(event):
             return
-        await _send_pending_page(event, 0)
+        await _send_pending_page(event, bot, 0)
 
     @bot.on(events.NewMessage(pattern=r"^(?:/failed|⚠️ Failed)"))
     async def handle_failed(event):
@@ -1787,7 +1787,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await _message_delete_send(event, _status_report_text(), buttons=_home_button_row())
                 return
             if home_action == "pending":
-                await _send_pending_page(event, 0)
+                await _send_pending_page(event, bot, 0)
                 return
             if home_action == "failed":
                 failed = db.get_failed_listings(limit=_PAGE_SIZE, offset=0)
@@ -1869,7 +1869,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         if data_str == "wiz:cancel":
-            _wizard_state.pop(ADMIN_USER_ID, None)
+            # Dropping the wizard must ALSO drop any half-typed edit draft:
+            # otherwise the stale text silently resurrects on a later Approve
+            # of the same listing (wizard-draft leak).
+            wiz = _wizard_state.pop(ADMIN_USER_ID, None)
+            if wiz and wiz.get("step") == "edit" and wiz.get("listing_id"):
+                _drafts.pop(wiz["listing_id"], None)
             await event.answer("Cancelled")
             try:
                 await event.delete()
@@ -1942,7 +1947,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         pendpage_match = re.match(r"^pend:page:(-?\d+)$", data_str)
         if pendpage_match:
             raw_page = int(pendpage_match.group(1))
-            await _send_pending_page(event, raw_page)
+            await _send_pending_page(event, bot, raw_page)
             return
 
         # ---- Suppliers submenu ---------------------------------------------
@@ -2290,20 +2295,27 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 logger.exception("Failed to build preview for listing #%s", listing_id)
                 await event.answer("Could not build preview for this listing.", alert=True)
                 return
-            # Delete the tapped prompt card; the preview is the new anchor message.
+            # Send the replacement preview FIRST so the original prompt card is
+            # never removed without a confirmed replacement in its place.
+            try:
+                await event.client.send_message(
+                    ADMIN_USER_ID,
+                    f"📄 **Preview of Listing #{listing_id}**\n"
+                    f"Source: {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))} · Status: `{listing['status']}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{preview_text}",
+                    buttons=_listing_action_buttons(listing),
+                    parse_mode="markdown",
+                )
+            except Exception:
+                logger.exception("Failed to send preview message for listing #%s", listing_id)
+                await event.answer("Could not send the preview.", alert=True)
+                return
+            # Only now is the tapped card removed.
             try:
                 await event.delete()
             except Exception:
                 pass
-            await event.client.send_message(
-                ADMIN_USER_ID,
-                f"📄 **Preview of Listing #{listing_id}**\n"
-                f"Source: {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))} · Status: `{listing['status']}`\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"{preview_text}",
-                buttons=_listing_action_buttons(listing_id, listing["status"]),
-                parse_mode="markdown",
-            )
             return
 
         edit_match = re.match(r"^edit:(\d+)$", data_str)
@@ -2459,6 +2471,25 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if user_client_ref and user_client_ref.is_connected() and DEST_CHANNEL:
                 # CONC-3: share the same lock + rate-limit as the worker and the
                 # auto-publish path so admin-approve and worker never interleave.
+                #
+                # F3: atomic claim BEFORE the external send. Only the single
+                # winner may publish; a second Approve tap, a second worker, or a
+                # crash-retry sees status 'publishing' and must not send again.
+                claimed = await db.run_async(
+                    db.claim_listing_for_publish, listing_id, post_number
+                )
+                if not claimed:
+                    try:
+                        await event.client.send_message(
+                            ADMIN_USER_ID,
+                            f"⚠️ Listing #{listing_id} is already being published by "
+                            f"another publish attempt. No duplicate was sent.",
+                            buttons=_home_keyboard(),
+                            parse_mode="markdown",
+                        )
+                    except Exception:
+                        pass
+                    return
                 await publish_guard.throttle()
                 published_msg_id = None
                 dest_peer = db.to_peer_reference(DEST_CHANNEL)
@@ -2474,26 +2505,44 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     published_msg_id = sent_msg.id
                 except Exception as e:
                     logger.exception("Send failed for listing #%s via user_client: %s", listing_id, e)
-                    # Nothing was sent — safe to re-queue for the worker.
-                    await db.run_async(db.update_listing_status, listing_id, "approved")
-                    await db.run_async(
-                        db.record_audit,
-                        "approved_queued",
-                        listing_id,
-                        actor_id=event.sender_id,
-                        detail=str(e)[:200],
+                    # Ambiguous failure: the message may actually have landed even
+                    # though the response was lost. Confirm against the channel
+                    # before re-queueing — otherwise the worker republishes it.
+                    confirmed_id = await publish_guard.confirm_message_on_destination(
+                        user_client_ref, dest_peer, republished_text
                     )
-                    try:
-                        await event.client.send_message(
-                            ADMIN_USER_ID,
-                            f"⚠️ Listing #{listing_id} approved but send failed.\n"
-                            f"Queued for retry. Error: {e}",
-                            buttons=_home_keyboard(),
-                            parse_mode="markdown",
+                    if confirmed_id is not None:
+                        logger.warning(
+                            "Approve send for listing #%s reported %r but the message "
+                            "is on the destination (msg id %s) — recording as published, "
+                            "NOT re-queueing.",
+                            listing_id,
+                            e,
+                            confirmed_id,
                         )
-                    except Exception:
-                        pass
-                    return
+                        published_msg_id = confirmed_id
+                    else:
+                        # Provably not on the destination — release the claim and
+                        # re-queue for the worker.
+                        await db.run_async(db.release_publish_claim, listing_id, "approved")
+                        await db.run_async(
+                            db.record_audit,
+                            "approved_queued",
+                            listing_id,
+                            actor_id=event.sender_id,
+                            detail=str(e)[:200],
+                        )
+                        try:
+                            await event.client.send_message(
+                                ADMIN_USER_ID,
+                                f"⚠️ Listing #{listing_id} approved but send failed.\n"
+                                f"Queued for retry. Error: {e}",
+                                buttons=_home_keyboard(),
+                                parse_mode="markdown",
+                            )
+                        except Exception:
+                            pass
+                        return
 
                 # Message IS on the channel now — under no circumstance re-queue it.
                 try:
@@ -2659,7 +2708,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 f"then Approve or Edit again.\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"{preview_text}",
-                buttons=_listing_action_buttons(listing_id, listing["status"]),
+                buttons=_listing_action_buttons(listing),
                 parse_mode="markdown",
             )
             return
