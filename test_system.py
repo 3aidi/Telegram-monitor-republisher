@@ -792,14 +792,14 @@ class TestMonitorSystem(unittest.TestCase):
             main_mod.ADMIN_USER_ID = old_admin_id
 
     def test_listing_is_editable_helper(self):
-        """The shared editable-status predicate gates edit/approve/reject flows."""
+        """The shared editable-status predicate gates edit/approve/skip flows."""
         import admin_bot
 
         self.assertTrue(admin_bot.listing_is_editable("pending_approval"))
         self.assertTrue(admin_bot.listing_is_editable("pending_review"))
         self.assertFalse(admin_bot.listing_is_editable("approved"))
         self.assertFalse(admin_bot.listing_is_editable("published"))
-        self.assertFalse(admin_bot.listing_is_editable("rejected"))
+        self.assertFalse(admin_bot.listing_is_editable("skipped_admin"))
         self.assertFalse(admin_bot.listing_is_editable("failed"))
         self.assertFalse(admin_bot.listing_is_editable(""))
 
@@ -1079,12 +1079,12 @@ class TestMonitorSystem(unittest.TestCase):
         sid = db.add_supplier("@skip_src", channel_id=-100888, db_path=TEST_DB)
         db.log_skip(sid, 7001, "duplicate", "WTS Bybit $100", db_path=TEST_DB)
         db.log_skip(sid, 7002, "not_a_listing", "some chatter", db_path=TEST_DB)
-        db.log_skip(sid, 7003, "self_echo", "our own output", db_path=TEST_DB)
+        db.log_skip(sid, 7003, "no_content", "no usable body", db_path=TEST_DB)
 
         reasons = db.get_skip_reasons_today(db_path=TEST_DB)
         self.assertEqual(reasons.get("duplicate"), 1)
         self.assertEqual(reasons.get("not_a_listing"), 1)
-        self.assertEqual(reasons.get("self_echo"), 1)
+        self.assertEqual(reasons.get("no_content"), 1)
 
         # Per-supplier breakdown counts listings processed today + skips today.
         stats = db.get_today_stats(db_path=TEST_DB)
@@ -3483,6 +3483,7 @@ import re as _re
 import types as _types
 
 _P5_SEQ = _itertools.count(1)
+_P5_SUPPLIER_CHANNELS = _itertools.count(start=1)
 
 
 class _P5FakeMsg:
@@ -3513,6 +3514,8 @@ class _P5FakeUserClient:
         self.sent = []
         self.forwarded = []
         self.forward_calls = 0
+        self.send_calls = 0
+        self.fail_send = None
         self.scan = {}
         self.dialogs_called = 0
         self.fail_forward = None
@@ -3526,6 +3529,9 @@ class _P5FakeUserClient:
         return self._connected
 
     async def send_message(self, peer, text, formatting_entities=None, **kw):
+        self.send_calls += 1
+        if self.fail_send is not None:
+            raise self.fail_send
         self._send_ids += 1
         m = _P5FakeMsg(self._send_ids, text=text)
         self.scan.setdefault(peer, []).insert(0, m)
@@ -3677,8 +3683,16 @@ async def _dispatch_wizard(bot, text, sender_id=None):
 
 def _button_datas(msg):
     out = []
-    for rows in msg.get("buttons") or []:
-        for b in rows:
+    raw = msg.get("buttons") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = [raw]
+    rows = [raw] if raw and not isinstance(raw[0], (list, tuple)) else raw
+    for row in rows:
+        if not isinstance(row, (list, tuple)):
+            row = [row]
+        for b in row:
             data = getattr(b, "data", None)
             if data is not None:
                 out.append(data.decode("utf-8") if isinstance(data, bytes) else str(data))
@@ -3735,7 +3749,6 @@ class TestPhase5Handlers(unittest.TestCase):
         main.DEST_CHANNEL = "-1007770001"
         admin_bot.DEST_CHANNEL = "-1007770001"
         main.PUBLISH_CLAIM_GRACE_SECONDS = 300
-        main._self_echo_pattern = None
         admin_bot._wizard_state.clear()
         admin_bot._drafts.clear()
 
@@ -3770,9 +3783,10 @@ class TestPhase5Handlers(unittest.TestCase):
 
     # ---------------- helpers ----------------------------------------
     def _new_supplier_id(self, label):
+        chan = next(_P5_SUPPLIER_CHANNELS)
         return db.add_supplier(
             f"@p5_{label}_{self._seq}",
-            channel_id=-1008830000 + self._seq * 10,
+            channel_id=-1008830000 + chan,
         )
 
     def _add_supplier(self, label):
@@ -4151,8 +4165,8 @@ class TestPhase5Handlers(unittest.TestCase):
             self.assertLess(send_at, delete_at, "send MUST happen before delete")
             data = _all_button_datas(self.bot)
             self.assertTrue(
-                {f"edit:{lid}", f"approve:{lid}", f"reject:{lid}"} <= set(data),
-                "the F1 fix must build Edit/Approve/Reject from the listing dict",
+                {f"edit:{lid}", f"approve:{lid}", f"skip:{lid}"} <= set(data),
+                "the F1 fix must build Edit/Approve/Skip from the listing dict",
             )
 
         asyncio.run(_run())
@@ -4226,19 +4240,18 @@ class TestPhase5Handlers(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_admin_double_tap_reject_no_resend(self):
-        """Double-tap Reject: the listing is rejected once; the second tap is
+    def test_admin_double_tap_skip_no_resend(self):
+        """Double-tap Skip: the listing is skipped once; the second tap is
         answered 'Already processed' and nothing is ever published."""
 
         async def _run():
             lid = self._add_listing(status="pending_approval")
-            await _dispatch_callback(self.bot, f"reject:{lid}", self.ADMIN)
-            self.assertEqual(db.get_listing_by_id(lid)["status"], "rejected")
+            await _dispatch_callback(self.bot, f"skip:{lid}", self.ADMIN)
+            self.assertEqual(db.get_listing_by_id(lid)["status"], "skipped_admin")
 
-            ev = await _dispatch_callback(self.bot, f"reject:{lid}", self.ADMIN)
+            ev = await _dispatch_callback(self.bot, f"skip:{lid}", self.ADMIN)
             self.assertTrue(any("Already processed" in a for a in ev.answers))
-            self.assertEqual(self.user_client.sent, [], "a rejected listing is never published")
-            self.assertTrue(any("rejected" in m["text"].lower() for m in self.bot.sent))
+            self.assertEqual(self.user_client.sent, [], "a skipped listing is never published")
 
         asyncio.run(_run())
 
@@ -4369,6 +4382,81 @@ class TestPhase5Handlers(unittest.TestCase):
             self.assertEqual(self.user_client.sent, [], "never published")
             self.assertEqual(self._forward_rows(new_listing["id"]), [],
                              "skipped content must never be forwarded")
+            self.assertTrue(
+                any("Skipped — duplicate" in m.get("text", "") for m in self.bot.sent),
+                "admin must be DM'd on a duplicate skip",
+            )
+
+        asyncio.run(_run())
+
+    def test_self_echo_guard_removed_message_is_processed(self):
+        """Self-echo is no longer a skip reason: a message whose text carries the
+        old destination-footer signature now flows through the normal pipeline
+        (reaching the AI step) instead of being short-circuited as 'self_echo'."""
+
+        async def _run():
+            prev_chatter = self.main_mod.PRE_FILTER_CHATTER
+            prev_analyze = self.main_mod.ai_rephraser.analyze_message
+            self.main_mod.PRE_FILTER_CHATTER = False
+
+            async def fake_analyze(text):
+                return {"is_listing": False, "blocked": False, "block_reason": ""}
+
+            self.main_mod.ai_rephraser.analyze_message = fake_analyze
+            try:
+                sup = self._add_supplier("echo_src")
+                chat = _types.SimpleNamespace(id=-1009990003)
+                text = "WTS Bybit full $100\nContact  : @fwfwdsf"
+                msg = _P5FakeMsg(650000 + self._seq, text=text, media=None, chat=chat)
+                await self.main_mod._process_supplier_message(
+                    self.user_client, self.bot, sup, msg
+                )
+
+                listing = db.get_listing_by_source(sup["id"], 650000 + self._seq)
+                self.assertIsNotNone(listing, "the self-echo-looking message must be processed")
+                self.assertEqual(
+                    listing["status"], "skipped_filter",
+                    "it must reach the AI step and be classified, not short-circuited",
+                )
+                with db.db_session() as conn:
+                    echo_skips = conn.execute(
+                        "SELECT COUNT(*) AS c FROM skips WHERE reason = 'self_echo'"
+                    ).fetchone()
+                self.assertEqual(echo_skips["c"], 0, "'self_echo' must never be logged again")
+                self.assertTrue(
+                    any("Skipped — not_a_listing" in m.get("text", "") for m in self.bot.sent),
+                    "admin must be DM'd on the AI not-a-listing skip",
+                )
+            finally:
+                self.main_mod.ai_rephraser.analyze_message = prev_analyze
+                self.main_mod.PRE_FILTER_CHATTER = prev_chatter
+
+        asyncio.run(_run())
+
+    def test_skip_chatter_notifies_admin(self):
+        """The chatter pre-filter skip DMs the admin instead of being silent."""
+
+        async def _run():
+            prev_chatter = self.main_mod.PRE_FILTER_CHATTER
+            self.main_mod.PRE_FILTER_CHATTER = True
+            try:
+                sup = self._add_supplier("chat_src")
+                chat = _types.SimpleNamespace(id=-1009990004)
+                msg = _P5FakeMsg(660000 + self._seq, text="Hi everyone, welcome!",
+                                 media=None, chat=chat)
+                await self.main_mod._process_supplier_message(
+                    self.user_client, self.bot, sup, msg
+                )
+
+                listing = db.get_listing_by_source(sup["id"], 660000 + self._seq)
+                self.assertIsNotNone(listing)
+                self.assertEqual(listing["status"], "skipped_chatter")
+                self.assertTrue(
+                    any("Skipped — chatter" in m.get("text", "") for m in self.bot.sent),
+                    "admin must be DM'd on a chatter skip",
+                )
+            finally:
+                self.main_mod.PRE_FILTER_CHATTER = prev_chatter
 
         asyncio.run(_run())
 
@@ -4389,13 +4477,163 @@ class TestPhase5Handlers(unittest.TestCase):
                 except OSError:
                     pass
 
-    def test_self_echo_pattern_normalized_matching(self):
-        """The self-echo regex tolerates spacing/case/@-prefix reformatting that
-        the old exact-string match let slip through."""
-        pat = _re.compile(r"contact\s*:\s*@?bybitbot", _re.IGNORECASE)
-        self.assertIsNotNone(pat.search("Price : DM\nContact  : @bybitbot"))
-        self.assertIsNotNone(pat.search("PRICE : DM\nCONTACT:@BybitBot"))
-        self.assertIsNone(pat.search("Price : DM\nSeller : @bybitbot"))
+    # ---------------- Next-Pending Review inbox (Phase 6) -------------
+    def _seed_two_pending(self, text_a="WTS Bybit full $100",
+                          text_b="WTS Revolut account $150"):
+        lid_a = self._add_listing(status="pending_approval", text=text_a)
+        lid_b = self._add_listing(
+            status="pending_approval", text=text_b,
+            supplier_id=self._new_supplier_id(f"nb{self._seq}"),
+        )
+        return lid_a, lid_b
+
+    def _sent_texts(self):
+        return [m.get("text", "") for m in self.bot.sent]
+
+    def _has_next_card(self, listing_id):
+        return (
+            f"approve:{listing_id}" in _all_button_datas(self.bot)
+            and any("Next Review" in t for t in self._sent_texts())
+        )
+
+    def test_approve_advances_to_next_listing(self):
+        """Approve publishes the current listing AND immediately shows the next
+        pending listing's review card (the inbox flow)."""
+
+        async def _run():
+            self._add_destination()
+            lid_a, lid_b = self._seed_two_pending()
+            await _dispatch_callback(self.bot, f"approve:{lid_a}", self.ADMIN)
+
+            row_a = db.get_listing_by_id(lid_a)
+            self.assertEqual(row_a["status"], "published")
+            self.assertEqual(len(self.user_client.sent), 1, "A published exactly once")
+            self.assertTrue(
+                any(f"#{lid_a} Published" in t for t in self._sent_texts()),
+                "publish confirmation shown",
+            )
+            self.assertTrue(
+                self._has_next_card(lid_b),
+                "the next pending listing B must be surfaced automatically",
+            )
+
+        asyncio.run(_run())
+
+    def test_skip_advances_to_next_listing(self):
+        """Skip leaves the review queue, is logged + audited, never publishes,
+        and the next listing is shown."""
+
+        async def _run():
+            lid_a, lid_b = self._seed_two_pending()
+            await _dispatch_callback(self.bot, f"skip:{lid_a}", self.ADMIN)
+
+            row_a = db.get_listing_by_id(lid_a)
+            self.assertEqual(row_a["status"], "skipped_admin")
+            self.assertEqual(self.user_client.sent, [], "skipped -> never published")
+            with db.db_session() as conn:
+                audit = conn.execute(
+                    "SELECT COUNT(*) AS c FROM audit_log WHERE listing_id = ? AND action = 'skipped_admin'",
+                    (lid_a,),
+                ).fetchone()
+                skip_row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM skips WHERE supplier_id = ? AND message_id = ?",
+                    (row_a["supplier_id"], row_a["source_message_id"]),
+                ).fetchone()
+            self.assertEqual(audit["c"], 1, "skip must be audited")
+            self.assertEqual(skip_row["c"], 1, "skip must be logged for the /skipped screen")
+            self.assertTrue(
+                self._has_next_card(lid_b),
+                "the next pending listing B must be surfaced after a skip",
+            )
+
+        asyncio.run(_run())
+
+    def test_edit_save_advances_to_next_listing(self):
+        """Edit -> type a draft -> Save (Approve) publishes the DRAFT and then
+        shows the next pending listing."""
+
+        async def _run():
+            self._add_destination()
+            lid_a, lid_b = self._seed_two_pending()
+            await _dispatch_callback(self.bot, f"edit:{lid_a}", self.ADMIN)
+            await _dispatch_wizard(self.bot, "KYC CURVE PAY\nANY EU", self.ADMIN)
+            await _dispatch_callback(self.bot, f"approve:{lid_a}", self.ADMIN)
+
+            self.assertEqual(db.get_listing_by_id(lid_a)["status"], "published")
+            self.assertEqual(len(self.user_client.sent), 1)
+            self.assertIn("KYC CURVE PAY", self.user_client.sent[0]["text"],
+                          "the saved draft is what gets published")
+            self.assertTrue(
+                self._has_next_card(lid_b),
+                "after saving an edit the inbox must advance to the next listing",
+            )
+
+        asyncio.run(_run())
+
+    def test_no_pending_listings_after_action_shows_queue_finished(self):
+        """When the queue empties after a decision, an explicit finished notice
+        is shown instead of a listing card."""
+
+        async def _run():
+            self._add_destination()
+            lid = self._add_listing(status="pending_approval")
+            await _dispatch_callback(self.bot, f"approve:{lid}", self.ADMIN)
+
+            texts = self._sent_texts()
+            self.assertTrue(any("Review queue finished" in t for t in texts))
+            self.assertTrue(any("No pending listings right now" in t for t in texts))
+            self.assertFalse(any("Next Review" in t for t in texts),
+                             "no card may be sent for an empty queue")
+
+        asyncio.run(_run())
+
+    def test_failed_publish_does_not_advance(self):
+        """A provably-failed publish releases the claim and keeps the listing as
+        the focus — the inbox must NOT advance as if it succeeded."""
+
+        async def _run():
+            self._add_destination()
+            lid_a, lid_b = self._seed_two_pending()
+            self.user_client.fail_send = RuntimeError("network timeout")
+
+            await _dispatch_callback(self.bot, f"approve:{lid_a}", self.ADMIN)
+
+            row_a = db.get_listing_by_id(lid_a)
+            self.assertEqual(row_a["status"], "approved",
+                             "claim released back to the worker queue")
+            self.assertIsNone(row_a["published_message_id"])
+            texts = self._sent_texts()
+            self.assertTrue(any("Queued for retry" in t or "send failed" in t for t in texts))
+            self.assertFalse(any("Next Review" in t for t in texts),
+                             "failed publish must not advance the inbox")
+            self.assertFalse(any("Review queue finished" in t for t in texts))
+            self.assertNotIn(f"approve:{lid_b}", _all_button_datas(self.bot))
+
+        asyncio.run(_run())
+
+    def test_double_tap_approve_stays_safe_and_advances(self):
+        """A second Approve tap on an already-published card never publishes
+        again; it is answered 'Already processed' and the inbox still moves."""
+
+        async def _run():
+            self._add_destination()
+            lid_a, lid_b = self._seed_two_pending()
+            await _dispatch_callback(self.bot, f"approve:{lid_a}", self.ADMIN)
+            self.assertEqual(len(self.user_client.sent), 1)
+
+            ev2 = await _dispatch_callback(self.bot, f"approve:{lid_a}", self.ADMIN)
+
+            self.assertTrue(any("Already processed" in a for a in ev2.answers),
+                            "second tap must be answered, not re-published")
+            self.assertEqual(len(self.user_client.sent), 1, "never a second publish")
+            self.assertEqual(db.get_listing_by_id(lid_a)["status"], "published")
+            self.assertEqual(len(self._forward_rows(lid_a)), 1, "no duplicate forward rows")
+            self.assertTrue(
+                self._has_next_card(lid_b),
+                "the already-processed card still advances the inbox to the next listing",
+            )
+
+        asyncio.run(_run())
 
 
 def admin_mod_drafts():

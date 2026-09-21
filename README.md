@@ -30,7 +30,7 @@ An automated, robust Telegram channel monitor and republisher for digital accoun
    - Adds `📞 Contact : @username` to the footer of every republished post so buyers can contact you directly.
    - Price is always shown as the static `Price DM` — never republished, negotiated privately.
 9. **Admin Approval Bot**:
-    - Inline `[Approve]` and `[Reject]` buttons for ambiguous listings.
+    - Inline `[Approve]` and `[Skip]` buttons for ambiguous listings.
     - Failed-publish queue (DLQ) with `/failed` and `/retry <id>`.
     - `/preview <id>` shows the exact formatted post before publishing.
 10. **Publish Reliability**:
@@ -186,7 +186,7 @@ When a source message contains a valid platform and price but lacks an explicit 
 1. The listing is saved with status `pending_approval`.
 2. The Admin Bot sends an alert to your Telegram with post details.
 3. Tap **[✅ Approve]** to republish the listing immediately to `DEST_CHANNEL`.
-4. Tap **[❌ Reject]** to mark it as skipped.
+4. Tap **[⏭️ Skip]** to leave it in `/skipped` for later (never published).
 
 If the bot cannot publish (e.g. temporary error), the listing is marked `approved` and the background worker publishes it automatically. Failed publishes land in the DLQ and can be re-queued with `/retry`.
 

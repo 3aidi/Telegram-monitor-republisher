@@ -27,8 +27,8 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0") or 0)
 DEST_CHANNEL = os.environ.get("DEST_CHANNEL", "")
 CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "")
 
-# Statuses in which a listing may still be edited / approved / rejected. Once a
-# listing leaves this set (published, failed, rejected...) any in-flight admin
+# Statuses in which a listing may still be edited / approved / skipped. Once a
+# listing leaves this set (published, failed, skipped...) any in-flight admin
 # action (edit wizard, Approve tap) must be refused, not silently applied.
 EDITABLE_LISTING_STATUSES = ("pending_approval", "pending_review")
 
@@ -72,20 +72,27 @@ async def send_approval_prompt(
     bot_client: TelegramClient,
     admin_id: int,
     listing: dict,
+    as_next: bool = False,
 ) -> None:
-    """Send a listing to the admin with inline Approve / Reject buttons."""
+    """Send a listing to the admin with inline Approve / Skip buttons.
+
+    ``as_next`` marks the card as the automatically-advanced next review in the
+    inbox flow (header becomes '📬 Next Review — #id')."""
     listing_id = listing["id"]
     platform = listing.get("platform_name") or listing.get("game_name") or "Unknown"
     review_reason = listing.get("_review_reason", "")
     ai_preview = (listing.get("clean_text") or "")[:400]
     raw_preview = (listing.get("raw_text") or "")[:400]
 
-    reason_label = {
-        "unknown_platform": "Platform Not Identified",
-        "ai_unavailable": "AI Unavailable — Manual Review",
-        "ai_blocked_review": "⚠️ AI Flagged Content — Verify",
-    }.get(review_reason, "Manual Review")
-    header = f"📬 {reason_label} — Listing #{listing_id}"
+    if as_next:
+        header = f"📬 Next Review — Listing #{listing_id}"
+    else:
+        reason_label = {
+            "unknown_platform": "Platform Not Identified",
+            "ai_unavailable": "AI Unavailable — Manual Review",
+            "ai_blocked_review": "⚠️ AI Flagged Content — Verify",
+        }.get(review_reason, "Manual Review")
+        header = f"📬 {reason_label} — Listing #{listing_id}"
     price_info = "Price : DM"
 
     platform_display = platform.title() if platform and platform != "Unknown" else "—"
@@ -101,7 +108,7 @@ async def send_approval_prompt(
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{content_section}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Approve → republish  |  Reject → dismiss"
+        f"Approve → republish  |  Skip → for later"
     )
 
     buttons = [
@@ -109,7 +116,7 @@ async def send_approval_prompt(
             Button.inline("👁️ Preview",  data=f"preview:{listing_id}"),
             Button.inline("✏️ Edit",     data=f"edit:{listing_id}"),
             Button.inline("✅ Approve", data=f"approve:{listing_id}"),
-            Button.inline("❌ Reject",  data=f"reject:{listing_id}"),
+            Button.inline("⏭️ Skip",    data=f"skip:{listing_id}"),
         ]
     ]
     buttons.extend(_channel_view_buttons(listing))
@@ -159,6 +166,34 @@ async def send_failed_alert(
         logger.info("Sent failed alert for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
         logger.exception("Failed to send failed alert to admin for listing #%s", listing_id)
+
+
+async def send_skipped_alert(
+    bot_client: TelegramClient,
+    admin_id: int,
+    listing: dict,
+    reason: str,
+) -> None:
+    """Notify the admin whenever an inbound message gets skipped."""
+    listing_id = listing["id"]
+    raw_preview = (listing.get("clean_text") or listing.get("raw_text") or "")[:200]
+
+    text = (
+        f"⏳ **Skipped — {reason}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Supplier : {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))}\n"
+        f"Reason   : {reason}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{raw_preview}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Not published. See `/skipped` to review and re-open it."
+    )
+
+    try:
+        await bot_client.send_message(admin_id, text, parse_mode=None)
+        logger.info("Sent skipped alert for listing #%s to admin %s", listing_id, admin_id)
+    except Exception:
+        logger.exception("Failed to send skipped alert to admin for listing #%s", listing_id)
 
 
 async def send_published_alert(
@@ -492,7 +527,7 @@ async def _message_delete_send(
 
 def _listing_action_buttons(listing: dict) -> List[List[object]]:
     """Inline actions shown with a preview: failed listings can be retried,
-    pending ones can be edited, then approved or rejected. A 'View in Buyer
+    pending ones can be edited, then approved or skipped. A 'View in Buyer
     channel' link is appended when the source post resolves to a t.me URL."""
     listing_id = listing["id"]
     status = listing["status"]
@@ -503,7 +538,7 @@ def _listing_action_buttons(listing: dict) -> List[List[object]]:
             [
                 Button.inline("✏️ Edit", data=f"edit:{listing_id}"),
                 Button.inline("✅ Approve", data=f"approve:{listing_id}"),
-                Button.inline("❌ Reject", data=f"reject:{listing_id}"),
+                Button.inline("⏭️ Skip", data=f"skip:{listing_id}"),
             ]
         ]
     buttons.extend(_channel_view_buttons(listing))
@@ -1241,6 +1276,25 @@ def _published_digest(
     buttons.append([Button.inline("Search Post", data="published:search")])
     buttons.extend(_home_button_row())
     return text, buttons
+
+
+async def _advance_review(bot: TelegramClient) -> None:
+    """Inbox flow: after a review decision, immediately surface the next pending
+    listing's review card (or a queue-finished notice when the queue is empty).
+    The next card is fetched from the database — never assumed to be the next
+    sequential id."""
+    next_listing = db.get_pending_listings(limit=1)
+    if next_listing:
+        await send_approval_prompt(bot, ADMIN_USER_ID, next_listing[0], as_next=True)
+    else:
+        try:
+            await bot.send_message(
+                ADMIN_USER_ID,
+                "✅ Review queue finished.\n\nNo pending listings right now.",
+                buttons=_home_button_row(),
+            )
+        except Exception:
+            logger.exception("Failed to send review-queue-finished notice")
 
 
 async def _send_pending_page(event, bot, page: int = 0) -> None:
@@ -2348,7 +2402,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 logger.exception("Failed to send edit prompt for listing #%s", listing_id)
             return
 
-        match = re.match(r"^(approve|reject|retry):(\d+)$", data_str)
+        match = re.match(r"^(approve|retry|skip):(\d+)$", data_str)
         if not match:
             await event.answer("Unknown action", alert=True)
             return
@@ -2386,19 +2440,34 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await event.answer("Re-queue failed.", alert=True)
             return
 
-        # Approve / Reject only valid on pending listings (never on already-approved,
+        # Approve / Skip only valid on pending listings (never on already-approved,
         # preventing double-publish races on re-taps).
         if not listing_is_editable(listing["status"]):
             await event.answer(
                 f"Already processed (status: {listing['status']})", alert=True
             )
+            # The listing was already handled by another action, a second tap, or
+            # the worker — move the inbox to the next pending listing.
+            await _advance_review(bot)
             return
 
-        if action == "reject":
+        if action == "skip":
+            # Skip: the admin decided it is not worth publishing right now; it
+            # stays re-reviewable from /skipped (status skipped_admin is in the
+            # reopenable set).
             _drafts.pop(listing_id, None)
-            await db.run_async(db.update_listing_status, listing_id, "rejected")
-            await db.run_async(db.record_audit, "rejected", listing_id, actor_id=event.sender_id)
-            await event.answer("❌ Rejected")
+            await db.run_async(db.update_listing_status, listing_id, "skipped_admin")
+            await db.run_async(
+                db.record_audit, "skipped_admin", listing_id, actor_id=event.sender_id
+            )
+            await db.run_async(
+                db.log_skip,
+                listing.get("supplier_id"),
+                listing.get("source_message_id"),
+                "admin_skip",
+                listing.get("raw_text") or listing.get("clean_text") or "",
+            )
+            await event.answer("⏭️ Skipped")
             try:
                 await event.delete()
             except Exception:
@@ -2406,19 +2475,20 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             try:
                 await event.client.send_message(
                     ADMIN_USER_ID,
-                    f"❌ Listing #{listing_id} rejected and dismissed.",
+                    f"⏭️ Listing #{listing_id} skipped for now.",
                     buttons=_home_keyboard(),
                     parse_mode="markdown",
                 )
             except Exception:
                 pass
+            await _advance_review(bot)
             return
 
         if action == "approve":
             # Re-check the listing's CURRENT status immediately before applying any
             # draft. The listing loaded above is a snapshot taken when the callback
             # arrived; if it has since moved out of the editable set (published,
-            # rejected, failed, requeued) the draft must NOT be silently applied to
+            # failed, requeued) the draft must NOT be silently applied to
             # a stale listing. Discard it and say so instead.
             fresh = db.get_listing_by_id(listing_id)
             if fresh is not None and not listing_is_editable(fresh["status"]):
@@ -2436,6 +2506,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     f"Check the Pending list for its current state.",
                     buttons=_home_keyboard(),
                 )
+                await _advance_review(bot)
                 return
 
             # A draft (from ✏️ Edit) replaces the source content.
@@ -2489,6 +2560,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         )
                     except Exception:
                         pass
+                    await _advance_review(bot)
                     return
                 await publish_guard.throttle()
                 published_msg_id = None
@@ -2599,6 +2671,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     )
                 except Exception:
                     pass
+                await _advance_review(bot)
                 return
             else:
                 await db.run_async(db.update_listing_status, listing_id, "approved")
@@ -2620,6 +2693,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     )
                 except Exception:
                     pass
+                await _advance_review(bot)
 
     @bot.on(events.NewMessage())
     async def handle_wizard_input(event):

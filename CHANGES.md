@@ -6,6 +6,16 @@
 
 ---
 
+## Changeset (2026-09-21) — Own-channel publishing + live skip alerts
+
+**Verification:** `python -m unittest test_system` **192/192 OK**; `py_compile` clean on `main.py`, `admin_bot.py`, `test_system.py`.
+
+1. **Self-echo guard removed**: the `self_echo` skip (footer `Contact : @<CONTACT_USERNAME>` detection in monitored channels) is gone from `_process_supplier_message`, along with `_build_self_echo_pattern` and `import re`. Messages from the admin's own test channel now flow through the normal pipeline and can be published. (Reconsider if the destination channel can ever echo back into a monitored source — that loop is the reason the guard existed.)
+2. **Live skip notifications**: every skip now DMs the admin instead of only touching the DB — `admin_bot.send_skipped_alert()` + `main._alert_admin_on_skip()`, wired into the duplicate/`no_content` filter skip, the chatter pre-filter skip, and the AI "not a listing" skip. Publish failures already alerted (`send_failed_alert`) — unchanged.
+3. **Reject removed — Skip is now the single decline action**: the `❌ Reject` button (approval prompt + action buttons), the `reject:` callback branch, and `^(approve|retry|skip):…` invalidation of `reject:` data are gone. `rejected` was terminal with no undo; `skipped_admin` is recoverable via `/skipped`, so mis-taps can no longer destroy a listing. README/ONBOARDING and tests updated.
+
+---
+
 ## Later changeset (2026-09-16) — Verification queue P1–P9, deploy hardening, pricing removal
 
 **Verification:** `python -m unittest test_system` **128/128 OK**; `ruff check .` (F+E9) **clean**.

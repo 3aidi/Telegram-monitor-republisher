@@ -1495,7 +1495,7 @@ def reopen_skipped(
         ).fetchone()
         if not listing:
             return None
-        if listing["status"] not in ("skipped_duplicate", "skipped_chatter", "skipped_filter", "skipped_no_content"):
+        if listing["status"] not in ("skipped_duplicate", "skipped_chatter", "skipped_filter", "skipped_no_content", "skipped_admin"):
             return None
         now_iso = datetime.now(timezone.utc).isoformat()
         conn.execute(

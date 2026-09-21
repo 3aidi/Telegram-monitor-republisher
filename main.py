@@ -8,7 +8,6 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 import os
-import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -283,28 +282,6 @@ def _supplier_label(supplier: dict) -> str:
             return f"id {username}"
         return f"@{username}" if not username.startswith("@") else username
     return "?"
-
-
-_self_echo_pattern = None
-
-
-def _build_self_echo_pattern() -> Optional[re.Pattern]:
-    """Regex matching our own destination footer in a re-shared message.
-
-    The footer is ``Contact  : @<CONTACT_USERNAME>``; a re-share can reformat
-    it (extra spaces, case, '@' dropped), so the old exact-string match was
-    brittle enough to let an echo slip through and be re-published. The pattern
-    tolerates spacing/case/@-prefix while still anchoring on the word 'contact'
-    so it cannot misfire on unrelated posts.
-    """
-    global _self_echo_pattern
-    if _self_echo_pattern is None and CONTACT_USERNAME:
-        user = CONTACT_USERNAME.strip().lstrip("@")
-        if user:
-            _self_echo_pattern = re.compile(
-                rf"contact\s*:\s*@?{re.escape(user)}", re.IGNORECASE
-            )
-    return _self_echo_pattern
 
 
 def deterministic_fallback_publish_ok(
@@ -643,6 +620,26 @@ async def _alert_admin_on_failure(
         await admin_bot.send_failed_alert(bot_client, ADMIN_USER_ID, listing_dict)
     except Exception:
         logger.exception("Failed to alert admin about failed listing #%s", listing_id)
+
+
+async def _alert_admin_on_skip(
+    bot_client: Optional[TelegramClient],
+    supplier: dict,
+    listing_id: int,
+    reason: str,
+) -> None:
+    """DM the admin whenever an inbound message is skipped (never silent)."""
+    if not (bot_client and ADMIN_USER_ID):
+        return
+    try:
+        listing_dict = db.get_listing_by_id(listing_id)
+        if not listing_dict:
+            return
+        listing_dict["supplier_username"] = supplier.get("channel_username")
+        listing_dict["supplier_display_name"] = supplier.get("display_name")
+        await admin_bot.send_skipped_alert(bot_client, ADMIN_USER_ID, listing_dict, reason)
+    except Exception:
+        logger.exception("Failed to alert admin about skipped listing #%s", listing_id)
 
 
 async def _alert_admin_on_published(
@@ -990,22 +987,6 @@ async def _process_supplier_message(
         )
         return
 
-    # Self-echo guard: if our own formatted output was looped back into a source
-    # channel, don't re-analyze/re-publish it. Its footer carries the destination
-    # contact signature; skipping stops repricing compounding (e.g. $60 -> $45 -> $34)
-    # and duplicate re-posts. This is a *containment* measure for re-shares of our
-    # own posts, not a filter on real supplier ads. The footer match tolerates
-    # spacing/case/@-prefix variations introduced by re-sharing.
-    echo_pattern = _build_self_echo_pattern()
-    if echo_pattern and echo_pattern.search(raw_text):
-        logger.info(
-            "Source message %s from %s looks like our own destination output; skipping",
-            source_msg_id,
-            _supplier_label(supplier),
-        )
-        await db.run_async(db.log_skip, supplier_id, source_msg_id, "self_echo", raw_text)
-        return
-
     logger.info(
         "Incoming message %s from supplier %s (chat_id: %s)",
         source_msg_id,
@@ -1074,6 +1055,7 @@ async def _process_supplier_message(
         await db.run_async(db.log_skip, supplier_id, source_msg_id, skip_reason, raw_text)
         await db.run_async(db.record_audit, skip_reason, listing_id, detail=raw_text[:200])
         logger.info("Listing #%s skipped by filter '%s'.", listing_id, skip_reason)
+        await _alert_admin_on_skip(bot_client, supplier, listing_id, skip_reason)
         return
 
     # Step 1.5 (optional): cheap chatter pre-filter. Obvious non-listings
@@ -1090,6 +1072,7 @@ async def _process_supplier_message(
                 listing_id,
                 chatter_reason,
             )
+            await _alert_admin_on_skip(bot_client, supplier, listing_id, chatter_reason)
             return
 
     # Step 1.75: payment-proof / confirmation messages are NEVER auto-published.
@@ -1267,6 +1250,7 @@ async def _process_supplier_message(
             "Listing #%s skipped (AI classified as not a listing).",
             listing_id,
         )
+        await _alert_admin_on_skip(bot_client, supplier, listing_id, "not_a_listing")
         return
 
     platform_name = analysis.get("platform")

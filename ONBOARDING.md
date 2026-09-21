@@ -13,7 +13,7 @@ A **Telegram bot** that watches a set of **source channels** (reseller listing
 channels), picks out real product listings, cleans / rephrases them with an **AI
 model**, formats them into a fixed "listing post" shell, and **publishes them to
 a destination channel** — while a **personal admin bot** lets the owner approve,
-reject, edit, retry and manage everything by chatting with a Telegram bot.
+skip, edit, retry and manage everything by chatting with a Telegram bot.
 
 Key characteristics that color every design decision:
 
@@ -49,7 +49,7 @@ Key characteristics that color every design decision:
 | File | Role |
 |---|---|
 | `main.py` | **Orchestrator / entry point.** Config, logging, single-instance guard, Telethon user client, event handlers, the full supplier→published pipeline, backfill, workers, reconnect loop. `python main.py` starts the monitor; `--manual` starts the admin bot + user session **without** ingestion/publishing. |
-| `admin_bot.py` | **Admin bot.** Inline keyboards, `/commands`, listing approval/reject/edit flows, preview/repair, sources & supplier management, skip/failed digests, status screens. |
+| `admin_bot.py` | **Admin bot.** Inline keyboards, `/commands`, listing approval/skip/edit flows, preview/repair, sources & supplier management, skip/failed digests, status screens. |
 | `ai_rephraser.py` | **AI engine.** `analyze_message(raw_text) -> dict | None` — one call decides everything (is_listing, blocked, platform, intent, header, content lines). Groq + OpenRouter fallback, caching, retries, JSON cleanup. |
 | `parser.py` | **Formatting module.** `build_ai_message(...) -> (text, entities)` builds the final post shell + all `MessageEntityCustomEmoji`/link entities; price extraction; body sanitizer (`sanitize_body_lines`); buyer-header validation. |
 | `countries.py` | **Country→flag system.** `COUNTRY_EMOJI` (name→custom-emoji document id), `_FLAG_ALTS` (name→exact alt emoji), detection (`detect_countries`, `canonical_of`), flag attachment (`flag_body_lines`). Bootstrapped from a dumped paste of the actual custom emoji pack. |
@@ -224,7 +224,7 @@ Single SQLite file (`DB_PATH`, default `monitor.db`). Key concepts:
   `post_number`, fingerprint, `created_at`.
 - **Statuses** that matter (the admin flow keys off these):
   `received` → `skipped_*` / `pending_review` / `pending_approval` / `approved` /
-  `published` / `failed` / `rejected`. `listing_is_editable()` whitelist stops
+  `published` / `failed`. `listing_is_editable()` whitelist stops
   stale in-flight edits after a listing leaves an editable state.
 - **skips**: every skip reason with message linkage (drives the skip digest).
 - **audit_log**: one row per decision (`published_auto`, `published_approved`,
@@ -250,10 +250,10 @@ the Home keyboard buttons):
 · "I'm Asleep"/"I'm Awake" toggle.
 
 Inline flows:
-- **Approve/Reject** (`approve:{id}` / `reject:{id}`): Approve sets `approved`
-  and the worker publishes immediately (never gated by All Stop). Reject sets
-  `rejected` (dismissed). Buttons refuse in-flight actions on non-editable
-  statuses.
+- **Approve/Skip** (`approve:{id}` / `skip:{id}`): Approve sets `approved`
+  and the worker publishes immediately (never gated by All Stop). Skip sets
+  `skipped_admin` (re-reviewable from `/skipped`). Buttons refuse in-flight
+  actions on non-editable statuses.
 - **Edit wizard** (`_edit_prompt` + `_edit_listing`): edit the body draft, then
   preview the exact publishing view before Approve.
 - Home menu, **Sources** editor (add via text or by forwarding a message from a
