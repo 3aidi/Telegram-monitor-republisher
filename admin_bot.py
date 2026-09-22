@@ -43,6 +43,13 @@ SKIP_DIGEST_MAX_CARDS = 10
 _skip_digest_last_sent = 0.0
 _skip_digest_task: Optional[asyncio.Task] = None
 
+# Inbox review session: the card currently on screen shows its position as
+# "1/4", "2/4", … where the total is snapshotted when the inbox opens (/pending)
+# and "done" counts cards already shown. Falls back to "N remaining" when a new
+# listing arrives mid-session or no inbox session is active.
+_review_session_total: Optional[int] = None
+_review_session_done: int = 0
+
 # FloodWait budget for interactive admin send/edit actions (shared helper in
 # publish_guard). Capped so a large flood can never hang the
 # admin bot's event loop indefinitely — on exhaustion the action fails through
@@ -73,25 +80,34 @@ async def send_approval_prompt(
     admin_id: int,
     listing: dict,
     as_next: bool = False,
+    queue_pos: Optional[str] = None,
 ) -> None:
     """Send a listing to the admin with inline Approve / Skip buttons.
 
     ``as_next`` marks the card as the automatically-advanced next review in the
-    inbox flow (header becomes '📬 Next Review — #id')."""
+    inbox flow (header becomes '📬 Next Review — #id'). ``queue_pos`` — e.g.
+    "1/4" or "3 remaining" — is rendered in the header so the admin always sees
+    where the current card sits in the inbox."""
     listing_id = listing["id"]
     platform = listing.get("platform_name") or listing.get("game_name") or "Unknown"
     review_reason = listing.get("_review_reason", "")
     ai_preview = (listing.get("clean_text") or "")[:400]
     raw_preview = (listing.get("raw_text") or "")[:400]
 
-    if as_next:
+    reason_label = {
+        "unknown_platform": "Platform Not Identified",
+        "ai_unavailable": "AI Unavailable — Manual Review",
+        "ai_blocked_review": "⚠️ AI Flagged Content — Verify",
+    }.get(review_reason, "Manual Review")
+
+    if queue_pos:
+        if as_next:
+            header = f"📬 Next Review · {queue_pos} — Listing #{listing_id}"
+        else:
+            header = f"📬 {queue_pos} — {reason_label} — Listing #{listing_id}"
+    elif as_next:
         header = f"📬 Next Review — Listing #{listing_id}"
     else:
-        reason_label = {
-            "unknown_platform": "Platform Not Identified",
-            "ai_unavailable": "AI Unavailable — Manual Review",
-            "ai_blocked_review": "⚠️ AI Flagged Content — Verify",
-        }.get(review_reason, "Manual Review")
         header = f"📬 {reason_label} — Listing #{listing_id}"
     price_info = "Price : DM"
 
@@ -358,7 +374,10 @@ async def skip_digest_worker(bot: TelegramClient) -> None:
             if now - _skip_digest_last_sent < SKIP_DIGEST_MIN_INTERVAL:
                 continue
             recent = await asyncio.to_thread(db.get_skipped_listings, 1000)
-            new_skips = [k for k in recent if k["skip_id"] > marker]
+            new_skips = [
+                k for k in recent
+                if k["skip_id"] > marker and k.get("reason") != "admin_skip"
+            ]
             if not new_skips:
                 continue
             for k in new_skips[:SKIP_DIGEST_MAX_CARDS]:
@@ -1278,15 +1297,39 @@ def _published_digest(
     return text, buttons
 
 
+def _review_position_label(remaining: int) -> str:
+    """Queue position for the next card: "2/4" when the inbox session's total is
+    known and the math still holds, else "N remaining" (e.g. a new listing
+    arrived mid-session, or no /pending session is active)."""
+    total = _review_session_total
+    if total is None or total < 1:
+        return f"{remaining} remaining"
+    current = _review_session_done + 1
+    if current > total:
+        return f"{remaining} remaining"
+    return f"{current}/{total}"
+
+
 async def _advance_review(bot: TelegramClient) -> None:
     """Inbox flow: after a review decision, immediately surface the next pending
     listing's review card (or a queue-finished notice when the queue is empty).
     The next card is fetched from the database — never assumed to be the next
     sequential id."""
+    global _review_session_done, _review_session_total
     next_listing = db.get_pending_listings(limit=1)
     if next_listing:
-        await send_approval_prompt(bot, ADMIN_USER_ID, next_listing[0], as_next=True)
+        _review_session_done += 1
+        remaining = db.count_pending_listings()
+        await send_approval_prompt(
+            bot,
+            ADMIN_USER_ID,
+            next_listing[0],
+            as_next=True,
+            queue_pos=_review_position_label(remaining),
+        )
     else:
+        _review_session_total = 0
+        _review_session_done = 0
         try:
             await bot.send_message(
                 ADMIN_USER_ID,
@@ -1298,16 +1341,17 @@ async def _advance_review(bot: TelegramClient) -> None:
 
 
 async def _send_pending_page(event, bot, page: int = 0) -> None:
-    """Inbox entry: show a count banner then ONE pending listing card.
+    """Inbox entry: delete the tapped message and surface ONE pending listing
+    card whose header carries its position in the queue ('1/N').
 
-    Replaces the tapped message with a brief queue-size notice, then surfaces
-    the oldest pending listing as a single review card. After the admin acts on
-    it (Approve / Skip / Edit → Save) ``_advance_review`` picks up and shows
-    the next card automatically — there is no multi-card dump anymore.
+    After the admin acts on it (Approve / Skip / Edit → Save) ``_advance_review``
+    picks up and shows the next card automatically — there is no multi-card dump
+    and no separate count banner anymore.
 
     The ``page`` argument is accepted for API compatibility with ``pend:page:N``
     callbacks but is ignored; the inbox always starts from the oldest item.
     """
+    global _review_session_total, _review_session_done
     total = db.count_pending_listings()
     pending = db.get_pending_listings(limit=1, offset=0)
     if not pending:
@@ -1317,15 +1361,17 @@ async def _send_pending_page(event, bot, page: int = 0) -> None:
             buttons=_home_button_row(),
         )
         return
-    # Replace the tapped menu entry with a count banner (so it's not lost in
-    # the chat), then send the single review card below it.
-    await _message_delete_send(
-        event,
-        f"⏳ {total} listing(s) pending review — tap Approve, Skip, or Edit on each card:",
-        buttons=_home_button_row(),
-        parse_mode=None,
+    _review_session_total = total
+    _review_session_done = 0
+    # Remove the tapped menu entry (so it's not lost in the chat) and send the
+    # single review card below it — the header carries the queue position.
+    try:
+        await event.delete()
+    except Exception:
+        pass
+    await send_approval_prompt(
+        bot, ADMIN_USER_ID, pending[0], as_next=False, queue_pos=f"1/{total}"
     )
-    await send_approval_prompt(bot, ADMIN_USER_ID, pending[0], as_next=False)
 
 
 def _post_card(post: dict) -> Tuple[str, List[List[object]]]:
@@ -2475,15 +2521,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await event.delete()
             except Exception:
                 pass
-            try:
-                await event.client.send_message(
-                    ADMIN_USER_ID,
-                    f"⏭️ Listing #{listing_id} skipped for now.",
-                    buttons=_home_keyboard(),
-                    parse_mode="markdown",
-                )
-            except Exception:
-                pass
             await _advance_review(bot)
             return
 
@@ -2556,9 +2593,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     try:
                         await event.client.send_message(
                             ADMIN_USER_ID,
-                            f"⚠️ Listing #{listing_id} is already being published by "
-                            f"another publish attempt. No duplicate was sent.",
-                            buttons=_home_keyboard(),
+                            f"⚠️ Listing #{listing_id} already being published elsewhere — nothing duplicate sent.",
                             parse_mode="markdown",
                         )
                     except Exception:
@@ -2658,12 +2693,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         logger.exception("Could not record published state for listing #%s", listing_id)
 
                 try:
-                    confirmation = (
-                        f"✅ **Listing #{listing_id} Published!**\n"
-                        f"📌 **Post #{post_number}**\n"
-                        f"Channel: {DEST_CHANNEL}\n"
-                        f"Price: `DM`"
-                    )
+                    confirmation = f"✅ Listing #{listing_id} Published! · Post #{post_number}"
                     approved_view = dict(listing)
                     approved_view["published_message_id"] = published_msg_id
                     await event.client.send_message(
@@ -2688,10 +2718,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 try:
                     await event.client.send_message(
                         ADMIN_USER_ID,
-                        f"✅ Listing #{listing_id} marked approved.\n"
-                        f"Will be dispatched to {DEST_CHANNEL} by the republisher.\n"
-                        f"(User listener not connected — sent via the worker queue.)",
-                        buttons=_home_keyboard(),
+                        f"✅ Listing #{listing_id} queued for republish.",
                         parse_mode="markdown",
                     )
                 except Exception:

@@ -4102,17 +4102,21 @@ class TestPhase5Handlers(unittest.TestCase):
 
     # ---------------- admin handlers (F1 / F2) -----------------------
     def test_admin_pending_command_renders_page_and_cards(self):
-        """/pending renders a count banner and exactly ONE review card (inbox mode).
-        The count banner carries 'listing(s) pending review'; the card carries
-        an Approve button. Subsequent cards appear via _advance_review after
-        each decision — there is no multi-card dump."""
+        """/pending renders exactly ONE review card (inbox mode) whose header
+        carries the position indicator ('1/N'); there is no separate count banner
+        anymore. Subsequent cards appear via _advance_review after each decision —
+        there is no multi-card dump."""
 
         async def _run():
             lid = self._add_listing(status="pending_approval")
             ev = await _dispatch_message(self.bot, "/pending", self.ADMIN)
             self.assertTrue(
+                any(m["text"].startswith("📬 1/1 ") for m in self.bot.sent),
+                "review card header must carry the queue position",
+            )
+            self.assertFalse(
                 any("listing(s) pending review" in m["text"] for m in self.bot.sent),
-                "count banner must include 'listing(s) pending review'",
+                "no count banner may be sent",
             )
             self.assertTrue(
                 f"approve:{lid}" in _all_button_datas(self.bot),
@@ -4133,15 +4137,19 @@ class TestPhase5Handlers(unittest.TestCase):
         asyncio.run(_run())
 
     def test_admin_home_pending_button_renders_page(self):
-        """Tapping Pending on the home inline keyboard shows the count banner and
-        ONE review card (inbox mode — second F2 call site)."""
+        """Tapping Pending on the home inline keyboard shows ONE review card
+        (inbox mode — second F2 call site) with the position in its header."""
 
         async def _run():
             lid = self._add_listing(status="pending_approval")
             await _dispatch_callback(self.bot, "home:pending", self.ADMIN)
             self.assertTrue(
+                any(m["text"].startswith("📬 1/1 ") for m in self.bot.sent),
+                "review card header must carry the queue position",
+            )
+            self.assertFalse(
                 any("listing(s) pending review" in m["text"] for m in self.bot.sent),
-                "count banner must be sent",
+                "no count banner may be sent",
             )
             self.assertTrue(f"approve:{lid}" in _all_button_datas(self.bot),
                             "the single review card must carry an Approve button")
@@ -4151,14 +4159,18 @@ class TestPhase5Handlers(unittest.TestCase):
     def test_admin_pending_pagination_callback(self):
         """pend:page:N routes through the same inbox renderer (third F2 call site).
         The page argument is accepted for API compat but the inbox always starts
-        from the oldest pending listing — one card is sent."""
+        from the oldest pending listing — one card is sent with its position."""
 
         async def _run():
             lid = self._add_listing(status="pending_approval")
             await _dispatch_callback(self.bot, "pend:page:0", self.ADMIN)
             self.assertTrue(
+                any(m["text"].startswith("📬 1/1 ") for m in self.bot.sent),
+                "review card header must carry the queue position",
+            )
+            self.assertFalse(
                 any("listing(s) pending review" in m["text"] for m in self.bot.sent),
-                "count banner must be sent",
+                "no count banner may be sent",
             )
             self.assertTrue(f"approve:{lid}" in _all_button_datas(self.bot),
                             "the single review card must be shown")
@@ -4563,6 +4575,39 @@ class TestPhase5Handlers(unittest.TestCase):
             self.assertTrue(
                 self._has_next_card(lid_b),
                 "the next pending listing B must be surfaced after a skip",
+            )
+
+        asyncio.run(_run())
+
+    def test_review_position_counts_across_advances(self):
+        """Each review card carries its position in the inbox: the /pending entry
+        card reads '1/N' and every _advance_review card bumps it ('2/4', '3/4')."""
+
+        async def _run():
+            lids = [
+                self._add_listing(
+                    status="pending_approval",
+                    text=f"WTS Bybit pos {i} $100",
+                    supplier_id=self._new_supplier_id(f"pos{i}"),
+                )
+                for i in range(4)
+            ]
+            await _dispatch_message(self.bot, "/pending", self.ADMIN)
+            self.assertTrue(
+                any(m["text"].startswith("📬 1/4 ") for m in self.bot.sent),
+                "entry card must show its position in the queue",
+            )
+
+            await _dispatch_callback(self.bot, f"skip:{lids[0]}", self.ADMIN)
+            self.assertTrue(
+                any(m["text"].startswith("📬 Next Review · 2/4 ") for m in self.bot.sent),
+                "after one decision the next card must show an incremented position",
+            )
+
+            await _dispatch_callback(self.bot, f"skip:{lids[1]}", self.ADMIN)
+            self.assertTrue(
+                any(m["text"].startswith("📬 Next Review · 3/4 ") for m in self.bot.sent),
+                "position must keep incrementing as the inbox advances",
             )
 
         asyncio.run(_run())
