@@ -605,23 +605,6 @@ async def publish_to_destination(
     raise PublishError(last_error)
 
 
-async def _alert_admin_on_failure(
-    bot_client: Optional[TelegramClient], supplier: dict, listing_id: int
-) -> None:
-    """DM the admin when a listing moves to the failed queue (never silent)."""
-    if not (bot_client and ADMIN_USER_ID):
-        return
-    try:
-        listing_dict = db.get_listing_by_id(listing_id)
-        if not listing_dict:
-            return
-        listing_dict["supplier_username"] = supplier.get("channel_username")
-        listing_dict["supplier_display_name"] = supplier.get("display_name")
-        await admin_bot.send_failed_alert(bot_client, ADMIN_USER_ID, listing_dict)
-    except Exception:
-        logger.exception("Failed to alert admin about failed listing #%s", listing_id)
-
-
 async def _alert_admin_on_skip(
     bot_client: Optional[TelegramClient],
     supplier: dict,
@@ -932,7 +915,6 @@ async def process_supplier_message(
                             listing["id"],
                             detail=str(exc)[:500],
                         )
-                        await _alert_admin_on_failure(bot_client, supplier, listing["id"])
                 except Exception:
                     logger.exception(
                         "Could not mark/fail listing for source message %s", source_msg_id
@@ -1178,7 +1160,6 @@ async def _process_supplier_message(
                     listing_id,
                     exc,
                 )
-                await _alert_admin_on_failure(bot_client, supplier, listing_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1191,7 +1172,6 @@ async def _process_supplier_message(
                     "Failed to publish listing #%s via deterministic fallback",
                     listing_id,
                 )
-                await _alert_admin_on_failure(bot_client, supplier, listing_id)
             return
 
         # AI is down AND the content is either risky or publishing is paused:
@@ -1323,13 +1303,11 @@ async def _process_supplier_message(
                 listing_id,
                 exc,
             )
-            await _alert_admin_on_failure(bot_client, supplier, listing_id)
         except asyncio.CancelledError:
             raise
         except Exception:
             await db.run_async(db.mark_listing_failed, listing_id, "unexpected publish error")
             logger.exception("Failed to publish message for listing #%s", listing_id)
-            await _alert_admin_on_failure(bot_client, supplier, listing_id)
     else:
         # Not an auto-publishable buy signal (unsafe buy, sell, neutral, paused)
         # -> route to manual approval with the exact reason attached.
@@ -1622,18 +1600,12 @@ async def approved_listings_worker(
                         listing_id,
                         exc,
                     )
-                    await _alert_admin_on_failure(
-                        bot_client, {"channel_username": listing.get("supplier_username")}, listing_id
-                    )
                     continue
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     await db.run_async(db.mark_listing_failed, listing_id, str(exc)[:500])
                     logger.exception("Worker failed to publish approved listing #%s", listing_id)
-                    await _alert_admin_on_failure(
-                        bot_client, {"channel_username": listing.get("supplier_username")}, listing_id
-                    )
                     continue
 
                 try:

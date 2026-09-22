@@ -31,11 +31,9 @@ An automated, robust Telegram channel monitor and republisher for digital accoun
    - Price is always shown as the static `Price DM` — never republished, negotiated privately.
 9. **Admin Approval Bot**:
     - Inline `[Approve]` and `[Skip]` buttons for ambiguous listings.
-    - Failed-publish queue (DLQ) with `/failed` and `/retry <id>`.
     - `/preview <id>` shows the exact formatted post before publishing.
 10. **Publish Reliability**:
     - Retry with exponential backoff, automatic FloodWait sleep, and destination throttling.
-    - After retries are exhausted a listing moves to the `failed` queue (visible to the admin bot) instead of being silently stuck.
     - Approved listings are never double-published (`published_message_id IS NULL` guard).
 11. **Message Edit & Deletion Handling**:
     - Source message edits update the published post in real-time (with a no-op guard).
@@ -43,7 +41,7 @@ An automated, robust Telegram channel monitor and republisher for digital accoun
 12. **Error Recovery & Logging**:
     - Auto-reconnect loop with capped backoff.
     - Console output + rotating log file (`monitor.log`, 5MB max, 5 backups).
-    - Full `audit_log` table for actions (auto-publish, admin approve/reject/retry, edits, blocklist rejections).
+    - Full `audit_log` table for actions (auto-publish, admin approve/skip, edits, blocklist rejections).
 
 ---
 
@@ -175,8 +173,6 @@ Message your bot directly on Telegram (only authorized for `ADMIN_USER_ID`):
 | `/reseed_from_env` | Manually re-import `SOURCE_CHANNELS` from `.env` once (confirm required) | `/reseed_from_env` |
 | `/status` | View today's stats (processed, published, skipped breakdown) | `/status` |
 | `/pending` | Review and approve ambiguous listings | `/pending` |
-| `/failed` | List failed publishes (DLQ) with error details | `/failed` |
-| `/retry <id>` | Re-queue a failed listing for publishing | `/retry 15` |
 | `/preview <id>` | Preview the formatted post before publishing | `/preview 15` |
 
 ### Ambiguous Listing Approval Flow
@@ -188,7 +184,7 @@ When a source message contains a valid platform and price but lacks an explicit 
 3. Tap **[✅ Approve]** to republish the listing immediately to `DEST_CHANNEL`.
 4. Tap **[⏭️ Skip]** to leave it in `/skipped` for later (never published).
 
-If the bot cannot publish (e.g. temporary error), the listing is marked `approved` and the background worker publishes it automatically. Failed publishes land in the DLQ and can be re-queued with `/retry`.
+If the bot cannot publish (e.g. temporary error), the listing is marked `approved` and the background worker publishes it automatically.
 
 ---
 

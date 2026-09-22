@@ -1208,53 +1208,6 @@ def mark_listing_failed(
         )
 
 
-def requeue_listing(listing_id: int, db_path: Optional[str] = None) -> bool:
-    """Move a failed/error listing back to the approved (published-by-worker) state."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    with db_session(db_path) as conn:
-        cursor = conn.execute(
-            "UPDATE listings SET status = 'approved', last_error = NULL, updated_at = ? WHERE id = ?",
-            (now_iso, listing_id),
-        )
-        return cursor.rowcount > 0
-
-
-def get_failed_listings(
-    limit: int = 10, offset: int = 0, db_path: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """Return failed listings (DLQ) ordered oldest-first.
-
-    'error' is retained in the read query purely for legacy rows: no current
-    code path writes it (mark_listing_failed sets 'failed' only) â€” STATE-1.
-    """
-    with db_session(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT l.*, s.channel_username as supplier_username,
-                   s.display_name as supplier_display_name
-            FROM listings l
-            LEFT JOIN suppliers s ON l.supplier_id = s.id
-            WHERE l.status IN ('failed', 'error')
-            ORDER BY l.updated_at ASC
-            LIMIT ? OFFSET ?
-            """,
-            (limit, offset),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-
-def count_failed_listings(db_path: Optional[str] = None) -> int:
-    """Total failed listings (same filter as get_failed_listings)."""
-    with db_session(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS c FROM listings
-            WHERE status IN ('failed', 'error')
-            """
-        ).fetchone()
-        return int(row["c"])
-
-
 def get_listing_by_source(
     supplier_id: Optional[int],
     source_message_id: int,
@@ -1581,15 +1534,10 @@ def get_today_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
         published_count = conn.execute(
             "SELECT count(*) FROM listings WHERE created_at >= ? AND status = 'published'",
             (today_start,),
-        ).fetchone()[0]
+).fetchone()[0]
 
         pending_count = conn.execute(
             "SELECT count(*) FROM listings WHERE created_at >= ? AND status IN ('pending_approval', 'pending_review')",
-            (today_start,),
-        ).fetchone()[0]
-
-        errors_count = conn.execute(
-            "SELECT count(*) FROM listings WHERE created_at >= ? AND status IN ('error', 'failed')",
             (today_start,),
         ).fetchone()[0]
 
@@ -1602,7 +1550,6 @@ def get_today_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
         "total_processed": total_processed,
         "published": published_count,
         "pending": pending_count,
-        "errors": errors_count,
         "total_skipped": total_skipped,
         "skip_reasons": skipped_reasons,
         "supplier_breakdown": supplier_breakdown,

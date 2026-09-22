@@ -1145,19 +1145,12 @@ class TestMonitorSystem(unittest.TestCase):
         approved = db.get_approved_listings_to_publish(limit=10, db_path=TEST_DB)
         self.assertTrue(any(l["id"] == listing_id for l in approved))
 
-        # Mark failed -> shows up in DLQ
+        # Mark failed -> status flips to 'failed' with the error recorded
         db.mark_listing_failed(listing_id, "FloodWaitError(30)", db_path=TEST_DB)
-        failed = db.get_failed_listings(limit=10, db_path=TEST_DB)
-        self.assertTrue(any(l["id"] == listing_id for l in failed))
-        self.assertGreaterEqual(
-            [l for l in failed if l["id"] == listing_id][0]["retry_count"], 1
-        )
-
-        # Requeue → back to approved, no longer in DLQ
-        ok = db.requeue_listing(listing_id, db_path=TEST_DB)
-        self.assertTrue(ok)
-        failed_after = db.get_failed_listings(limit=10, db_path=TEST_DB)
-        self.assertFalse(any(l["id"] == listing_id for l in failed_after))
+        row = db.get_listing_by_id(listing_id, db_path=TEST_DB)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["last_error"], "FloodWaitError(30)")
+        self.assertGreaterEqual(row["retry_count"], 1)
 
     def test_db_audit_log(self):
         db.record_audit("published_auto", 42, detail="msg 5001", db_path=TEST_DB)
@@ -1954,32 +1947,6 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(len(small), 4, "single page keeps the exact old layout")
         self.assertEqual(small[3][1].text, "⬅️ Back")
 
-    def _failed_rows(self, n):
-        return [
-            {"id": 100 + i, "status": "failed", "platform_name": "P",
-             "created_at": "2026-01-01T00:00:00",
-             "supplier_username": "src", "supplier_display_name": None,
-             "updated_at": "2026-01-01T00:00:00", "last_error": None}
-            for i in range(n)
-        ]
-
-    def test_failed_digest_pagination(self):
-        """failed digest gets fail:page:N nav + footer only when total is given."""
-        import admin_bot
-
-        text, buttons = admin_bot._failed_digest(self._failed_rows(6), 0, total=6)
-        self.assertNotIn("Page", text)
-        self.assertFalse(any(r and getattr(r[0], "data", b"").decode().startswith("fail:page:")
-                             for r in buttons))
-
-        text, buttons = admin_bot._failed_digest(self._failed_rows(6), 1, total=13)
-        self.assertIn("Page 2 of 3", text)
-        nav = buttons[-2]
-        self.assertEqual([x.text for x in nav], ["⬅️ Prev", "2/3", "➡️ Next"])
-        self.assertEqual([x.data.decode() for x in nav],
-                         ["fail:page:0", "fail:page:1", "fail:page:2"])
-        self.assertEqual(buttons[-1][0].data.decode(), "menu:home")
-
     def test_skipped_digest_pagination(self):
         """skipped digest gets skip:page:N nav + footer when total is given."""
         import admin_bot
@@ -2065,27 +2032,6 @@ class TestMonitorSystem(unittest.TestCase):
             db.init_db(temp_db)
             db.add_supplier("@page_src_db", channel_id=-100777, db_path=temp_db)
             sup_id = db.get_supplier_by_chat(username="page_src_db", db_path=temp_db)["id"]
-
-            # ---- failed queue (ORDER BY updated_at ASC) ---------------------
-            fail_ids = [
-                db.insert_listing(supplier_id=sup_id, source_message_id=80000 + i,
-                                  game_name=None, rank_tier=None, status="failed",
-                                  raw_text="t", clean_text="t", db_path=temp_db)
-                for i in range(7)
-            ]
-            self.assertEqual(db.count_failed_listings(db_path=temp_db), 7)
-            self.assertTrue(all(
-                l["id"] in set(fail_ids)
-                for l in db.get_failed_listings(limit=6, offset=0, db_path=temp_db)
-                + db.get_failed_listings(limit=6, offset=6, db_path=temp_db)
-            ))
-            all_failed = db.get_failed_listings(limit=1000, offset=0, db_path=temp_db)
-            self.assertEqual(
-                db.get_failed_listings(limit=6, offset=0, db_path=temp_db)
-                + db.get_failed_listings(limit=6, offset=6, db_path=temp_db),
-                all_failed,
-                "failed OFFSET pages slice the same ordered result",
-            )
 
             # ---- pending queue (ORDER BY id ASC) ----------------------------
             pend_ids = [
@@ -4283,17 +4229,6 @@ class TestPhase5Handlers(unittest.TestCase):
             ev = await _dispatch_callback(self.bot, f"skip:{lid}", self.ADMIN)
             self.assertTrue(any("Already processed" in a for a in ev.answers))
             self.assertEqual(self.user_client.sent, [], "a skipped listing is never published")
-
-        asyncio.run(_run())
-
-    def test_admin_retry_requeues_failed_listing(self):
-        """A failed listing's Retry button re-queues it for the worker."""
-
-        async def _run():
-            lid = self._add_listing(status="failed")
-            await _dispatch_callback(self.bot, f"retry:{lid}", self.ADMIN)
-            self.assertEqual(db.get_listing_by_id(lid)["status"], "approved")
-            self.assertTrue(any("re-queued" in m["text"] for m in self.bot.sent))
 
         asyncio.run(_run())
 

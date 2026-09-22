@@ -49,7 +49,7 @@ Key characteristics that color every design decision:
 | File | Role |
 |---|---|
 | `main.py` | **Orchestrator / entry point.** Config, logging, single-instance guard, Telethon user client, event handlers, the full supplier→published pipeline, backfill, workers, reconnect loop. `python main.py` starts the monitor; `--manual` starts the admin bot + user session **without** ingestion/publishing. |
-| `admin_bot.py` | **Admin bot.** Inline keyboards, `/commands`, listing approval/skip/edit flows, preview, sources & supplier management, skip/failed digests, status screens. |
+| `admin_bot.py` | **Admin bot.** Inline keyboards, `/commands`, listing approval/skip/edit flows, preview, sources & supplier management, skip digests, status screens. |
 | `ai_rephraser.py` | **AI engine.** `analyze_message(raw_text) -> dict | None` — one call decides everything (is_listing, blocked, platform, intent, header, content lines). Groq + OpenRouter fallback, caching, retries, JSON cleanup. |
 | `parser.py` | **Formatting module.** `build_ai_message(...) -> (text, entities)` builds the final post shell + all `MessageEntityCustomEmoji`/link entities; price extraction; body sanitizer (`sanitize_body_lines`); buyer-header validation. |
 | `countries.py` | **Country→flag system.** `COUNTRY_EMOJI` (name→custom-emoji document id), `_FLAG_ALTS` (name→exact alt emoji), detection (`detect_countries`, `canonical_of`), flag attachment (`flag_body_lines`). Bootstrapped from a dumped paste of the actual custom emoji pack. |
@@ -224,7 +224,7 @@ Single SQLite file (`DB_PATH`, default `monitor.db`). Key concepts:
   `post_number`, fingerprint, `created_at`.
 - **Statuses** that matter (the admin flow keys off these):
   `received` → `skipped_*` / `pending_review` / `pending_approval` / `approved` /
-  `published` / `failed`. `listing_is_editable()` whitelist stops
+  `published`. `listing_is_editable()` whitelist stops
   stale in-flight edits after a listing leaves an editable state.
 - **skips**: every skip reason with message linkage (drives the skip digest).
 - **audit_log**: one row per decision (`published_auto`, `published_approved`,
@@ -245,8 +245,8 @@ the Home keyboard buttons):
 
 `/start` `/help` · `/suppliers` `/sources` · `/addsupplier [text|forwarded msg]`
 `/removesupplier` · `/dedupe_suppliers` · `/reseed_from_env` · `/status`
-`/pending` · `/failed` · `/skipped` · `/published`
-`/post [N]` · `/retry [N]` · `/preview [N]` · pause/resume ("All Stop/All Start")
+`/pending` · `/skipped` · `/published`
+`/post [N]` · `/preview [N]` · pause/resume ("All Stop/All Start")
 · "I'm Asleep"/"I'm Awake" toggle.
 
 Inline flows:
@@ -258,7 +258,7 @@ Inline flows:
   preview the exact publishing view before Approve.
 - Home menu, **Sources** editor (add via text or by forwarding a message from a
   private channel/group, toggle active, remove), **Skipped** with
-  per-card Re-review (`reskip:{skip_id}`), **Failed/DLQ** with Retry,
+  per-card Re-review (`reskip:{skip_id}`),
   **Published** listing with #post + source/destination links, Status report with
   skip-reason breakdown.
 

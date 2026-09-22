@@ -141,46 +141,6 @@ async def send_approval_prompt(
         logger.exception("Failed to send approval prompt to admin for listing #%s", listing_id)
 
 
-async def send_failed_alert(
-    bot_client: TelegramClient,
-    admin_id: int,
-    listing: dict,
-) -> None:
-    """Notify the admin whenever a listing moves to the failed queue (DLQ)."""
-    listing_id = listing["id"]
-    error = listing.get("last_error") or "unknown error"
-    retries = listing.get("retry_count", 0)
-    raw_preview = (listing.get("clean_text") or listing.get("raw_text") or "")[:200]
-
-    text = (
-        f"⚠️ **Publish Failed — Listing #{listing_id}**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Supplier : {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))}\n"
-        f"Retries  : {retries}\n"
-        f"Error    : `{(error or '')[:300]}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{raw_preview}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"The listing could not be published after retrying. "
-        f"Tap **Retry** (or send `/retry {listing_id}`) to send it again, "
-        f"or use `/failed` to see all failed listings."
-    )
-
-    buttons = [
-        [
-            Button.inline("👁️ Preview", data=f"preview:{listing_id}"),
-            Button.inline("🔁 Retry", data=f"retry:{listing_id}"),
-        ]
-    ]
-    buttons.extend(_channel_view_buttons(listing))
-
-    try:
-        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
-        logger.info("Sent failed alert for listing #%s to admin %s", listing_id, admin_id)
-    except Exception:
-        logger.exception("Failed to send failed alert to admin for listing #%s", listing_id)
-
-
 async def send_skipped_alert(
     bot_client: TelegramClient,
     admin_id: int,
@@ -256,7 +216,7 @@ async def send_published_alert(
 
 
 def _format_listing(n: int, l: dict) -> str:
-    """Single-line listing summary for /pending, /failed, /preview lists."""
+    """Single-line listing summary for /pending, /preview lists."""
     platform = l.get("platform_name") or l.get("game_name") or "?"
     created = (l.get("created_at") or "")[:16].replace("T", " ")
     return (
@@ -415,7 +375,7 @@ DESTINATIONS_ROUTE_RE = (
 def _home_keyboard() -> List[List[object]]:
     pause_label = "▶ All Start" if db.is_paused() else "⏸ All Stop"
     return [
-        [Button.text("📊 Status", resize=True), Button.text("⏳ Pending", resize=True), Button.text("⚠️ Failed", resize=True)],
+        [Button.text("📊 Status", resize=True), Button.text("⏳ Pending", resize=True)],
         [Button.text("📋 Sources", resize=True), Button.text(DESTINATIONS_BTN, resize=True), Button.text(pause_label, resize=True)],
         [Button.text("🚫 Skipped", resize=True), Button.text("✅ Published", resize=True), Button.text(_asleep_label(), resize=True)],
         [Button.text("❓ Help", resize=True)],
@@ -504,13 +464,13 @@ async def _message_delete_send(
 
 
 def _listing_action_buttons(listing: dict) -> List[List[object]]:
-    """Inline actions shown with a preview: failed listings can be retried,
-    pending ones can be edited, then approved or skipped. A 'View in Buyer
-    channel' link is appended when the source post resolves to a t.me URL."""
+    """Inline actions shown with a preview: pending ones can be edited, then
+    approved or skipped. A 'View in Buyer channel' link is appended when the
+    source post resolves to a t.me URL."""
     listing_id = listing["id"]
     status = listing["status"]
     if status in ("failed", "error"):
-        buttons = [[Button.inline("🔁 Retry", data=f"retry:{listing_id}")]]
+        buttons = []
     else:
         buttons = [
             [
@@ -1057,7 +1017,6 @@ def _home_inline_keyboard() -> List[List[object]]:
         [
             Button.inline("📊 Status", data="home:status"),
             Button.inline("⏳ Pending", data="home:pending"),
-            Button.inline("⚠️ Failed", data="home:failed"),
         ],
         [
             Button.inline("📋 Sources", data="menu:sources"),
@@ -1081,7 +1040,6 @@ def _help_text() -> str:
         "Everything is one tap — no commands to remember:\n"
         "• **📊 Status** — today's report\n"
         "• **⏳ Pending** — approve / preview / edit new listings\n"
-        "• **⚠️ Failed** — retry failed publishes\n"
         "• **📋 Sources** — add, manage, remove sources\n"
         f"• **{DESTINATIONS_BTN}** — add groups to forward copies of every bot post to\n"
         "• **✅ Published** — every post with its **#Post number** + channel & source links\n"
@@ -1117,40 +1075,13 @@ def _status_report_text() -> str:
         f"• Total Processed: `{stats['total_processed']}`\n"
         f"• Published: `{stats['published']}`\n"
         f"• Pending Approval: `{stats['pending']}`\n"
-        f"• Total Skipped: `{stats['total_skipped']}`\n"
-        f"• Errors: `{stats['errors']}`\n\n"
+        f"• Total Skipped: `{stats['total_skipped']}`\n\n"
         f"**By Supplier**\n{supplier_text}\n\n"
         f"**Skip Breakdown**\n{reason_text}"
     )
     if db.is_paused():
         msg = "⏸ **PAUSED — automatic publishing is stopped**\n(manual Approve taps still publish)\n\n" + msg
     return msg
-
-
-def _failed_digest(
-    failed: List[dict], page: int = 0, total: Optional[int] = None
-) -> Tuple[str, List[List[object]]]:
-    lines = ["⚠️ **Failed Listings (DLQ)** — tap an action below:\n"]
-    for i, l in enumerate(failed, 1):
-        lines.append(_format_listing(i, l))
-        error = l.get("last_error")
-        if error:
-            lines.append(f"   └ Last error: `{(error or '')[:120]}`")
-    buttons = []
-    for l in failed:
-        buttons.append([
-            Button.inline(f"👁️ #{l['id']} Preview", data=f"preview:{l['id']}"),
-            Button.inline(f"🔁 #{l['id']} Retry", data=f"retry:{l['id']}"),
-        ])
-    if total is not None:
-        total = max(int(total), len(failed))
-        _, _, page_count, _, _ = _page_window(total, page)
-        footer = _page_footer(page, page_count)
-        if footer:
-            lines.append(f"\n{footer}")
-        buttons.extend(_nav_row("fail", page, page_count))
-    buttons.extend(_home_button_row())
-    return "\n".join(lines), buttons
 
 
 def _relative_time(iso_ts: Optional[str]) -> str:
@@ -1313,11 +1244,7 @@ async def _send_pending_page(event, bot, page: int = 0) -> None:
     total = db.count_pending_listings()
     pending = db.get_pending_listings(limit=1, offset=0)
     if not pending:
-        await _message_delete_send(
-            event,
-            "✅ No listings pending approval right now.",
-            buttons=_home_button_row(),
-        )
+        await event.reply("✅ No listings pending approval right now.")
         return
     _review_session_total = total
     _review_session_done = 0
@@ -1573,18 +1500,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         await _send_pending_page(event, bot, 0)
 
-    @bot.on(events.NewMessage(pattern=r"^(?:/failed|⚠️ Failed)"))
-    async def handle_failed(event):
-        if not await check_admin(event):
-            return
-        failed = db.get_failed_listings(limit=_PAGE_SIZE, offset=0)
-        if not failed:
-            await event.reply("✅ No failed publishes in the queue.", buttons=_home_keyboard())
-            return
-
-        text, buttons = _failed_digest(failed, 0, db.count_failed_listings())
-        await event.reply(text, buttons=buttons, parse_mode="markdown")
-
     @bot.on(events.NewMessage(pattern=r"^(?:/skipped|🚫 Skipped)"))
     async def handle_skipped(event):
         if not await check_admin(event):
@@ -1632,41 +1547,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         text, buttons = _post_card(post)
         await event.reply(text, buttons=buttons, parse_mode="markdown")
 
-    @bot.on(events.NewMessage(pattern=r"^/retry(?:[ \t]+(\d+))?"))
-    async def handle_retry(event):
-        if not await check_admin(event):
-            return
-        arg = (event.pattern_match.group(1) or "").strip()
-        if not arg:
-            await event.reply(
-                "Usage: `/retry <listing_id>`\nRe-queues a failed listing for publishing.",
-                buttons=_home_keyboard(),
-            )
-            return
-
-        listing_id = int(arg)
-        listing = db.get_listing_by_id(listing_id)
-        if not listing:
-            await event.reply(f"❌ Listing **#{listing_id}** not found.", buttons=_home_keyboard())
-            return
-        if listing["status"] not in ("failed", "error"):
-            await event.reply(
-                f"⚠️ Listing **#{listing_id}** is not in a failed state (current: `{listing['status']}`).",
-                buttons=_home_keyboard(),
-            )
-            return
-
-        ok = await db.run_async(db.requeue_listing, listing_id)
-        await db.run_async(db.record_audit, "requeue", listing_id, actor_id=event.sender_id)
-        if ok:
-            await event.reply(
-                f"🔁 Listing **#{listing_id}** re-queued for publishing. "
-                f"The republisher will pick it up shortly.",
-                buttons=_home_keyboard(),
-            )
-        else:
-            await event.reply(f"❌ Could not re-queue listing **#{listing_id}**.", buttons=_home_keyboard())
-
     @bot.on(events.NewMessage(pattern=r"^/preview(?:[ \t]+(\d+))?"))
     async def handle_preview(event):
         if not await check_admin(event):
@@ -1696,7 +1576,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             logger.warning("Preview too long to send for listing #%s: %s", arg, exc)
             await event.reply(
                 f"⚠️ Preview for **#{arg}** is too long to display inline. "
-                f"Use `/pending` or find it via `/failed`.",
+                f"Use `/pending` to find it.",
                 buttons=_home_keyboard(),
             )
 
@@ -1774,18 +1654,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
             if home_action == "pending":
                 await _send_pending_page(event, bot, 0)
-                return
-            if home_action == "failed":
-                failed = db.get_failed_listings(limit=_PAGE_SIZE, offset=0)
-                if not failed:
-                    await _message_delete_send(
-                        event,
-                        "✅ No failed publishes in the queue.",
-                        buttons=_home_button_row(),
-                    )
-                    return
-                text, buttons = _failed_digest(failed, 0, db.count_failed_listings())
-                await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
             if home_action == "help":
                 await _message_delete_send(event, _help_text(), buttons=_home_button_row())
@@ -1905,17 +1773,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 buttons=_destinations_buttons(destinations, page),
                 parse_mode=None,
             )
-            return
-
-        failpage_match = re.match(r"^fail:page:(-?\d+)$", data_str)
-        if failpage_match:
-            raw_page = int(failpage_match.group(1))
-            total = db.count_failed_listings()
-            start, _, _, _, _ = _page_window(total, raw_page)
-            page = start // _PAGE_SIZE
-            failed = db.get_failed_listings(limit=_PAGE_SIZE, offset=start)
-            text, buttons = _failed_digest(failed, page, total)
-            await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
             return
 
         skippage_match = re.match(r"^skip:page:(-?\d+)$", data_str)
@@ -2344,7 +2201,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 logger.exception("Failed to send edit prompt for listing #%s", listing_id)
             return
 
-        match = re.match(r"^(approve|retry|skip):(\d+)$", data_str)
+        match = re.match(r"^(approve|skip):(\d+)$", data_str)
         if not match:
             await event.answer("Unknown action", alert=True)
             return
@@ -2355,31 +2212,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         if not listing:
             await event.answer("Listing not found in database.", alert=True)
-            return
-
-        if action == "retry":
-            if listing["status"] not in ("failed", "error"):
-                await event.answer(f"Already processed (status: {listing['status']})", alert=True)
-                return
-            ok = await db.run_async(db.requeue_listing, listing_id)
-            await db.run_async(db.record_audit, "requeue", listing_id, actor_id=event.sender_id)
-            if ok:
-                try:
-                    await event.delete()
-                except Exception:
-                    pass
-                try:
-                    await event.client.send_message(
-                        ADMIN_USER_ID,
-                        f"🔁 Listing #{listing_id} re-queued for publishing. "
-                        f"The republisher will pick it up shortly.",
-                        buttons=_home_keyboard(),
-                        parse_mode="markdown",
-                    )
-                except Exception:
-                    await event.answer(f"Re-queued #{listing_id}", alert=True)
-            else:
-                await event.answer("Re-queue failed.", alert=True)
             return
 
         # Approve / Skip only valid on pending listings (never on already-approved,
@@ -2429,7 +2261,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             # Re-check the listing's CURRENT status immediately before applying any
             # draft. The listing loaded above is a snapshot taken when the callback
             # arrived; if it has since moved out of the editable set (published,
-            # failed, requeued) the draft must NOT be silently applied to
+            # skipped, requeued) the draft must NOT be silently applied to
             # a stale listing. Discard it and say so instead.
             fresh = db.get_listing_by_id(listing_id)
             if fresh is not None and not listing_is_editable(fresh["status"]):
@@ -2656,7 +2488,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if text.startswith("/"):
             return
         # Menu taps must not be swallowed while a wizard is waiting
-        if text in ("📊 Status", "⏳ Pending", "⚠️ Failed", "📋 Sources", DESTINATIONS_BTN,
+        if text in ("📊 Status", "⏳ Pending", "📋 Sources", DESTINATIONS_BTN,
                     "⏸ All Stop", "▶ All Start", "❓ Help", "✅ Published",
                     "💤 I'm Asleep", "☀️ I'm Awake"):
             _wizard_state.pop(ADMIN_USER_ID, None)
@@ -2773,7 +2605,6 @@ async def create_admin_bot_client() -> TelegramClient:
             commands=[
                 BotCommand(command="status", description=" Today's stats report"),
                 BotCommand(command="pending", description="Pending approval listings"),
-                BotCommand(command="failed", description="Failed publishes (DLQ)"),
                 BotCommand(command="skipped", description="Recently skipped messages"),
                 BotCommand(command="sources", description=" Manage monitored sources"),
                 BotCommand(command="published", description="Published posts & channel links"),
