@@ -1034,7 +1034,7 @@ async def _process_supplier_message(
             if listing_dict:
                 listing_dict["supplier_username"] = supplier.get("channel_username")
                 listing_dict["_review_reason"] = "media_only"
-                await admin_bot.send_approval_prompt(
+                await admin_bot.send_review_notification(
                     bot_client, ADMIN_USER_ID, listing_dict
                 )
         return
@@ -1098,7 +1098,7 @@ async def _process_supplier_message(
             if listing_dict:
                 listing_dict["supplier_username"] = supplier.get("channel_username")
                 listing_dict["_review_reason"] = "payment_proof"
-                await admin_bot.send_approval_prompt(bot_client, ADMIN_USER_ID, listing_dict)
+                await admin_bot.send_review_notification(bot_client, ADMIN_USER_ID, listing_dict)
         return
 
     # Step 2: AI analysis + rewriting — ONE call decides everything. Nothing
@@ -1213,7 +1213,7 @@ async def _process_supplier_message(
             if listing_dict:
                 listing_dict["supplier_username"] = supplier.get("channel_username")
                 listing_dict["_review_reason"] = "ai_unavailable"
-                await admin_bot.send_approval_prompt(bot_client, ADMIN_USER_ID, listing_dict)
+                await admin_bot.send_review_notification(bot_client, ADMIN_USER_ID, listing_dict)
         return
 
     # Blocklist check (AI-detected illicit / hacked / stolen content).
@@ -1238,7 +1238,7 @@ async def _process_supplier_message(
             if listing_dict:
                 listing_dict["supplier_username"] = supplier.get("channel_username")
                 listing_dict["_review_reason"] = "ai_blocked_review"
-                await admin_bot.send_approval_prompt(bot_client, ADMIN_USER_ID, listing_dict)
+                await admin_bot.send_review_notification(bot_client, ADMIN_USER_ID, listing_dict)
         return
 
     # Not a legitimate listing (spam / admin chatter / nonsense)
@@ -1353,7 +1353,7 @@ async def _process_supplier_message(
             if listing_dict:
                 listing_dict["supplier_username"] = supplier.get("channel_username")
                 listing_dict["_review_reason"] = gate_reason
-                await admin_bot.send_approval_prompt(bot_client, ADMIN_USER_ID, listing_dict)
+                await admin_bot.send_review_notification(bot_client, ADMIN_USER_ID, listing_dict)
 
 
 async def process_edited_message(client: TelegramClient, event) -> None:

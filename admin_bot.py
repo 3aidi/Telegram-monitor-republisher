@@ -190,19 +190,13 @@ async def send_skipped_alert(
     listing: dict,
     reason: str,
 ) -> None:
-    """Notify the admin whenever an inbound message gets skipped."""
+    """One-line DM telling the admin whenever an inbound message gets skipped."""
     listing_id = listing["id"]
-    raw_preview = (listing.get("clean_text") or listing.get("raw_text") or "")[:200]
+    src = _pretty_source(listing.get("supplier_username"), listing.get("supplier_display_name")) or "?"
 
     text = (
-        f"⏳ **Skipped — {reason}**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Supplier : {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))}\n"
-        f"Reason   : {reason}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{raw_preview}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Not published. See `/skipped` to review and re-open it."
+        f"⏳ Skipped — {reason}: {src} — Listing #{listing_id} — "
+        f"tap /skipped to review."
     )
 
     try:
@@ -210,6 +204,44 @@ async def send_skipped_alert(
         logger.info("Sent skipped alert for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
         logger.exception("Failed to send skipped alert to admin for listing #%s", listing_id)
+
+
+async def send_review_notification(
+    bot_client: TelegramClient,
+    admin_id: int,
+    listing: dict,
+) -> None:
+    """One-line heads-up that an inbound message needs manual review.
+
+    The full review card (Approve / Skip / Edit with its queue position) lives
+    on the Pending screen — this is only a notification, never another big card.
+    """
+    listing_id = listing["id"]
+    review_reason = listing.get("_review_reason") or ""
+    label = {
+        "media_only": "media-only post",
+        "payment_proof": "payment-proof message",
+        "ai_unavailable": "AI unavailable — needs manual review",
+        "ai_blocked_review": "⚠️ flagged content — needs manual review",
+        "buy_gate": "buy intent — needs manual approval",
+        "buy_gate_weak_body": "buy intent with weak body — needs manual approval",
+        "unknown_platform": "platform not identified — needs manual review",
+    }.get(review_reason, "")
+    where = f" ({label})" if label else ""
+    src = _pretty_source(
+        listing.get("supplier_username"), listing.get("supplier_display_name")
+    )
+    src_part = f" from {src}" if src and src != "?" else ""
+    text = (
+        f"📬 Review needed{where}: Listing #{listing_id}{src_part} is pending — "
+        f"tap /pending to review."
+    )
+
+    try:
+        await bot_client.send_message(admin_id, text, parse_mode=None)
+        logger.info("Sent review notification for listing #%s to admin %s", listing_id, admin_id)
+    except Exception:
+        logger.exception("Failed to send review notification for listing #%s", listing_id)
 
 
 async def send_published_alert(
@@ -324,26 +356,18 @@ def _repair_targets(max_posts: int = 100) -> List[dict]:
 
 
 def _skip_notification(k: dict) -> Tuple[str, List[List[object]]]:
-    """One send_published_alert-style card for a single skipped message.
+    """One-line notification for a single skipped message.
 
-    Mirrors the published-alert layout (header + divider + Supplier/Reason +
-    snippet + divider) so skipped notifications read like their published
-    counterparts. Each card carries its own Re-review button and a source-link
-    button when the supplier's channel resolves to a t.me URL.
+    Compact by design: just the reason + supplier on one line, with a small
+    Re-review button (and a source-link button when the supplier's channel
+    resolves to a t.me URL) so it is actionable without being a big card.
     """
     reason = (k.get("reason") or "unknown").replace("_", " ")
-    header = f"⏳ **Skipped — {reason}**"
     src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
-    snippet = (k.get("raw_text") or "").strip().replace("\n", " ")[:240]
+    listing_part = f" — Listing #{k['listing_id']}" if k.get("listing_id") else ""
     text = (
-        f"{header}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Supplier : {src}\n"
-        f"Reason   : {reason}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{snippet}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Nothing was published for this message."
+        f"⏳ Skipped — {reason}: {src}{listing_part} — "
+        f"tap /skipped to review."
     )
     buttons = [[Button.inline("🔁 Re-review", data=f"reskip:{k['skip_id']}")]]
     src_url = _source_url({
@@ -1976,13 +2000,23 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             # otherwise the stale text silently resurrects on a later Approve
             # of the same listing (wizard-draft leak).
             wiz = _wizard_state.pop(ADMIN_USER_ID, None)
-            if wiz and wiz.get("step") == "edit" and wiz.get("listing_id"):
+            edit_cancelled = bool(wiz and wiz.get("step") == "edit" and wiz.get("listing_id"))
+            if edit_cancelled:
                 _drafts.pop(wiz["listing_id"], None)
             await event.answer("Cancelled")
             try:
                 await event.delete()
             except Exception:
                 pass
+            if edit_cancelled:
+                try:
+                    await event.client.send_message(
+                        ADMIN_USER_ID,
+                        "✏️ Edit cancelled.",
+                        parse_mode="markdown",
+                    )
+                except Exception:
+                    pass
             return
 
         # ---- List pagination ----------------------------------------------
@@ -2519,6 +2553,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await event.answer("⏭️ Skipped")
             try:
                 await event.delete()
+            except Exception:
+                pass
+            try:
+                await event.client.send_message(
+                    ADMIN_USER_ID,
+                    f"⏭️ Listing #{listing_id} skipped for now.",
+                    parse_mode="markdown",
+                )
             except Exception:
                 pass
             await _advance_review(bot)

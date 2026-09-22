@@ -1718,8 +1718,8 @@ class TestMonitorSystem(unittest.TestCase):
             admin_bot.DEST_CHANNEL = old
 
     def test_skip_notification_render(self):
-        """One skip renders as a send_published_alert-style card with a
-        Re-review button and (when resolvable) a source-channel link."""
+        """One skip renders as a one-line notification with a Re-review button
+        and (when resolvable) a source-channel link."""
         import admin_bot
 
         text, buttons = admin_bot._skip_notification({
@@ -1729,9 +1729,9 @@ class TestMonitorSystem(unittest.TestCase):
             "reason": "duplicate",
             "raw_text": "WTS Bybit account $100",
         })
-        self.assertIn("⏳ **Skipped — duplicate**", text)
-        self.assertIn("━━━━━━━━━━━━━━━━━━━━", text)
-        self.assertIn("Supplier : @kycgroupke", text)
+        self.assertIn("Skipped — duplicate", text)
+        self.assertNotIn("\n", text, "skip notification must stay on one line")
+        self.assertIn("@kycgroupke", text)
         self.assertEqual(len(buttons), 1, "one row of buttons")
         row = buttons[0]
         self.assertTrue(any(getattr(b, "text", "") == "🔁 Re-review" for b in row))
