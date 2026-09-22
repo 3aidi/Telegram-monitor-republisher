@@ -1917,7 +1917,7 @@ async def main() -> None:
         logger.debug("Could not pre-warm user client dialogs cache.")
     if MANUAL_MODE:
         # Manual mode: no supplier resolution, no ingestion, no auto-publish —
-        # just the user client + admin bot ready for approval/repair work.
+        # just the user client + admin bot ready for approval work.
         logger.info(
             "MANUAL MODE active: admin bot + user client online. "
             "Ingestion/auto-publish disabled. Publishing to %s",
@@ -1928,7 +1928,7 @@ async def main() -> None:
                 await bot_client.send_message(
                     ADMIN_USER_ID,
                     "🛠 **Manual mode online.** Ingestion and auto-publish are OFF. "
-                    "Approvals publish immediately; /skipped and /repair are available.",
+                    "Approvals publish immediately; /skipped is available.",
                 )
             except Exception:
                 logger.exception("Could not send manual-mode notice")

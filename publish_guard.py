@@ -46,7 +46,7 @@ async def run_with_floodwait_retry(
     """Await a coroutine factory, transparently honoring FloodWaitError (TEL-1).
 
     This is the SINGLE FloodWait retry mechanism shared by main.py and the
-    admin bot so edit/repair/approve paths behave like the successful
+    admin bot so edit/approve paths behave like the successful
     auto-publish path instead of each implementing its own retry.
 
     ``coro_factory`` takes no args and returns a coroutine (a fresh call must

@@ -286,7 +286,7 @@ def sanitize_body_lines(content_lines, max_lines: int = 40) -> List[str]:
         # formatting_entities WITHOUT parse_mode, so Telethon never interprets
         # "**" as bold — without this, asterisks would leak into the post as
         # literal characters. This runs in the ONE shared sanitizer each render
-        # path goes through (auto-publish, approve, preview, /repair).
+        # path goes through (auto-publish, approve, preview).
         stripped = stripped.replace("**", "").replace("*", "")
         stripped = re.sub(r"\s{2,}", " ", stripped).strip()
         if stripped:
@@ -314,7 +314,7 @@ def _asleep_footer_line() -> Optional[str]:
     """Return the buyer-asleep footer line, or None when the toggle is OFF.
 
     ``build_ai_message`` is the ONE place every published post is rendered
-    (auto worker, admin approve, preview, /repair), so this single hook keeps
+    (auto worker, admin approve, preview), so this single hook keeps
     every path consistent. ``db`` is imported lazily and every failure degrades
     to no footer, keeping parser a leaf module that runs standalone (unit tests,
     tooling). A missing default DB is never created here either — the line is
@@ -378,7 +378,7 @@ def build_ai_message(
 
     Returns (text, entities) — pass both to Telethon send_message(). When
     ``sanitize_body`` is False the body is wrapped verbatim (used only to
-    reconstruct what was actually published, for /repair diffing).
+    reconstruct what was actually published).
     """
     if sanitize_body:
         lines = sanitize_body_lines(content_lines)[:40]

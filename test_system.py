@@ -2947,7 +2947,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("KYC CURVE PAY", msg)
 
     def test_build_ai_message_preserves_body_when_sanitize_false(self):
-        # /repair reconstructs the as-published text: verbatim body, no sanitizing.
+        # Reconstructs the as-published text: verbatim body, no sanitizing.
         msg, _entities = parser.build_ai_message(
             content_lines=["KYC CURVE PAY", "PRICE: $30"],
             platform="curve",

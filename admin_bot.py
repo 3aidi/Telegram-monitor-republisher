@@ -54,9 +54,6 @@ _review_session_done: int = 0
 # publish_guard). Capped so a large flood can never hang the
 # admin bot's event loop indefinitely — on exhaustion the action fails through
 # into its existing error path (e.g. re-queue for the worker).
-REPAIR_FLOODWAIT_BUDGET_SECONDS = float(
-    os.environ.get("REPAIR_FLOODWAIT_BUDGET_SECONDS", "120") or 120
-)
 APPROVE_FLOODWAIT_BUDGET_SECONDS = float(
     os.environ.get("APPROVE_FLOODWAIT_BUDGET_SECONDS", "120") or 120
 )
@@ -211,30 +208,16 @@ async def send_review_notification(
     admin_id: int,
     listing: dict,
 ) -> None:
-    """One-line heads-up that an inbound message needs manual review.
 
-    The full review card (Approve / Skip / Edit with its queue position) lives
-    on the Pending screen — this is only a notification, never another big card.
-    """
     listing_id = listing["id"]
     review_reason = listing.get("_review_reason") or ""
-    label = {
-        "media_only": "media-only post",
-        "payment_proof": "payment-proof message",
-        "ai_unavailable": "AI unavailable — needs manual review",
-        "ai_blocked_review": "⚠️ flagged content — needs manual review",
-        "buy_gate": "buy intent — needs manual approval",
-        "buy_gate_weak_body": "buy intent with weak body — needs manual approval",
-        "unknown_platform": "platform not identified — needs manual review",
-    }.get(review_reason, "")
-    where = f" ({label})" if label else ""
     src = _pretty_source(
         listing.get("supplier_username"), listing.get("supplier_display_name")
     )
-    src_part = f" from {src}" if src and src != "?" else ""
+    src_part = f" from {src}\n" if src and src != "?" else ""
     text = (
-        f"📬 Review needed{where}: Listing #{listing_id}{src_part} is pending — "
-        f"tap /pending to review."
+        f"📬 Review needed : Listing #{listing_id} \n {src_part} "
+        f"\n tap /pending to review."
     )
 
     try:
@@ -305,54 +288,6 @@ async def _build_preview_text(listing: dict) -> str:
         source_text=listing.get("raw_text"),
     )
     return preview_text
-
-
-def _repair_targets(max_posts: int = 100) -> List[dict]:
-    """Find published posts whose body still contains leaked source prices /
-    @handles / DM lines. Returns the diff of what IS published vs what a clean
-    (sanitized) rebuild would be, with entities ready to apply via edit_message."""
-    published = db.get_published_listings(limit=max_posts)
-    targets: List[dict] = []
-    for p in published:
-        listing_id = p["id"]
-        content_text = p.get("clean_text") or p.get("raw_text") or ""
-        content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
-        sanitized = parser.sanitize_body_lines(content_lines) or ["Available"]
-        platform = p.get("platform_name") or p.get("game_name")
-        intent = p.get("intent") or "neutral"
-        post_number = p.get("post_number")
-
-        current_text, _ = parser.build_ai_message(
-            content_lines=content_lines,
-            platform=platform,
-            contact_username=CONTACT_USERNAME,
-            intent=intent,
-            header_word=p.get("header_word"),
-            listing_seed=listing_id,
-            post_number=post_number,
-            sanitize_body=False,
-            source_text=p.get("raw_text"),
-        )
-        repaired_text, entities = parser.build_ai_message(
-            content_lines=sanitized,
-            platform=platform,
-            contact_username=CONTACT_USERNAME,
-            intent=intent,
-            header_word=p.get("header_word"),
-            listing_seed=listing_id,
-            post_number=post_number,
-            source_text=p.get("raw_text"),
-        )
-        if repaired_text != current_text:
-            targets.append({
-                "listing_id": listing_id,
-                "post_number": post_number,
-                "published_message_id": p.get("published_message_id"),
-                "current_text": current_text,
-                "repaired_text": repaired_text,
-                "entities": entities,
-            })
-    return targets
 
 
 def _skip_notification(k: dict) -> Tuple[str, List[List[object]]]:
@@ -1357,8 +1292,7 @@ async def _advance_review(bot: TelegramClient) -> None:
         try:
             await bot.send_message(
                 ADMIN_USER_ID,
-                "✅ Review queue finished.\n\nNo pending listings right now.",
-                buttons=_home_button_row(),
+                "✅ No pending listings right now.",
             )
         except Exception:
             logger.exception("Failed to send review-queue-finished notice")
@@ -1663,81 +1597,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         text, buttons = _skipped_digest(skips, 0, db.count_skipped_listings())
         await event.reply(text, buttons=buttons, parse_mode="markdown")
 
-    @bot.on(events.NewMessage(pattern=r"^/repair(?:\s+(do|list))?"))
-    async def handle_repair(event):
-        if not await check_admin(event):
-            return
-        mode = (event.pattern_match.group(1) or "list").lower()
-        targets = _repair_targets()
-
-        if mode != "do":
-            if not targets:
-                await event.reply(
-                    "✅ No published posts need repair — all bodies are clean.",
-                    buttons=_home_keyboard(),
-                )
-                return
-            nums = ", ".join(f"#{t['post_number'] or '?'}" for t in targets)
-            lines = [
-                f"🔧 **Repair dry-run** — {len(targets)} published post(s) would be edited "
-                f"in place (leaked prices/@handles/DM lines removed):\n"
-                f"Posts: {nums}\n"
-                f"Detailed before/after for the first {min(5, len(targets))} below.\n",
-            ]
-            for t in targets[:5]:
-                lines.append(
-                    f"━━━ **Post #{t['post_number'] or '?'}** · listing #{t['listing_id']} ━━━\n"
-                    f"**now:**\n{t['current_text']}\n"
-                    f"**after:**\n{t['repaired_text']}"
-                )
-            lines.append(
-                "\nRun `/repair do` to apply to all of them. "
-                "**Review carefully — this EDITS the live channel.**"
-            )
-            await event.reply("\n\n".join(lines), buttons=_home_keyboard(), parse_mode="markdown")
-            return
-
-        if not targets:
-            await event.reply("✅ Nothing to repair.", buttons=_home_keyboard())
-            return
-        if not user_client_ref or not user_client_ref.is_connected() or not DEST_CHANNEL:
-            await event.reply(
-                "⚠️ User client not connected — can't edit the destination channel.",
-                buttons=_home_keyboard(),
-            )
-            return
-        done = 0
-        failed = 0
-        for t in targets:
-            try:
-                await publish_guard.throttle()
-                await publish_guard.run_with_floodwait_retry(
-                    lambda t=t: user_client_ref.edit_message(
-                        DEST_CHANNEL,
-                        t["published_message_id"],
-                        t["repaired_text"],
-                        formatting_entities=t["entities"],
-                    ),
-                    f"repair edit post {t['published_message_id']}",
-                    max_total_sleep=REPAIR_FLOODWAIT_BUDGET_SECONDS,
-                )
-                await db.run_async(
-                    db.record_audit,
-                    "repair_edited",
-                    t["listing_id"],
-                    actor_id=event.sender_id,
-                    detail=f"post #{t['post_number']}",
-                )
-                done += 1
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Repair edit failed for post %s", t.get("post_number"))
-                failed += 1
-        await event.reply(
-            f"🔧 Repair done: **{done} edited**, {failed} failed.",
-            buttons=_home_keyboard(),
-        )
     @bot.on(events.NewMessage(pattern=r"^(?:/published|✅ Published)"))
     async def handle_published(event):
         if not await check_admin(event):
@@ -2558,7 +2417,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             try:
                 await event.client.send_message(
                     ADMIN_USER_ID,
-                    f"⏭️ Listing #{listing_id} skipped for now.",
+                    f"Listing #{listing_id} skipped for now.",
                     parse_mode="markdown",
                 )
             except Exception:
@@ -2912,15 +2771,14 @@ async def create_admin_bot_client() -> TelegramClient:
             scope=BotCommandScopeDefault(),
             lang_code="",
             commands=[
-                BotCommand(command="status", description="📊 Today's stats report"),
-                BotCommand(command="pending", description="⏳ Pending approval listings"),
-                BotCommand(command="failed", description="⚠️ Failed publishes (DLQ)"),
-                BotCommand(command="skipped", description="🚫 Recently skipped messages"),
-                BotCommand(command="sources", description="📋 Manage monitored sources"),
-                BotCommand(command="published", description="✅ Published posts & channel links"),
-                BotCommand(command="post", description="🔢 Look up a post by its number: /post 12"),
-                BotCommand(command="repair", description="🔧 Edit leaked prices/handles out of live posts"),
-                BotCommand(command="help", description="❓ Show buttons and shortcuts"),
+                BotCommand(command="status", description=" Today's stats report"),
+                BotCommand(command="pending", description="Pending approval listings"),
+                BotCommand(command="failed", description="Failed publishes (DLQ)"),
+                BotCommand(command="skipped", description="Recently skipped messages"),
+                BotCommand(command="sources", description=" Manage monitored sources"),
+                BotCommand(command="published", description="Published posts & channel links"),
+                BotCommand(command="post", description=" Look up a post by its number: /post 12"),
+                BotCommand(command="help", description=" Show buttons and shortcuts"),
             ]
         ))
     except Exception as e:
