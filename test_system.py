@@ -1152,6 +1152,10 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(row["last_error"], "FloodWaitError(30)")
         self.assertGreaterEqual(row["retry_count"], 1)
 
+        # Failed listings count toward today's stats "errors" headline.
+        stats = db.get_today_stats(db_path=TEST_DB)
+        self.assertGreaterEqual(stats["errors"], 1)
+
     def test_db_audit_log(self):
         db.record_audit("published_auto", 42, detail="msg 5001", db_path=TEST_DB)
         with db.db_session(TEST_DB) as conn:

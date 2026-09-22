@@ -1541,6 +1541,11 @@ def get_today_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
             (today_start,),
         ).fetchone()[0]
 
+        errors_count = conn.execute(
+            "SELECT count(*) FROM listings WHERE created_at >= ? AND status = 'failed'",
+            (today_start,),
+        ).fetchone()[0]
+
     skipped_reasons = get_skip_reasons_today(db_path)
     total_skipped = sum(skipped_reasons.values())
     supplier_breakdown = get_supplier_stats_today(db_path)
@@ -1551,6 +1556,7 @@ def get_today_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
         "published": published_count,
         "pending": pending_count,
         "total_skipped": total_skipped,
+        "errors": errors_count,
         "skip_reasons": skipped_reasons,
         "supplier_breakdown": supplier_breakdown,
     }
