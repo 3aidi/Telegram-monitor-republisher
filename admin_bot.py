@@ -1298,15 +1298,18 @@ async def _advance_review(bot: TelegramClient) -> None:
 
 
 async def _send_pending_page(event, bot, page: int = 0) -> None:
-    """Render one page of the pending queue: header + nav + up to 6 approval cards.
+    """Inbox entry: show a count banner then ONE pending listing card.
 
-    Replaces the tapped message with a fresh page header (carrying the
-    ``pend:page:N`` Prev/Next navigation) and sends one approval card per
-    listing on the page. Approval cards themselves stay untouched."""
+    Replaces the tapped message with a brief queue-size notice, then surfaces
+    the oldest pending listing as a single review card. After the admin acts on
+    it (Approve / Skip / Edit → Save) ``_advance_review`` picks up and shows
+    the next card automatically — there is no multi-card dump anymore.
+
+    The ``page`` argument is accepted for API compatibility with ``pend:page:N``
+    callbacks but is ignored; the inbox always starts from the oldest item.
+    """
     total = db.count_pending_listings()
-    start, end, page_count, _, _ = _page_window(total, page)
-    page = start // _PAGE_SIZE
-    pending = db.get_pending_listings(limit=_PAGE_SIZE, offset=start)
+    pending = db.get_pending_listings(limit=1, offset=0)
     if not pending:
         await _message_delete_send(
             event,
@@ -1314,15 +1317,15 @@ async def _send_pending_page(event, bot, page: int = 0) -> None:
             buttons=_home_button_row(),
         )
         return
-    text = f"⏳ Found {total} listing(s) pending review:"
-    footer = _page_footer(page, page_count)
-    if footer:
-        text += f"\n\n{footer}"
-    buttons = list(_nav_row("pend", page, page_count))
-    buttons.extend(_home_button_row())
-    await _message_delete_send(event, text, buttons=buttons)
-    for l in pending:
-        await send_approval_prompt(bot, ADMIN_USER_ID, l)
+    # Replace the tapped menu entry with a count banner (so it's not lost in
+    # the chat), then send the single review card below it.
+    await _message_delete_send(
+        event,
+        f"⏳ {total} listing(s) pending review — tap Approve, Skip, or Edit on each card:",
+        buttons=_home_button_row(),
+        parse_mode=None,
+    )
+    await send_approval_prompt(bot, ADMIN_USER_ID, pending[0], as_next=False)
 
 
 def _post_card(post: dict) -> Tuple[str, List[List[object]]]:

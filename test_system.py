@@ -4102,47 +4102,66 @@ class TestPhase5Handlers(unittest.TestCase):
 
     # ---------------- admin handlers (F1 / F2) -----------------------
     def test_admin_pending_command_renders_page_and_cards(self):
-        """/pending renders the page header and one approval card per listing.
-        Regression for F2 (the page renderer must be handed the bot)."""
+        """/pending renders a count banner and exactly ONE review card (inbox mode).
+        The count banner carries 'listing(s) pending review'; the card carries
+        an Approve button. Subsequent cards appear via _advance_review after
+        each decision — there is no multi-card dump."""
 
         async def _run():
             lid = self._add_listing(status="pending_approval")
             ev = await _dispatch_message(self.bot, "/pending", self.ADMIN)
             self.assertTrue(
                 any("listing(s) pending review" in m["text"] for m in self.bot.sent),
-                "pending header must be sent",
+                "count banner must include 'listing(s) pending review'",
             )
             self.assertTrue(
                 f"approve:{lid}" in _all_button_datas(self.bot),
-                "approval card must carry an Approve button",
+                "the single review card must carry an Approve button",
             )
+            # Exactly one card per /pending invocation (inbox, not a dump)
+            approve_count = sum(
+                1 for m in self.bot.sent
+                if any(
+                    any(getattr(b, 'data', b'').decode('utf-8', 'replace').startswith('approve:')
+                        for b in (row if isinstance(row, list) else [row]))
+                    for row in (m.get('buttons') or [])
+                )
+            )
+            self.assertEqual(approve_count, 1, "inbox entry must show exactly ONE review card")
             self.assertEqual(ev._deleted, 1)
 
         asyncio.run(_run())
 
     def test_admin_home_pending_button_renders_page(self):
-        """Tapping Pending on the home inline keyboard renders the page (the
-        second F2 call site)."""
+        """Tapping Pending on the home inline keyboard shows the count banner and
+        ONE review card (inbox mode — second F2 call site)."""
 
         async def _run():
             lid = self._add_listing(status="pending_approval")
             await _dispatch_callback(self.bot, "home:pending", self.ADMIN)
             self.assertTrue(
-                any("listing(s) pending review" in m["text"] for m in self.bot.sent)
+                any("listing(s) pending review" in m["text"] for m in self.bot.sent),
+                "count banner must be sent",
             )
-            self.assertTrue(f"approve:{lid}" in _all_button_datas(self.bot))
+            self.assertTrue(f"approve:{lid}" in _all_button_datas(self.bot),
+                            "the single review card must carry an Approve button")
 
         asyncio.run(_run())
 
     def test_admin_pending_pagination_callback(self):
-        """pend:page:N routes through the same page renderer (third F2 call site)."""
+        """pend:page:N routes through the same inbox renderer (third F2 call site).
+        The page argument is accepted for API compat but the inbox always starts
+        from the oldest pending listing — one card is sent."""
 
         async def _run():
-            self._add_listing(status="pending_approval")
+            lid = self._add_listing(status="pending_approval")
             await _dispatch_callback(self.bot, "pend:page:0", self.ADMIN)
             self.assertTrue(
-                any("listing(s) pending review" in m["text"] for m in self.bot.sent)
+                any("listing(s) pending review" in m["text"] for m in self.bot.sent),
+                "count banner must be sent",
             )
+            self.assertTrue(f"approve:{lid}" in _all_button_datas(self.bot),
+                            "the single review card must be shown")
 
         asyncio.run(_run())
 
