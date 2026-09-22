@@ -803,7 +803,6 @@ def _sources_buttons(suppliers: List[dict], page: int = 0) -> List[List[object]]
     buttons.extend(_nav_row("sup", page, page_count))
     buttons.append([
         Button.inline("➕ Add Source", data="supadd"),
-        Button.inline("⬅️ Back", data="menu:home"),
     ])
     return buttons
 
@@ -849,7 +848,6 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
     buttons.extend(_nav_row("dest", page, page_count))
     buttons.append([
         Button.inline("➕ Add Destination", data="destadd"),
-        Button.inline("⬅️ Back", data="menu:home"),
     ])
     return buttons
 
