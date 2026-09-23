@@ -79,6 +79,19 @@ FORWARD_FLOODWAIT_BUDGET_SECONDS = float(
     os.environ.get("FORWARD_FLOODWAIT_BUDGET_SECONDS", "60") or 60
 )
 FORWARD_WORKER_INTERVAL = float(os.environ.get("FORWARD_WORKER_INTERVAL", "3") or 3)
+# Pause between each destination forward within one drain pass. Keeps a single
+# listing from burst-forwarding to every destination back-to-back, which is what
+# triggers Telegram flood-limits / spam restrictions on the acting account.
+FORWARD_PACING_SECONDS = float(os.environ.get("FORWARD_PACING_SECONDS", "2.0") or 2.0)
+# Optional dedicated forward-only account (DEST-ROUTE): a second Telethon session
+# that forwards ONLY to the destinations listed in FORWARD_SESSION_DESTINATIONS.
+# The main account keeps monitoring + publishing and forwards to everything else.
+# Empty FORWARD_SESSION_NAME disables the second account entirely.
+FORWARD_SESSION_NAME = os.environ.get("FORWARD_SESSION_NAME", "").strip() or None
+FORWARD_SESSION_DESTINATIONS = {
+    chat.strip() for chat in os.environ.get("FORWARD_SESSION_DESTINATIONS", "").split(",")
+    if chat.strip()
+}
 
 # Errors that will never succeed on retry: reporting them as the queue's final
 # state (failed) beats grinding retries forever (DEST-1).
@@ -692,7 +705,9 @@ async def _confirm_forward_on_destination(
     return None
 
 
-async def _drain_forward_queue(client: TelegramClient) -> None:
+async def _drain_forward_queue(
+    client: TelegramClient, forward_client: Optional[TelegramClient] = None
+) -> None:
     """One pass over the pending destination-forward batch.
 
     Sequential (never a parallel forward storm), oldest-first, each destination
@@ -702,6 +717,11 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
     the others. Rows are CLAIMED ('forwarding') before the external forward so
     two workers can never forward the same message, and an ambiguous failure is
     VERIFIED against the destination before it is retried or failed (F6).
+
+    When ``forward_client`` is provided, destinations listed in
+    FORWARD_SESSION_DESTINATIONS are sent by that dedicated account and every
+    other destination by the main ``client``. Forwarding is paced with
+    FORWARD_PACING_SECONDS between destinations so neither account bursts.
     """
     pending = await db.run_async(db.get_pending_forwardings, 10)
     for row in pending:
@@ -709,6 +729,13 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
         to_peer = db.to_peer_reference(row["destination_chat_id"])
         from_peer = db.to_peer_reference(row["published_chat_id"])
         expected_post_id = int(row["published_message_id"])
+
+        if forward_client is not None and row["destination_chat_id"] in FORWARD_SESSION_DESTINATIONS:
+            sender = forward_client
+            sender_tag = "fwd-session"
+        else:
+            sender = client
+            sender_tag = "main-session"
 
         claimed = await db.run_async(db.claim_forwarding, fwd_id)
         if not claimed:
@@ -723,7 +750,7 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
         # actually have landed, and a blind resend would duplicate it.
         if (row.get("error") or "") == "stale_claim_reset":
             already_there = await _confirm_forward_on_destination(
-                client, to_peer, expected_post_id
+                sender, to_peer, expected_post_id
             )
             if already_there is not None:
                 await db.run_async(db.mark_forwarded, fwd_id)
@@ -738,7 +765,7 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
 
         async def _forward_call():
             try:
-                return await client.forward_messages(
+                return await sender.forward_messages(
                     to_peer,
                     messages=[expected_post_id],
                     from_peer=from_peer,
@@ -752,10 +779,10 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
                     res_err,
                 )
                 try:
-                    await client.get_dialogs(limit=50)
+                    await sender.get_dialogs(limit=50)
                 except Exception as diag_err:
                     logger.debug("Failed refreshing dialogs during forward retry: %s", diag_err)
-                return await client.forward_messages(
+                return await sender.forward_messages(
                     to_peer,
                     messages=[expected_post_id],
                     from_peer=from_peer,
@@ -776,7 +803,7 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
             # surfaced (timeout/lost response). Verify BEFORE declaring failure,
             # otherwise the retry below would forward the message a second time.
             already_there = await _confirm_forward_on_destination(
-                client, to_peer, expected_post_id
+                sender, to_peer, expected_post_id
             )
             if already_there is not None:
                 await db.run_async(db.mark_forwarded, fwd_id)
@@ -791,23 +818,31 @@ async def _drain_forward_queue(client: TelegramClient) -> None:
             permanent = isinstance(raise_as_error, PERMANENT_FORWARD_ERRORS)
             await db.run_async(db.mark_forward_failed, fwd_id, str(exc)[:500], permanent)
             logger.warning(
-                "Forward to destination %s failed%s: %s",
+                "Forward to destination %s failed%s [%s]: %s",
                 row["destination_chat_id"],
                 " (permanent)" if permanent else "",
+                sender_tag,
                 exc,
             )
             continue
         await db.run_async(db.mark_forwarded, fwd_id)
         logger.info(
-            "Forwarded bot post #%s (msg %s) to destination %s",
+            "Forwarded bot post #%s (msg %s) to destination %s [%s]",
             row["listing_id"],
             row["published_message_id"],
             row["destination_chat_id"],
+            sender_tag,
         )
+
+        if FORWARD_PACING_SECONDS > 0:
+            await asyncio.sleep(FORWARD_PACING_SECONDS)
 
 
 async def forwarding_worker(
-    client: TelegramClient, stop_event: asyncio.Event, interval: float = None
+    client: TelegramClient,
+    stop_event: asyncio.Event,
+    interval: float = None,
+    forward_client: Optional[TelegramClient] = None,
 ) -> None:
     """Background loop draining the persistent destination-forward queue.
 
@@ -819,7 +854,7 @@ async def forwarding_worker(
     interval = FORWARD_WORKER_INTERVAL if interval is None else interval
     while not stop_event.is_set():
         try:
-            await _drain_forward_queue(client)
+            await _drain_forward_queue(client, forward_client)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1882,6 +1917,38 @@ async def main() -> None:
                 logger.exception("Unhandled error processing deleted message")
 
     await user_client.start()
+
+    # Optional dedicated forward-only account (DEST-ROUTE): a second Telethon
+    # session whose ONLY job is forwarding to FORWARD_SESSION_DESTINATIONS.
+    # It registers no event handlers, so it never monitors or publishes.
+    forward_client: Optional[TelegramClient] = None
+    if FORWARD_SESSION_NAME:
+        try:
+            forward_client = TelegramClient(FORWARD_SESSION_NAME, API_ID, API_HASH)
+            await forward_client.start()
+            try:
+                await forward_client.get_dialogs(limit=50)
+            except Exception:
+                logger.debug("Could not pre-warm forward-client dialogs cache.")
+            logger.info(
+                "Forward-dedicated client connected (%s); forwarding %d destination(s) "
+                "via the second account.",
+                FORWARD_SESSION_NAME,
+                len(FORWARD_SESSION_DESTINATIONS),
+            )
+        except Exception:
+            logger.exception(
+                "Could not start forward-dedicated client %s; "
+                "forwarding will use the main account for all destinations.",
+                FORWARD_SESSION_NAME,
+            )
+            try:
+                if forward_client is not None:
+                    await forward_client.disconnect()
+            except Exception:
+                pass
+            forward_client = None
+
     try:
         await user_client.get_dialogs(limit=50)
         logger.debug("Warmed up user client dialogs cache.")
@@ -1948,7 +2015,9 @@ async def main() -> None:
 
     # Start background workers
     worker_task = asyncio.create_task(approved_listings_worker(user_client, stop_event, bot_client))
-    forward_task = asyncio.create_task(forwarding_worker(user_client, stop_event))
+    forward_task = asyncio.create_task(
+        forwarding_worker(user_client, stop_event, forward_client=forward_client)
+    )
     health_task = None
     resolve_task = None
     rephrase_task = None
@@ -2005,6 +2074,11 @@ async def main() -> None:
                 await bot_client.disconnect()
             except Exception:
                 logger.exception("Error disconnecting admin bot client")
+        if forward_client:
+            try:
+                await forward_client.disconnect()
+            except Exception:
+                logger.exception("Error disconnecting forward-dedicated client")
         try:
             await user_client.disconnect()
         except Exception:

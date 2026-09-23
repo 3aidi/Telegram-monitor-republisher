@@ -141,28 +141,6 @@ async def send_approval_prompt(
         logger.exception("Failed to send approval prompt to admin for listing #%s", listing_id)
 
 
-async def send_skipped_alert(
-    bot_client: TelegramClient,
-    admin_id: int,
-    listing: dict,
-    reason: str,
-) -> None:
-    """One-line DM telling the admin whenever an inbound message gets skipped."""
-    listing_id = listing["id"]
-    src = _pretty_source(listing.get("supplier_username"), listing.get("supplier_display_name")) or "?"
-
-    text = (
-        f"⏳ Skipped — {reason}: {src} — Listing #{listing_id} — "
-        f"tap /skipped to review."
-    )
-
-    try:
-        await bot_client.send_message(admin_id, text, parse_mode=None)
-        logger.info("Sent skipped alert for listing #%s to admin %s", listing_id, admin_id)
-    except Exception:
-        logger.exception("Failed to send skipped alert to admin for listing #%s", listing_id)
-
-
 async def send_review_notification(
     bot_client: TelegramClient,
     admin_id: int,
@@ -257,12 +235,10 @@ def _skip_notification(k: dict) -> Tuple[str, List[List[object]]]:
     Re-review button (and a source-link button when the supplier's channel
     resolves to a t.me URL) so it is actionable without being a big card.
     """
-    reason = (k.get("reason") or "unknown").replace("_", " ")
     src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
     listing_part = f" — Listing #{k['listing_id']}" if k.get("listing_id") else ""
     text = (
-        f"⏳ Skipped — {reason}: {src}{listing_part} — "
-        f"tap /skipped to review."
+        f"⏳ Skipped From — {src}{listing_part} — "
     )
     buttons = [[Button.inline("🔁 Re-review", data=f"reskip:{k['skip_id']}")]]
     src_url = _source_url({
