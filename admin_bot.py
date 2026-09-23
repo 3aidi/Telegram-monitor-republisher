@@ -72,6 +72,49 @@ def set_user_client(client: TelegramClient) -> None:
     user_client_ref = client
 
 
+# Optional dedicated forward-only account (second session) and the destination
+# set it owns. The destinations health-check probe uses the SAME account the
+# pipeline would use, so its verdicts reflect real forwarding behavior.
+forward_client_ref: Optional[TelegramClient] = None
+forward_destinations: set = set()
+
+
+def set_forward_client(client: Optional[TelegramClient]) -> None:
+    """Set reference to the dedicated forward-only account (if any)."""
+    global forward_client_ref
+    forward_client_ref = client
+
+
+def set_forward_destinations(destinations: set) -> None:
+    """Set the destination set owned by the forward-only account."""
+    global forward_destinations
+    forward_destinations = set(destinations or ())
+
+
+def _probe_client_for(chat_id: str) -> Optional[TelegramClient]:
+    """Return the client that would forward to ``chat_id`` (mirrors main routing):
+    public (@) destinations and FORWARD_SESSION_DESTINATIONS go to the dedicated
+    forward account, everything else to the main user client."""
+    if forward_client_ref is not None and (
+        chat_id in forward_destinations or str(chat_id).startswith("@")
+    ):
+        return forward_client_ref
+    return user_client_ref
+
+
+def _classify_probe_failure(error_text: str) -> str:
+    """Map a forward failure to a probe verdict:
+    'banned' | 'nowrite' | 'throttled' | 'error'."""
+    low = (error_text or "").lower()
+    if "banned from sending" in low:
+        return "banned"
+    if "can't write" in low or "cant write" in low or "no write" in low:
+        return "nowrite"
+    if "wait of " in low and "seconds" in low:
+        return "throttled"
+    return "error"
+
+
 async def send_approval_prompt(
     bot_client: TelegramClient,
     admin_id: int,
@@ -822,7 +865,94 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
         buttons.append([Button.inline(label, data=f"dest:{d['id']}")])
     buttons.extend(_nav_row("dest", page, page_count))
     buttons.append([
+        Button.inline("🔍 Check Banned", data="dest:check"),
         Button.inline("➕ Add Destination", data="destadd"),
+    ])
+    return buttons
+
+
+async def _probe_destination_once(
+    client, to_peer, from_peer, post_id: int
+) -> None:
+    """Live-probe one destination: forward the latest published post, then delete
+    the probe copy immediately so no duplicate stays in the group."""
+    result = await client.forward_messages(
+        to_peer, messages=[post_id], from_peer=from_peer
+    )
+    sent = result[0] if isinstance(result, (list, tuple)) else result
+    sent_id = getattr(sent, "id", None)
+    if sent_id is not None:
+        try:
+            await client.delete_messages(to_peer, [sent_id])
+        except Exception:
+            pass
+
+
+async def _run_destination_health_check() -> Tuple[List[dict], int]:
+    """Live-probe every ACTIVE destination using the same account routing as the
+    pipeline. Returns (blocked, throttled): ``blocked`` lists destinations whose
+    account is banned / cannot write (with a ``verdict`` key), ``throttled`` is
+    the count of flood-wait deferrals. The probe never writes any DB row and
+    removes each successful probe copy."""
+    destinations = db.list_destinations(active_only=True)
+    body_client = user_client_ref
+    post_id = None
+    if body_client is not None and DEST_CHANNEL:
+        try:
+            msgs = await body_client.get_messages(DEST_CHANNEL, limit=1)
+            if msgs:
+                post_id = msgs[0].id
+        except Exception:
+            post_id = None
+    blocked: List[dict] = []
+    throttled = 0
+    if body_client is None or post_id is None:
+        return blocked, throttled
+    for d in destinations:
+        chat_id = d["chat_id"]
+        client = _probe_client_for(chat_id)
+        if client is None:
+            continue
+        try:
+            await _probe_destination_once(
+                client, db.to_peer_reference(chat_id), db.to_peer_reference(DEST_CHANNEL), post_id
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            verdict = _classify_probe_failure(str(exc))
+            if verdict in ("banned", "nowrite"):
+                blocked.append(dict(d, verdict=verdict))
+            elif verdict == "throttled":
+                throttled += 1
+        await asyncio.sleep(1.0)
+    return blocked, throttled
+
+
+def _blocked_report_text(blocked: List[dict], throttled: int, total: int) -> str:
+    lines = [f"🔍 **Health Check — {total} active destinations scanned**"]
+    if not blocked:
+        lines.append("\n✅ **No banned groups.** All active destinations forward OK.")
+    else:
+        lines.append(f"\n🚨 **Blocked ({len(blocked)}):**")
+        for d in blocked:
+            mark = "🚫" if d.get("verdict") == "banned" else "⛔"
+            lines.append(f"{mark} `{d['chat_id']}` — {_destination_label(d)}")
+        lines.append("\nTap **❌ Remove** to permanently delete it and stop forwarding there.")
+    if throttled:
+        lines.append(f"\nℹ️ {throttled} group(s) throttled by flood-limits (skipped).")
+    return "\n".join(lines)
+
+
+def _blocked_report_buttons(blocked: List[dict]) -> List[List[object]]:
+    buttons = []
+    for d in blocked:
+        buttons.append([
+            Button.inline(f"❌ Remove {_destination_label(d)}", data=f"destdel:{d['id']}")
+        ])
+    buttons.append([
+        Button.inline("🔄 Re-check", data="dest:check"),
+        Button.inline("⬅️ Back", data="menu:destinations"),
     ])
     return buttons
 
@@ -1613,6 +1743,38 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await _message_delete_send(
                 event, text, buttons=_destinations_buttons(destinations), parse_mode=None
             )
+            return
+
+        if data_str == "dest:check":
+            if user_client_ref is None or not DEST_CHANNEL:
+                await event.answer("User client / DEST_CHANNEL not configured.", alert=True)
+                return
+            await event.answer("🔍 Checking… this may take a minute.")
+            total = len(db.list_destinations(active_only=True)) if user_client_ref else 0
+            if total == 0:
+                await event.answer("No active destinations.", alert=True)
+                return
+            note = None
+            try:
+                note = await event.client.send_message(
+                    ADMIN_USER_ID,
+                    f"🔍 **Health Check running** — probing {total} active destination(s) "
+                    "one by one (real forward, probe copy removed afterwards).",
+                    parse_mode="markdown",
+                )
+            except Exception:
+                pass
+            blocked, throttled = await _run_destination_health_check()
+            text = _blocked_report_text(blocked, throttled, total)
+            buttons = _blocked_report_buttons(blocked)
+            try:
+                await event.client.edit_message(
+                    ADMIN_USER_ID, note.id, text, buttons=buttons, parse_mode="markdown"
+                )
+            except Exception:
+                await event.client.send_message(
+                    ADMIN_USER_ID, text, buttons=buttons, parse_mode="markdown"
+                )
             return
 
         if data_str.startswith("home:"):

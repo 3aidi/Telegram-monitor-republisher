@@ -718,10 +718,11 @@ async def _drain_forward_queue(
     two workers can never forward the same message, and an ambiguous failure is
     VERIFIED against the destination before it is retried or failed (F6).
 
-    When ``forward_client`` is provided, destinations listed in
-    FORWARD_SESSION_DESTINATIONS are sent by that dedicated account and every
-    other destination by the main ``client``. Forwarding is paced with
-    FORWARD_PACING_SECONDS between destinations so neither account bursts.
+    When ``forward_client`` is provided, public destinations (any @username) and
+    those listed in FORWARD_SESSION_DESTINATIONS are sent by that dedicated
+    account; private numeric-id destinations go through the main ``client``.
+    Forwarding is paced with FORWARD_PACING_SECONDS between destinations so
+    neither account bursts.
     """
     pending = await db.run_async(db.get_pending_forwardings, 10)
     for row in pending:
@@ -730,7 +731,10 @@ async def _drain_forward_queue(
         from_peer = db.to_peer_reference(row["published_chat_id"])
         expected_post_id = int(row["published_message_id"])
 
-        if forward_client is not None and row["destination_chat_id"] in FORWARD_SESSION_DESTINATIONS:
+        if forward_client is not None and (
+            row["destination_chat_id"] in FORWARD_SESSION_DESTINATIONS
+            or str(row["destination_chat_id"]).startswith("@")
+        ):
             sender = forward_client
             sender_tag = "fwd-session"
         else:
@@ -1919,8 +1923,8 @@ async def main() -> None:
     await user_client.start()
 
     # Optional dedicated forward-only account (DEST-ROUTE): a second Telethon
-    # session whose ONLY job is forwarding to FORWARD_SESSION_DESTINATIONS.
-    # It registers no event handlers, so it never monitors or publishes.
+    # session whose ONLY job is forwarding to public (@) destinations. It
+    # registers no event handlers, so it never monitors or publishes.
     forward_client: Optional[TelegramClient] = None
     if FORWARD_SESSION_NAME:
         try:
@@ -1930,11 +1934,19 @@ async def main() -> None:
                 await forward_client.get_dialogs(limit=50)
             except Exception:
                 logger.debug("Could not pre-warm forward-client dialogs cache.")
+            try:
+                _public_dests = [
+                    d for d in await db.run_async(db.list_destinations, True)
+                    if str(d.get("chat_id", "")).startswith("@")
+                ]
+                _fwd_dest_count = len(_public_dests)
+            except Exception:
+                _fwd_dest_count = len(FORWARD_SESSION_DESTINATIONS)
             logger.info(
-                "Forward-dedicated client connected (%s); forwarding %d destination(s) "
-                "via the second account.",
+                "Forward-dedicated client connected (%s); forwarding %d public "
+                "destination(s) via the second account.",
                 FORWARD_SESSION_NAME,
-                len(FORWARD_SESSION_DESTINATIONS),
+                _fwd_dest_count,
             )
         except Exception:
             logger.exception(
@@ -1948,6 +1960,13 @@ async def main() -> None:
             except Exception:
                 pass
             forward_client = None
+
+    if bot_client is not None:
+        try:
+            admin_bot.set_forward_client(forward_client)
+            admin_bot.set_forward_destinations(FORWARD_SESSION_DESTINATIONS)
+        except Exception:
+            logger.debug("Admin forward-client wiring skipped.", exc_info=True)
 
     try:
         await user_client.get_dialogs(limit=50)

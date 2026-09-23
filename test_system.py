@@ -2979,6 +2979,138 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(db.get_skip_digest_marker(db_path=TEST_DB), 3)
 
 
+class TestDestinationHealthCheck(unittest.TestCase):
+    """DEST health-check probe: reports ONLY blocked (banned / no-write)
+    destinations with a Remove button each, throttled groups are summarised
+    without detail, and every successful probe copy is deleted so the probe is
+    non-invasive (writes no DB rows)."""
+
+    def test_classify_probe_failure(self):
+        import admin_bot as admin_mod
+
+        cases = {
+            "You're banned from sending messages in supergroups/channels "
+            "(caused by ForwardMessagesRequest)": "banned",
+            "You can't write in this chat (caused by ForwardMessagesRequest)": "nowrite",
+            "A wait of 148 seconds is required before sending another message "
+            "in this chat (caused by ForwardMessagesRequest)": "throttled",
+            "Connection error: timeout": "error",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(admin_mod._classify_probe_failure(text), expected, text)
+
+    def test_blocked_report_only_lists_banned(self):
+        import admin_bot as admin_mod
+
+        blocked = [
+            {"id": 1, "chat_id": "@bad", "title": "Bad", "verdict": "banned"},
+            {"id": 2, "chat_id": "@stuck", "title": "Stuck", "verdict": "nowrite"},
+        ]
+        text = admin_mod._blocked_report_text(blocked, throttled=5, total=10)
+        self.assertIn("@bad", text)
+        self.assertIn("@stuck", text)
+        self.assertIn("🚨", text)
+        self.assertIn("5 group(s) throttled", text)
+        for detail in ("wait of", "connection", "✅"):
+            self.assertNotIn(detail, text)
+
+        none = admin_mod._blocked_report_text([], throttled=0, total=3)
+        self.assertIn("No banned groups", none)
+        self.assertNotIn("🚨", none)
+
+    def test_blocked_report_buttons_have_remove_per_row(self):
+        import admin_bot as admin_mod
+
+        blocked = [
+            {"id": 7, "chat_id": "@a", "title": "A", "verdict": "banned"},
+            {"id": 9, "chat_id": "@b", "title": "B", "verdict": "banned"},
+        ]
+        buttons = admin_mod._blocked_report_buttons(blocked)
+        data = [b.data.decode() for row in buttons for b in row]
+        self.assertEqual(data[:2], ["destdel:7", "destdel:9"])
+        self.assertIn("dest:check", data)
+        self.assertIn("menu:destinations", data)
+
+    def test_probe_clients_route_public_to_forward_account(self):
+        import admin_bot as admin_mod
+
+        class _C:
+            def __init__(self, name):
+                self.name = name
+
+        main_c, fwd_c = _C("main"), _C("fwd")
+        with mock.patch.object(admin_mod, "user_client_ref", main_c), \
+             mock.patch.object(admin_mod, "forward_client_ref", fwd_c), \
+             mock.patch.object(admin_mod, "forward_destinations", {"@explicit"}):
+            self.assertIs(admin_mod._probe_client_for("@pub"), fwd_c)
+            self.assertIs(admin_mod._probe_client_for("@explicit"), fwd_c)
+            self.assertIs(admin_mod._probe_client_for("-100priv"), main_c)
+
+    def test_probe_deletes_success_copy_and_writes_no_rows(self):
+        import asyncio
+
+        import admin_bot as admin_mod
+        from types import SimpleNamespace
+
+        class _Msg:
+            id = 500
+
+        class _Client:
+            def __init__(self):
+                self.forwards = []
+                self.deleted = []
+
+            async def get_messages(self, peer, limit=1):
+                return [_Msg()]
+
+            async def forward_messages(self, to_peer, messages=None, from_peer=None):
+                self.forwards.append(to_peer)
+                if str(to_peer) == "@banned":
+                    raise RuntimeError(
+                        "You're banned from sending messages in supergroups/channels"
+                    )
+                return [SimpleNamespace(id=9000 + len(self.forwards))]
+
+            async def delete_messages(self, peer, ids):
+                self.deleted.append((peer, list(ids)))
+
+        db_path = os.path.join(tempfile.gettempdir(), f"dest_probe_{os.getpid()}.db")
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        db.init_db(db_path)
+
+        main_client = _Client()
+        destinations = [
+            {"id": 1, "chat_id": "@ok", "title": "OK", "active": 1},
+            {"id": 2, "chat_id": "@banned", "title": "Banned", "active": 1},
+        ]
+        try:
+            with mock.patch.object(admin_mod, "user_client_ref", main_client), \
+                 mock.patch.object(admin_mod, "forward_client_ref", None), \
+                 mock.patch.object(admin_mod, "DEST_CHANNEL", "@destchan"), \
+                 mock.patch.object(admin_mod.db, "list_destinations", return_value=destinations), \
+                 mock.patch.object(admin_mod.asyncio, "sleep", new_callable=mock.AsyncMock):
+                blocked, throttled = asyncio.run(
+                    admin_mod._run_destination_health_check()
+                )
+        finally:
+            os.unlink(db_path)
+
+        self.assertEqual(throttled, 0)
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["chat_id"], "@banned")
+        self.assertEqual(blocked[0]["verdict"], "banned")
+        self.assertEqual(main_client.forwards, ["@ok", "@banned"])
+        self.assertEqual(
+            main_client.deleted,
+            [("@ok", [9001])],
+            "successful probe copy must be removed immediately",
+        )
+        self.assertEqual(
+            os.path.exists(db_path), False, "probe must never touch the DB"
+        )
+
+
 class TestDestinationsForwarding(unittest.TestCase):
     """DEST-1: destination forwards are queued ONLY on successful publication and
     drained independently of the main-channel publish path."""
@@ -3255,6 +3387,46 @@ class TestDestinationsForwarding(unittest.TestCase):
         self.assertEqual(by_dest["-100812"]["status"], "failed", "permanent error is terminal")
         self.assertEqual(by_dest["-100812"]["retry_count"], 0, "no retries for permanent errors")
         os.remove(db_path)
+
+    def test_public_dest_auto_routed_to_second_account(self):
+        """DEST-ROUTE: any public (@) destination goes to the forward-dedicated
+        account even when it is NOT listed in FORWARD_SESSION_DESTINATIONS;
+        private numeric-id destinations stay on the main account."""
+        db_path = self._fresh_db("dest_route_pub.db")
+        db.add_destination("@pub", "Public", db_path=db_path)
+        db.add_destination(-100112233, "Private", db_path=db_path)
+        db.queue_forwarding(1, "@chan", 700, db_path=db_path)
+
+        got_main, got_fwd = [], []
+
+        class _Acct:
+            def __init__(self, log):
+                self.log = log
+
+            async def forward_messages(self, to_entity, messages, from_peer):
+                self.log.append(to_entity)
+                return object()
+
+        import asyncio
+        import main as _main
+
+        main_acct, fwd_acct = _Acct(got_main), _Acct(got_fwd)
+        old_default = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = db_path
+        try:
+            with mock.patch("main.FORWARD_SESSION_DESTINATIONS", set()), \
+                 mock.patch("main.FORWARD_PACING_SECONDS", 0.0):
+                asyncio.run(_main._drain_forward_queue(main_acct, fwd_acct))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+        os.remove(db_path)
+
+        self.assertEqual(
+            got_fwd, ["@pub"], "public dest must overflow to the second account"
+        )
+        self.assertEqual(
+            got_main, [-100112233], "private dest stays on the main account"
+        )
 
     def test_queue_forwarding_only_called_from_publish_path(self):
         """DEST-1 guard: manual messages typed in the main channel can NEVER be
