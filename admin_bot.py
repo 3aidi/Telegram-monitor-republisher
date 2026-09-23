@@ -351,10 +351,9 @@ DESTINATIONS_ROUTE_RE = (
 def _home_keyboard() -> List[List[object]]:
     pause_label = "▶ All Start" if db.is_paused() else "⏸ All Stop"
     return [
-        [Button.text("📊 Status", resize=True), Button.text("⏳ Pending", resize=True)],
-        [Button.text("📋 Sources", resize=True), Button.text(DESTINATIONS_BTN, resize=True), Button.text(pause_label, resize=True)],
-        [Button.text("🚫 Skipped", resize=True), Button.text("✅ Published", resize=True), Button.text(_asleep_label(), resize=True)],
-        [Button.text("❓ Help", resize=True)],
+        [Button.text("⏳ Pending", resize=True), Button.text("📋 Sources", resize=True)],
+        [Button.text(DESTINATIONS_BTN, resize=True), Button.text(pause_label, resize=True)],
+        [Button.text("🚫 Skipped", resize=True), Button.text("✅ Published", resize=True)],
     ]
 
 
@@ -989,21 +988,16 @@ def _home_inline_keyboard() -> List[List[object]]:
     pause_label = "▶ All Start" if db.is_paused() else "⏸ All Stop"
     return [
         [
-            Button.inline("📊 Status", data="home:status"),
             Button.inline("⏳ Pending", data="home:pending"),
+            Button.inline("📋 Sources", data="menu:sources"),
         ],
         [
-            Button.inline("📋 Sources", data="menu:sources"),
             Button.inline(DESTINATIONS_BTN, data="menu:destinations"),
             Button.inline(pause_label, data="home:toggle"),
         ],
         [
             Button.inline("🚫 Skipped", data="home:skipped"),
             Button.inline("✅ Published", data="home:published"),
-        ],
-        [
-            Button.inline(_asleep_label(), data="home:asleep"),
-            Button.inline("❓ Help", data="home:help"),
         ],
     ]
 
