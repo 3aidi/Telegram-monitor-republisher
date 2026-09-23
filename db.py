@@ -147,6 +147,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 published_at TEXT,
                 fingerprint TEXT,
                 intent TEXT,
+                media_kind TEXT,
                 FOREIGN KEY(supplier_id) REFERENCES suppliers(id)
             );
             """
@@ -492,6 +493,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_forwardings_dest ON forwardings(destination_id);"
         )
         cursor.execute("PRAGMA user_version = 10")
+
+    if version < 11:
+        # MED-1: listings.media_kind stores the source media category
+        # (photo/video/document/gif...) so the publish path knows to re-attach
+        # the original media. Pure additive column.
+        table_info = cursor.execute("PRAGMA table_info(listings)").fetchall()
+        cols = {r["name"] for r in table_info}
+        if "media_kind" not in cols:
+            cursor.execute("ALTER TABLE listings ADD COLUMN media_kind TEXT")
+        cursor.execute("PRAGMA user_version = 11")
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1072,7 @@ def insert_listing(
     clean_text: str,
     published_message_id: Optional[int] = None,
     fingerprint: Optional[str] = None,
+    media_kind: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> int:
     """Insert a captured listing record (idempotent per supplier+message).
@@ -1077,8 +1089,8 @@ def insert_listing(
             INSERT INTO listings (
                 supplier_id, source_message_id, game_name, rank_tier,
                 status, raw_text, clean_text,
-                fingerprint, published_message_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fingerprint, published_message_id, media_kind, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(supplier_id, source_message_id) DO NOTHING
             """,
             (
@@ -1091,6 +1103,7 @@ def insert_listing(
                 clean_text,
                 fingerprint,
                 published_message_id,
+                media_kind,
                 now_iso,
                 now_iso,
             ),

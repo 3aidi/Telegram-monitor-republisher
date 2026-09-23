@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.tl.types import MessageMediaWebPage
 from telethon.errors import (
     ChannelInvalidError,
     ChannelPrivateError,
@@ -546,7 +547,10 @@ async def resolve_supplier_for_event(event) -> Optional[dict]:
 # Publish helpers (retry + flood-wait + throttle)
 # ---------------------------------------------------------------------------
 async def publish_to_destination(
-    client: TelegramClient, text: str, entities: list
+    client: TelegramClient,
+    text: str,
+    entities: list,
+    listing: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
     Send a message to DEST_CHANNEL with retry/backoff.
@@ -558,6 +562,9 @@ async def publish_to_destination(
       error surfaced) is verified against the destination channel FIRST: an
       exact-text match returns that message id instead of resending, so a lost
       response can never produce a duplicate publication (F3 / NET-AMB).
+    - Listing-driven media (MED-1): when ``listing`` carries media_kind, the
+      original source media is re-attached to the published post; if it cannot
+      be fetched the text is still published (fail-open, logged).
     - Raises PublishError after exhausting retries (verification confirming the
       message is genuinely absent from the destination).
     """
@@ -567,7 +574,9 @@ async def publish_to_destination(
     dest_peer = db.to_peer_reference(DEST_CHANNEL)
     for attempt in range(1, PUBLISH_MAX_RETRIES + 1):
         try:
-            sent = await client.send_message(dest_peer, text, formatting_entities=entities)
+            sent = await admin_bot.publish_with_media(
+                client, dest_peer, text, entities, listing
+            )
             _mark_publish()
             return sent.id
         except asyncio.CancelledError:
@@ -969,6 +978,35 @@ async def process_supplier_message(
         _release_processing_lock(supplier["id"], source_msg_id, entry)
 
 
+def _detect_media_kind(msg) -> Optional[str]:
+    """Classify the media on a Telegram message (photo/video/gif/document/...) or
+    None. Link-preview web pages are NOT treated as media. Unknown/generic media
+    payloads (incl. synthetic test objects) still rate as 'media' so they are
+    never silently dropped — routing to manual review is always safe."""
+    media = getattr(msg, "media", None)
+    if media is None:
+        return None
+    if isinstance(media, MessageMediaWebPage):
+        return None
+    if getattr(msg, "photo", None) is not None:
+        return "photo"
+    if getattr(msg, "video", None) is not None:
+        return "video"
+    if getattr(msg, "gif", None) is not None:
+        return "gif"
+    if getattr(msg, "sticker", None) is not None:
+        return "sticker"
+    doc = getattr(msg, "document", None)
+    if doc is not None:
+        mime = (getattr(doc, "mime_type", "") or "")
+        if mime.startswith("audio/"):
+            return "audio"
+        if mime.startswith("video/"):
+            return "video"
+        return "document"
+    return "media"
+
+
 async def _process_supplier_message(
     client: TelegramClient,
     bot_client: Optional[TelegramClient],
@@ -982,17 +1020,17 @@ async def _process_supplier_message(
     supplier_id = supplier["id"]
     source_msg_id = getattr(msg, "id", None)
     raw_text = msg.text or ""
-    has_media = bool(getattr(msg, "media", None))
+    media_kind = _detect_media_kind(msg)
 
-    # Media-only posts (screenshot/image ads with no caption) must never be
-    # silently dropped: they are routed to manual review so the admin can see
-    # them and type an Edit body if they are a real listing. Purely textless,
-    # medialess noise (e.g. random emoji messages) is still dropped.
+    # MED-1: ANY post carrying media is routed to manual review — never silently
+    # dropped, never auto-published — so the admin decides before it is sent with
+    # the original media attached. Purely textless, medialess noise (e.g. random
+    # emoji messages) is still dropped.
     if not source_msg_id:
         return
-    if not raw_text.strip() and not has_media:
+    if not raw_text.strip() and media_kind is None:
         return
-    media_only = has_media and not raw_text.strip()
+    media_only = media_kind is not None and not raw_text.strip()
     if media_only:
         raw_text = "[📷 Media-only post — no text caption]"
 
@@ -1034,27 +1072,28 @@ async def _process_supplier_message(
         raw_text=raw_text,
         clean_text=fallback_clean_text,
         fingerprint=fingerprint,
+        media_kind=media_kind,
     )
 
-    # Media-only posts have no analyzable text: skip fingerprint/AI entirely and
-    # route straight to admin review (never silently dropped, never auto-published).
-    if media_only:
+    # MED-1: posts carrying media skip fingerprint/AI/publish entirely and route
+    # straight to admin review (never silently dropped, never auto-published).
+    if media_kind:
         await db.run_async(db.update_listing_status, listing_id, "pending_review")
-        await db.run_async(
-            db.record_audit,
-            "media_only_review",
-            listing_id,
-            detail="Media-only post (no caption) routed for manual review",
-        )
+        audit_action = "media_only_review" if media_only else "media_manual_review"
+        detail = f"{media_kind} post routed for manual review"
+        if media_only:
+            detail = f"{media_kind} post (no caption) routed for manual review"
+        await db.run_async(db.record_audit, audit_action, listing_id, detail=detail)
         logger.info(
-            "Listing #%s is a media-only post (no caption); routed to pending_review.",
+            "Listing #%s carries %s media; routed to pending_review.",
             listing_id,
+            media_kind,
         )
         if bot_client and ADMIN_USER_ID:
             listing_dict = db.get_listing_by_id(listing_id)
             if listing_dict:
                 listing_dict["supplier_username"] = supplier.get("channel_username")
-                listing_dict["_review_reason"] = "media_only"
+                listing_dict["_review_reason"] = "media"
                 await admin_bot.send_review_notification(
                     bot_client, ADMIN_USER_ID, listing_dict
                 )
@@ -1631,7 +1670,9 @@ async def approved_listings_worker(
 
                 published_msg_id = None
                 try:
-                    published_msg_id = await publish_to_destination(client, out_text, entities)
+                    published_msg_id = await publish_to_destination(
+                        client, out_text, entities, listing=listing
+                    )
                 except PublishError as exc:
                     await db.run_async(db.mark_listing_failed, listing_id, str(exc))
                     logger.error(

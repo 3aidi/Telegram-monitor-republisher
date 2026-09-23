@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -89,6 +90,95 @@ def set_forward_destinations(destinations: set) -> None:
     """Set the destination set owned by the forward-only account."""
     global forward_destinations
     forward_destinations = set(destinations or ())
+
+
+async def _source_media(client: TelegramClient, listing: dict):
+    """Fetch the original media object referenced by a listing (if any).
+
+    MED-1: called at publish time with the monitoring client, which is a member
+    of every monitored source channel, so it can re-read the source message and
+    re-attach its media to the republished post. Returns None when the listing
+    has no media_kind, the source no longer resolves, or the fetch failed.
+    """
+    if not (listing or {}).get("media_kind"):
+        return None
+    ref = (
+        listing.get("supplier_channel_id")
+        or listing.get("supplier_username")
+        or ""
+    )
+    if isinstance(ref, int):
+        ref = str(ref)
+    ref = str(ref).strip()
+    mid = listing.get("source_message_id")
+    if not ref or not mid:
+        logger.debug(
+            "Listing #%s has media_kind but no resolvable source; media dropped.",
+            listing.get("id"),
+        )
+        return None
+    try:
+        fetched = await client.get_messages(db.to_peer_reference(ref), ids=[int(mid)])
+        src = fetched[0] if isinstance(fetched, (list, tuple)) else fetched
+        if src is None or getattr(src, "media", None) is None:
+            logger.debug(
+                "Source message %s for listing #%s no longer has media.",
+                mid,
+                listing.get("id"),
+            )
+            return None
+        return src.media
+    except Exception:
+        logger.debug(
+            "Could not fetch source media for listing #%s (ref=%r, mid=%r).",
+            listing.get("id"),
+            ref,
+            mid,
+        )
+        return None
+
+
+async def publish_with_media(
+    client: TelegramClient,
+    dest_peer,
+    text: str,
+    entities,
+    listing: Optional[Dict[str, Any]] = None,
+):
+    """Publish a formatted post, re-attaching the original source media when the
+    listing carries any (MED-1). Fails open: if the media cannot be fetched the
+    text is still posted (with a logged warning), so an approval never blocks
+    permanently on media retrieval."""
+    media = await _source_media(client, listing)
+    if media is not None:
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = await client.download_media(media, file=tmpdir)
+                if path:
+                    path_str = str(path)
+                    if os.path.isfile(path_str):
+                        try:
+                            return await client.send_file(
+                                dest_peer,
+                                path_str,
+                                caption=text,
+                                formatting_entities=entities,
+                            )
+                        finally:
+                            try:
+                                os.remove(path_str)
+                            except Exception:
+                                pass
+        except Exception:
+            logger.exception(
+                "Failed to attach media while publishing listing #%s; falling back to text.",
+                listing.get("id") if listing else None,
+            )
+    logger.warning(
+        "No media re-attached for listing #%s; publishing text-only.",
+        listing.get("id") if listing else None,
+    )
+    return await client.send_message(dest_peer, text, formatting_entities=entities)
 
 
 def _probe_client_for(chat_id: str) -> Optional[TelegramClient]:
@@ -200,6 +290,38 @@ async def send_review_notification(
         f"📬 Review needed : Listing #{listing_id} \n {src_part} "
         f"\n tap /pending to review."
     )
+
+    # MED-1: when the listing carries media, attach the original media as a
+    # preview via the monitoring USER client (the bot cannot read source
+    # channels), so the admin sees exactly what they are approving. Best-effort:
+    # any failure falls back to the text-only prompt below.
+    if listing.get("media_kind") and user_client_ref and user_client_ref.is_connected():
+        try:
+            media = await _source_media(user_client_ref, listing)
+            if media is not None:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    path = await user_client_ref.download_media(media, file=tmpdir)
+                    if path and os.path.isfile(str(path)):
+                        try:
+                            await user_client_ref.send_file(
+                                admin_id, str(path), caption=text, parse_mode=None
+                            )
+                            logger.info(
+                                "Sent review notification WITH media for listing #%s to admin %s",
+                                listing_id,
+                                admin_id,
+                            )
+                            return
+                        finally:
+                            try:
+                                os.remove(str(path))
+                            except Exception:
+                                pass
+        except Exception:
+            logger.exception(
+                "Failed to attach media preview for review notification listing #%s",
+                listing_id,
+            )
 
     try:
         await bot_client.send_message(admin_id, text, parse_mode=None)
@@ -2466,12 +2588,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await publish_guard.throttle()
                 published_msg_id = None
                 dest_peer = db.to_peer_reference(DEST_CHANNEL)
+                async def _approve_publish_send():
+                    return await publish_with_media(
+                        user_client_ref, dest_peer, republished_text, entities, listing
+                    )
                 try:
                     sent_msg = await publish_guard.run_with_floodwait_retry(
-                        lambda text=republished_text, ent=entities: user_client_ref.send_message(
-                            dest_peer, text,
-                            formatting_entities=ent
-                        ),
+                        _approve_publish_send,
                         f"approve send listing #{listing_id}",
                         max_total_sleep=APPROVE_FLOODWAIT_BUDGET_SECONDS,
                     )

@@ -3111,6 +3111,336 @@ class TestDestinationHealthCheck(unittest.TestCase):
         )
 
 
+class TestMediaReviewPublish(unittest.TestCase):
+    """MED-1: any source post carrying media routes to manual review (never
+    auto-published), media_kind is persisted on the listing, and republishing
+    re-attaches the original media (publish_with_media) with a text-only
+    fallback when the media cannot be fetched."""
+
+    ADMIN = 777002
+
+    def setUp(self):
+        import admin_bot
+        import main
+
+        self.admin_mod = admin_bot
+        self.main_mod = main
+        self._seq = next(_P5_SEQ)
+
+        self._db_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"test_media_{self._seq}.db",
+        )
+        db.init_db(self._db_path)
+
+        self._old_admin_bot_id = admin_bot.ADMIN_USER_ID
+        self._old_main_admin_id = main.ADMIN_USER_ID
+        self._old_main_dest = main.DEST_CHANNEL
+        self._old_admin_dest = admin_bot.DEST_CHANNEL
+        self._old_db_default = db.DEFAULT_DB_PATH
+        self._old_interval = publish_guard.PUBLISH_INTERVAL
+        self._old_lock = publish_guard._publish_lock
+        self._old_user_ref = admin_bot.user_client_ref
+
+        db.DEFAULT_DB_PATH = self._db_path
+        publish_guard.set_publish_interval(0.0)
+        publish_guard._publish_lock = asyncio.Lock()
+        admin_bot.ADMIN_USER_ID = self.ADMIN
+        main.ADMIN_USER_ID = self.ADMIN
+        main.DEST_CHANNEL = "-1007770002"
+        admin_bot.DEST_CHANNEL = "-1007770002"
+        admin_bot._wizard_state.clear()
+        admin_bot._drafts.clear()
+
+        self.user_client = _P5FakeUserClient()
+        admin_bot.set_user_client(self.user_client)
+        self.bot = _P5FakeBot()
+        admin_bot.setup_admin_handlers(self.bot)
+
+    def tearDown(self):
+        import admin_bot
+        import main
+
+        admin_bot.set_user_client(self._old_user_ref)
+        admin_bot._wizard_state.clear()
+        admin_bot._drafts.clear()
+        admin_bot.ADMIN_USER_ID = self._old_admin_bot_id
+        main.ADMIN_USER_ID = self._old_main_admin_id
+        main.DEST_CHANNEL = self._old_main_dest
+        admin_bot.DEST_CHANNEL = self._old_admin_dest
+        db.DEFAULT_DB_PATH = self._old_db_default
+        publish_guard.set_publish_interval(self._old_interval)
+        publish_guard._publish_lock = self._old_lock
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(self._db_path + suffix)
+            except OSError:
+                pass
+
+    def _add_supplier(self, label):
+        chan = next(_P5_SUPPLIER_CHANNELS)
+        db.add_supplier(
+            f"@media_{label}_{self._seq}", channel_id=-1008950000 + chan
+        )
+        return db.get_supplier_by_chat(username=f"@media_{label}_{self._seq}")
+
+    def _forward_rows(self, listing_id):
+        with db.db_session() as conn:
+            rows = conn.execute(
+                "SELECT * FROM forwardings WHERE listing_id = ?", (listing_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def _mk_msg(self, mid, text, kind, chat, media_obj=object()):
+        """Fake message exposing the attribute _detect_media_kind reads, for a
+        given media kind."""
+        if kind == "web":
+            from telethon.tl.types import MessageMediaWebPage
+            media_obj = MessageMediaWebPage.__new__(MessageMediaWebPage)
+            return _types.SimpleNamespace(id=mid, text=text, media=media_obj,
+                                          photo=None, video=None, gif=None,
+                                          document=None, sticker=None, chat=chat)
+        attrs = {"media": media_obj, "photo": None, "video": None, "gif": None,
+                 "document": None, "sticker": None, "chat": chat}
+        if kind:
+            attrs[kind] = media_obj
+        attrs["media"] = media_obj
+        return _types.SimpleNamespace(id=mid, text=text, **attrs)
+
+    def test_media_kind_classification(self):
+        from telethon.tl.types import MessageMediaWebPage as _WebPage
+
+        def _mk(media=None, photo=None, video=None, gif=None, document=None, sticker=None):
+            return _types.SimpleNamespace(
+                media=media, photo=photo, video=video, gif=gif,
+                document=document, sticker=sticker,
+            )
+
+        self.assertEqual(self.main_mod._detect_media_kind(None), None)
+        self.assertEqual(self.main_mod._detect_media_kind(_mk(media=None)), None)
+        self.assertEqual(
+            self.main_mod._detect_media_kind(_mk(media=_WebPage.__new__(_WebPage))),
+            None,
+            "link-preview web pages are not media",
+        )
+        self.assertEqual(self.main_mod._detect_media_kind(_mk(media=object(), photo=object())), "photo")
+        self.assertEqual(self.main_mod._detect_media_kind(_mk(media=object(), video=object())), "video")
+        self.assertEqual(self.main_mod._detect_media_kind(_mk(media=object(), gif=object())), "gif")
+        self.assertEqual(self.main_mod._detect_media_kind(_mk(media=object(), sticker=object())), "sticker")
+        doc_v = _types.SimpleNamespace(mime_type="video/mp4")
+        self.assertEqual(self.main_mod._detect_media_kind(_mk(media=object(), document=doc_v)), "video")
+        doc_a = _types.SimpleNamespace(mime_type="audio/ogg")
+        self.assertEqual(self.main_mod._detect_media_kind(_mk(media=object(), document=doc_a)), "audio")
+        self.assertEqual(
+            self.main_mod._detect_media_kind(_mk(media=object(), document=object())),
+            "document",
+        )
+        self.assertEqual(
+            self.main_mod._detect_media_kind(_mk(media=object())),
+            "media",
+            "unknown/generic media payloads still route to manual review",
+        )
+
+    def test_insert_listing_persists_media_kind(self):
+        sup = self._add_supplier("ins")
+        text = "WTS account"
+        listing_id = db.insert_listing(
+            sup["id"], 700000 + self._seq, game_name=None, rank_tier=None,
+            status="pending_review", raw_text=text, clean_text=text,
+            fingerprint="fp", media_kind="photo",
+        )
+        row = db.get_listing_by_id(listing_id)
+        self.assertEqual(row["media_kind"], "photo")
+
+    def test_media_with_caption_routes_to_manual_review(self):
+        """A media post that ALSO has a caption now goes to manual review too
+        (previously it auto-published) and never forwards."""
+
+        async def _run():
+            sup = self._add_supplier("cap")
+            chat = _types.SimpleNamespace(id=-1009990011)
+            msg = self._mk_msg(710000 + self._seq, "WTS Bybit verified account $100", "photo", chat)
+
+            await self.main_mod._process_supplier_message(self.user_client, self.bot, sup, msg)
+
+            listing = db.get_listing_by_source(sup["id"], 710000 + self._seq)
+            self.assertIsNotNone(listing)
+            self.assertEqual(listing["status"], "pending_review")
+            self.assertEqual(listing["media_kind"], "photo")
+            self.assertEqual(self.user_client.sent, [], "media posts are never auto-published")
+            self.assertEqual(self._forward_rows(listing["id"]), [], "media posts create no forwarding work")
+
+            with db.db_session() as conn:
+                audits = conn.execute(
+                    "SELECT COUNT(*) AS c FROM audit_log "
+                    "WHERE listing_id = ? AND action = 'media_manual_review'",
+                    (listing["id"],),
+                ).fetchone()
+            self.assertEqual(audits["c"], 1)
+
+            self.assertTrue(
+                any(f"Listing #{listing['id']}" in m["text"] for m in self.bot.sent),
+                "admin must receive a manual-review prompt",
+            )
+
+        asyncio.run(_run())
+
+    def test_media_only_still_routes_to_review_with_kind(self):
+        """The pre-existing media-only behavior is preserved and now also records
+        the media kind."""
+
+        async def _run():
+            sup = self._add_supplier("only")
+            chat = _types.SimpleNamespace(id=-1009990012)
+            msg = self._mk_msg(720000 + self._seq, "", "photo", chat)
+
+            await self.main_mod._process_supplier_message(self.user_client, self.bot, sup, msg)
+
+            listing = db.get_listing_by_source(sup["id"], 720000 + self._seq)
+            self.assertIsNotNone(listing)
+            self.assertEqual(listing["status"], "pending_review")
+            self.assertEqual(listing["media_kind"], "photo")
+            self.assertEqual(self.user_client.sent, [])
+            with db.db_session() as conn:
+                audits = conn.execute(
+                    "SELECT COUNT(*) AS c FROM audit_log "
+                    "WHERE listing_id = ? AND action = 'media_only_review'",
+                    (listing["id"],),
+                ).fetchone()
+            self.assertEqual(audits["c"], 1)
+
+        asyncio.run(_run())
+
+    def test_web_preview_not_routed_as_media(self):
+        """Link-preview media (MessageMediaWebPage) is not classified as media,
+        so a caption with a link preview still flows through the normal pipeline."""
+
+        from telethon.tl.types import MessageMediaWebPage as _WebPage
+
+        async def _run():
+            sup = self._add_supplier("web")
+            chat = _types.SimpleNamespace(id=-1009990013)
+            msg = self._mk_msg(
+                730000 + self._seq,
+                "WTS Bybit verified account $100",
+                "web",
+                chat,
+            )
+            self.assertEqual(
+                self.main_mod._detect_media_kind(msg), None,
+                "web-preview media must not count as real media",
+            )
+
+            await self.main_mod._process_supplier_message(self.user_client, self.bot, sup, msg)
+            listing = db.get_listing_by_source(sup["id"], 730000 + self._seq)
+            self.assertIsNotNone(listing)
+            self.assertIsNone(
+                listing["media_kind"],
+                "web-preview posts must flow the normal pipeline as text (no media flag)",
+            )
+            with db.db_session() as conn:
+                media_audits = conn.execute(
+                    "SELECT COUNT(*) AS c FROM audit_log "
+                    "WHERE listing_id = ? AND action IN ('media_manual_review', 'media_only_review')",
+                    (listing["id"],),
+                ).fetchone()
+            self.assertEqual(media_audits["c"], 0)
+
+        asyncio.run(_run())
+
+    def test_publish_with_media_attaches_source_media(self):
+        """publish_with_media re-fetches the source message and posts it with the
+        caption + entities via send_file."""
+
+        async def _run():
+            listing = {
+                "id": 1,
+                "media_kind": "photo",
+                "supplier_channel_id": -100123,
+                "supplier_username": "@src",
+                "source_message_id": 42,
+            }
+            src = _types.SimpleNamespace(media="the-media-object")
+            client = mock.Mock()
+            client.get_messages = mock.AsyncMock(return_value=[src])
+            fd, path = tempfile.mkstemp(suffix=".jpg")
+            os.close(fd)
+            try:
+                client.download_media = mock.AsyncMock(return_value=path)
+                client.send_file = mock.AsyncMock()
+                client.send_message = mock.AsyncMock()
+
+                await self.admin_mod.publish_with_media(
+                    client, "-100dest", "cap", [1, 2, 3], listing
+                )
+                client.get_messages.assert_awaited()
+                client.download_media.assert_awaited_with(
+                    "the-media-object", file=mock.ANY
+                )
+                client.send_file.assert_awaited_once()
+                args, kw = client.send_file.await_args
+                self.assertEqual(args[0], "-100dest")
+                self.assertEqual(args[1], path)
+                self.assertEqual(kw["caption"], "cap")
+                self.assertEqual(kw["formatting_entities"], [1, 2, 3])
+                client.send_message.assert_not_awaited()
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        asyncio.run(_run())
+
+    def test_publish_with_media_falls_back_to_text_when_unfetchable(self):
+        """When the source media cannot be fetched, publishing fails open to a
+        text-only post (approval must never block on media retrieval)."""
+
+        async def _run():
+            listing = {
+                "id": 2,
+                "media_kind": "photo",
+                "supplier_channel_id": -100123,
+                "supplier_username": "@src",
+                "source_message_id": 42,
+            }
+            client = mock.Mock()
+            client.get_messages = mock.AsyncMock(side_effect=Exception("boom"))
+            client.download_media = mock.AsyncMock()
+            client.send_file = mock.AsyncMock()
+            client.send_message = mock.AsyncMock()
+
+            await self.admin_mod.publish_with_media(
+                client, "-100dest", "cap", [1, 2, 3], listing
+            )
+            client.get_messages.assert_awaited_once()
+            client.send_message.assert_awaited_once()
+            args, kw = client.send_message.await_args
+            self.assertEqual(args[0], "-100dest")
+            self.assertEqual(kw["formatting_entities"], [1, 2, 3])
+            client.send_file.assert_not_awaited()
+            client.download_media.assert_not_awaited()
+
+        asyncio.run(_run())
+
+    def test_publish_with_media_text_only_without_listing(self):
+        """Listings without media_kind (or None listing) publish as plain text —
+        exactly the historical behavior."""
+
+        async def _run():
+            client = mock.Mock()
+            client.send_message = mock.AsyncMock()
+            client.send_file = mock.AsyncMock()
+            client.get_messages = mock.AsyncMock()
+
+            await self.admin_mod.publish_with_media(client, "-100dest", "plain", None, None)
+            client.send_message.assert_awaited_once()
+            client.send_file.assert_not_awaited()
+            client.get_messages.assert_not_awaited()
+
+        asyncio.run(_run())
+
+
 class TestDestinationsForwarding(unittest.TestCase):
     """DEST-1: destination forwards are queued ONLY on successful publication and
     drained independently of the main-channel publish path."""
