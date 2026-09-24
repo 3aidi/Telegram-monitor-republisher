@@ -14,7 +14,19 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script_stop: true
           script: |
             cd ${{ secrets.DEPLOY_PATH }}
-            git pull
+            git fetch origin main
+            git reset --hard origin/main
+
+            if [ -d venv ]; then
+              ./venv/bin/pip install -r requirements.txt
+            elif [ -d .venv ]; then
+              ./.venv/bin/pip install -r requirements.txt
+            else
+              python3 -m pip install -r requirements.txt
+            fi
+
             sudo systemctl restart tele-monitor
+            sudo systemctl status tele-monitor --no-pager
