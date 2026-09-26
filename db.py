@@ -493,25 +493,75 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         cursor.execute("PRAGMA user_version = 10")
 
-    if version < 11:
-        # QUARANTINE: the dedup hold. Purely additive — two nullable columns and
-        # one index, no existing row is read, rewritten, or deleted, so this is
-        # safe on a live database mid-burst.
-        #
-        # hold_until  : when the held-listings worker may evaluate this listing.
-        # duplicate_of: the listing id that won the dedup race, so every
-        #              suppressed twin is traceable to the copy that shipped.
-        table_info = cursor.execute("PRAGMA table_info(listings)").fetchall()
-        cols = {r["name"] for r in table_info}
-        if "hold_until" not in cols:
-            cursor.execute("ALTER TABLE listings ADD COLUMN hold_until TEXT")
-        if "duplicate_of" not in cols:
-            cursor.execute("ALTER TABLE listings ADD COLUMN duplicate_of INTEGER")
+    # QUARANTINE: the dedup hold. Purely additive — two nullable columns and
+    # one index, no existing row is read, rewritten, or deleted, so this is
+    # safe on a live database mid-burst.
+    #
+    # hold_until  : when the held-listings worker may evaluate this listing.
+    # duplicate_of: the listing id that won the dedup race, so every
+    #              suppressed twin is traceable to the copy that shipped.
+    #
+    # RECONCILE (MIGRATION-1): this block deliberately does NOT sit behind
+    # `if version < 11`. A production database was found carrying
+    # user_version=11 with neither column present, and the old version guard
+    # therefore skipped this migration forever: ingest failed on every insert
+    # and the held worker crash-looped, with no way for the code to recover.
+    # A version marker is not proof of schema state, so the actual columns are
+    # inspected on every startup and anything missing is added. The statements
+    # are idempotent, so this is a no-op once the schema is correct.
+    #
+    # user_version is advanced only AFTER the columns exist, so the marker can
+    # never lead the schema again.
+    _QUARANTINE_COLUMNS = (
+        ("hold_until", "TEXT"),
+        ("duplicate_of", "INTEGER"),
+    )
+    _table_info = cursor.execute("PRAGMA table_info(listings)").fetchall()
+    if _table_info:  # only reconcile when the table actually exists
+        _cols = {r["name"] for r in _table_info}
+        for _col, _decl in _QUARANTINE_COLUMNS:
+            if _col not in _cols:
+                cursor.execute(f"ALTER TABLE listings ADD COLUMN {_col} {_decl}")
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_listings_hold "
             "ON listings(status, hold_until)"
         )
+        # The idempotency index insert_listing()'s ON CONFLICT clause depends on.
+        # It used to be created only in the `version < 1` block, so a database
+        # that had diverged from its version marker would reject every insert
+        # with "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+        # constraint". Recreated unconditionally for the same reason as the
+        # columns above. IF NOT EXISTS makes it free when the index is present.
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_unique "
+            "ON listings(supplier_id, source_message_id)"
+        )
+    if version < 11:
         cursor.execute("PRAGMA user_version = 11")
+
+
+# Schema objects the running code depends on. Used by verify_schema() so a
+# diverged database is reported loudly at startup instead of failing later
+# inside a worker, where the traceback is easy to miss.
+_REQUIRED_LISTINGS_COLUMNS = ("hold_until", "duplicate_of")
+
+
+def verify_schema(db_path: str = None) -> list:
+    """Return the list of required columns missing from `listings` (empty = ok).
+
+    Read-only. Does not raise on a missing file or table so it is safe to call
+    straight after init_db() in the startup path.
+    """
+    path = db_path or DEFAULT_DB_PATH
+    try:
+        with db_session(path) as conn:
+            rows = conn.execute("PRAGMA table_info(listings)").fetchall()
+            if not rows:
+                return list(_REQUIRED_LISTINGS_COLUMNS)
+            cols = {r["name"] for r in rows}
+            return [c for c in _REQUIRED_LISTINGS_COLUMNS if c not in cols]
+    except sqlite3.Error:
+        return list(_REQUIRED_LISTINGS_COLUMNS)
 
 
 # ---------------------------------------------------------------------------

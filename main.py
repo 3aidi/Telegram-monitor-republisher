@@ -155,6 +155,63 @@ def _mark_worker_heartbeat(name: str) -> None:
     _WORKER_HEARTBEATS[name] = time.monotonic()
 
 
+# A heartbeat alone cannot prove a worker is healthy: every worker marks its
+# beat at the TOP of its loop, before doing any work, so a worker stuck in a
+# failing drain still reports a fresh beat. During the 5.5h quarantine outage
+# the health line cheerfully read "held_worker-0s" the entire time. Track how
+# long a worker has been failing instead, and alert on that.
+_WORKER_FAILURES: Dict[str, List[float]] = {}  # name -> [first_failure_at, count]
+STUCK_WORKER_ALERT_SECONDS = 120.0
+_STUCK_ALERTED: Dict[str, float] = {}
+
+
+def _note_worker_failure(name: str) -> None:
+    entry = _WORKER_FAILURES.get(name)
+    if entry is None:
+        _WORKER_FAILURES[name] = [time.monotonic(), 1.0]
+    else:
+        entry[1] += 1.0
+
+
+def _clear_worker_failure(name: str) -> None:
+    if _WORKER_FAILURES.pop(name, None) is not None:
+        _STUCK_ALERTED.pop(name, None)
+
+
+def _stuck_workers(threshold_seconds: float = STUCK_WORKER_ALERT_SECONDS):
+    """Workers failing continuously for longer than the threshold."""
+    now = time.monotonic()
+    stuck = []
+    for name, (first_at, count) in _WORKER_FAILURES.items():
+        elapsed = now - first_at
+        if elapsed >= threshold_seconds:
+            stuck.append((name, int(count), elapsed))
+    return sorted(stuck, key=lambda item: -item[2])
+
+
+async def _alert_stuck_workers(bot_client: Optional[TelegramClient]) -> None:
+    """Tell the admin once per worker per hour that a worker is wedged."""
+    if bot_client is None:
+        return
+    admin = os.environ.get("ADMIN_ID") or os.environ.get("ADMIN_CHAT_ID")
+    if not admin:
+        return
+    for name, count, elapsed in _stuck_workers():
+        last = _STUCK_ALERTED.get(name, 0.0)
+        if time.monotonic() - last < 3600.0:
+            continue
+        _STUCK_ALERTED[name] = time.monotonic()
+        try:
+            await bot_client.send_message(
+                int(admin),
+                f"WORKER STUCK: {name} has failed {count}x over "
+                f"{elapsed / 60:.0f} min without recovering. Listings are not "
+                f"being published. Check: journalctl -u tele-monitor | grep STUCK",
+            )
+        except Exception:
+            logger.exception("Could not send stuck-worker alert for %s", name)
+
+
 def _runtime_health_suffix() -> str:
     """Short summary of process-level liveness for the health log line."""
     upstream = max(
@@ -178,10 +235,18 @@ def _runtime_health_suffix() -> str:
         if _LAST_FAILURE
         else "no-failures"
     )
+    stuck = _stuck_workers()
+    stuck_txt = (
+        "STUCK:" + ",".join(f"{n}({c}x/{e / 60:.0f}m)" for n, c, e in stuck)
+        if stuck
+        else "no-stuck-workers"
+    )
     return (
         f" | uptime={(time.monotonic() - _RUNTIME_STARTED_AT) / 60:.0f}m | {alive} | "
-        f"{last_pub} | beats: {beats} | {failure}"
+        f"{last_pub} | beats: {beats} | {failure} | {stuck_txt}"
     )
+
+
 # Manual mode (`python main.py --manual`): start the admin bot + user client
 # ONLY. No listener, no auto-publish, no backfill, no supplier resolution —
 # the admin reviews and publishes everything. Approvals drain the queue worker.
@@ -1086,18 +1151,36 @@ async def _process_supplier_message(
     hold_until = (
         datetime.now(timezone.utc) + timedelta(seconds=QUARANTINE_SECONDS)
     ).isoformat()
-    listing_id = await db.run_async(
-        db.insert_listing,
-        supplier_id=supplier_id,
-        source_message_id=source_msg_id,
-        game_name=None,
-        rank_tier=None,
-        status="held",
-        raw_text=raw_text,
-        clean_text=fallback_clean_text,
-        fingerprint=fingerprint,
-        hold_until=hold_until,
-    )
+    try:
+        listing_id = await db.run_async(
+            db.insert_listing,
+            supplier_id=supplier_id,
+            source_message_id=source_msg_id,
+            game_name=None,
+            rank_tier=None,
+            status="held",
+            raw_text=raw_text,
+            clean_text=fallback_clean_text,
+            fingerprint=fingerprint,
+            hold_until=hold_until,
+        )
+    except Exception as exc:
+        # INGEST-1: a failed INSERT leaves no row, so the outer handler's
+        # get_listing_by_source() returns None and there is nothing to mark or
+        # audit. A 5-hour total outage was invisible for exactly that reason:
+        # 26 messages died here and left no trace beyond a traceback. Log the
+        # source id explicitly so every dropped message is greppable and can be
+        # recovered with a backfill sweep. Re-raised so the outer handler still
+        # releases the processing lock and records the failure counter.
+        logger.error(
+            "INGEST DROPPED MESSAGE: could not store source message %s from "
+            "supplier %s (status=held). It will NOT be published; recover it "
+            "with a backfill sweep. Cause: %s",
+            source_msg_id,
+            _supplier_label(supplier),
+            exc,
+        )
+        raise
     logger.info(
         "Listing #%s held for dedup quarantine until %s (%ds).",
         listing_id,
@@ -1668,6 +1751,41 @@ async def _recover_stale_publish_claims(client: TelegramClient) -> None:
             )
 
 
+# WORKER-1: rate limiting for a persistent held-queue read fault. The first
+# failure is reported with a full traceback; repeats inside the window are
+# suppressed entirely, and the next report is due at most every 5 minutes. This
+# keeps a hard fault visible without letting a 5-second poll bury the journal
+# (it produced 3843 tracebacks and hid the ingest failure during the outage).
+_HELD_QUERY_ERROR_WINDOW_SECONDS = 300.0
+_held_query_error_at: float = 0.0
+_held_query_error_count: int = 0
+
+
+def _note_held_query_error(exc: BaseException) -> None:
+    """Log a held-queue read failure, rate limited. Never raises."""
+    global _held_query_error_at, _held_query_error_count
+    now = time.monotonic()
+    _held_query_error_count += 1
+    if now - _held_query_error_at >= _HELD_QUERY_ERROR_WINDOW_SECONDS:
+        _held_query_error_at = now
+        logger.exception(
+            "HELD WORKER STUCK: could not read due held listings "
+            "(%d failure(s) so far). No listing can be quarantined, evaluated, or "
+            "published until this clears. Cause: %s",
+            _held_query_error_count,
+            exc,
+        )
+
+
+def _clear_held_query_error() -> None:
+    """Reset rate limiting after a successful read so the next fault is loud."""
+    global _held_query_error_at, _held_query_error_count
+    if _held_query_error_count:
+        logger.info("HELD WORKER RECOVERED after %d failure(s).", _held_query_error_count)
+    _held_query_error_at = 0.0
+    _held_query_error_count = 0
+
+
 async def drain_held_listings(
     client: TelegramClient,
     bot_client: Optional[TelegramClient],
@@ -1696,7 +1814,19 @@ async def drain_held_listings(
     Never raises for a single bad row: it is failed loudly and the batch
     continues, so one poisoned listing cannot stall the queue.
     """
-    due = await db.run_async(db.get_held_listings_due, limit)
+    try:
+        due = await db.run_async(db.get_held_listings_due, limit)
+    except Exception as exc:
+        # WORKER-1: this call used to sit outside any try, so a schema fault
+        # escaped to held_listings_worker's outer handler and logged a full
+        # traceback every 5 seconds — 3843 of them across a 5.5h outage, which
+        # buried the actual ingest failure in the journal. Report it once, then
+        # stay quiet until the fault changes, so a persistent problem is still
+        # obvious without flooding. Re-raised so the worker's failure counter
+        # still records it.
+        _note_held_query_error(exc)
+        raise
+    _clear_held_query_error()
     drained = 0
     # winner_id -> a representative loser, filled as twins lose their claim.
     burst_losers: dict = {}
@@ -1806,11 +1936,19 @@ async def held_listings_worker(
         _mark_worker_heartbeat("held_worker")
         try:
             await drain_held_listings(client, bot_client, 10)
+            _clear_worker_failure("held_worker")
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Error in held listings worker")
+        except Exception as exc:
+            # WORKER-1: the underlying read fault is already reported with full
+            # detail and rate limited by drain_held_listings(). Logging another
+            # traceback here on every 5s tick is what buried the journal during
+            # the outage, so keep this line short and let the rate limiter own
+            # the detail.
+            _note_worker_failure("held_worker")
+            logger.error("Held listings worker tick failed: %s", exc)
             _record_failure("held_listings_worker", "loop error")
+            await _alert_stuck_workers(bot_client)
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=5)
@@ -2009,6 +2147,18 @@ async def health_check_worker(stop_event: asyncio.Event) -> None:
                 stats["errors"],
                 _runtime_health_suffix(),
             )
+            # A worker that has been failing for minutes is the difference
+            # between "no listings arrived" and "listings arrived and were
+            # thrown away", which the counters above look identical for. Say so
+            # explicitly instead of leaving it buried in the suffix.
+            for _name, _count, _elapsed in _stuck_workers():
+                logger.error(
+                    "STUCK WORKER: %s has failed %dx over %.0f min. Listings are "
+                    "not being quarantined, evaluated, or published.",
+                    _name,
+                    _count,
+                    _elapsed / 60,
+                )
         except Exception:
             logger.exception("Error in health check worker")
 
@@ -2117,7 +2267,27 @@ async def rephrase_unpublished() -> None:
 # ---------------------------------------------------------------------------
 async def main() -> None:
     _validate_config()
-    db.init_db()
+    # MIGRATION-1: init_db is the only startup step that is not individually
+    # guarded. If it raises, the process dies before the listener connects and
+    # systemd reports an opaque restart loop. Fail loudly, but keep the explicit
+    # log so the cause is obvious in the journal.
+    try:
+        db.init_db()
+    except Exception:
+        logger.exception("Database initialization failed at startup")
+        raise
+    # The version marker can agree with the code while the schema disagrees with
+    # both, so verify the columns the workers depend on instead of trusting it.
+    missing = db.verify_schema()
+    if missing:
+        logger.error(
+            "LISTINGS SCHEMA OUT OF SYNC: missing column(s) %s after migration. "
+            "Ingest and the held-listings worker will fail. Check the init_db "
+            "traceback above.",
+            ", ".join(missing),
+        )
+    else:
+        logger.info("Listings schema verified (hold_until, duplicate_of present).")
     try:
         norm_result = db.normalize_supplier_channel_ids()
         if norm_result["normalized"] or norm_result["merged"]:

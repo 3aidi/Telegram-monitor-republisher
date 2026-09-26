@@ -1434,6 +1434,116 @@ class TestMonitorSystem(unittest.TestCase):
         if os.path.exists(mig_db):
             os.remove(mig_db)
 
+    def test_migration_self_heals_schema_diverged_from_user_version(self):
+        """MIGRATION-1: a DB claiming v11 without the v11 columns must self-heal.
+
+        Production outage: the live database carried PRAGMA user_version=11 with
+        neither `hold_until` nor `duplicate_of` present. Because the v11 block
+        sat behind `if version < 11`, init_db() skipped it forever — every
+        ingest INSERT failed and the held worker crash-looped every 5s, with no
+        code path able to recover. A version marker is not proof of schema
+        state, so init_db() must reconcile the real columns every time.
+        """
+        mig_db = "test_migration_diverged_v11.db"
+        if os.path.exists(mig_db):
+            os.remove(mig_db)
+        conn = sqlite3.connect(mig_db)
+        # The exact stored CREATE TABLE read off the live production database
+        # (fingerprint included, because v3-v9 ran long before the marker hit 11)
+        # minus hold_until/duplicate_of.
+        conn.execute(
+            """
+            CREATE TABLE listings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                supplier_id INTEGER,
+                source_message_id INTEGER NOT NULL,
+                game_name TEXT,
+                rank_tier TEXT,
+                original_price REAL,
+                our_price REAL,
+                status TEXT NOT NULL,
+                raw_text TEXT,
+                clean_text TEXT,
+                published_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                platform_name TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                reviewed_by INTEGER,
+                reviewed_at TEXT,
+                published_at TEXT,
+                fingerprint TEXT,
+                intent TEXT,
+                post_number INTEGER,
+                header_word TEXT,
+                media_kind TEXT
+            )
+            """
+        )
+        now = "2026-01-01T00:00:00+00:00"
+        conn.execute(
+            "INSERT INTO listings (supplier_id, source_message_id, status, raw_text, "
+            "clean_text, created_at, updated_at) VALUES (1, 1, 'published', 'x', 'x', ?, ?)",
+            (now, now),
+        )
+        # The exact broken state from production: marker says 11, schema says otherwise.
+        conn.execute("PRAGMA user_version = 11")
+        conn.commit()
+        conn.close()
+
+        db.init_db(mig_db)
+
+        conn = sqlite3.connect(mig_db)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
+            self.assertIn("hold_until", cols)
+            self.assertIn("duplicate_of", cols)
+            # The pre-existing row must survive: this is additive only.
+            rows = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+            self.assertEqual(rows, 1)
+        finally:
+            conn.close()
+
+        # The repaired schema is actually usable, which is the whole point.
+        self.assertEqual(db.verify_schema(mig_db), [])
+        listing_id = db.insert_listing(
+            supplier_id=1,
+            source_message_id=2,
+            game_name=None,
+            rank_tier=None,
+            status="held",
+            raw_text="dup",
+            clean_text="dup",
+            fingerprint="f" * 64,
+            hold_until="2026-01-01T00:05:00+00:00",
+            db_path=mig_db,
+        )
+        self.assertIsNotNone(listing_id)
+        due = db.get_held_listings_due(10, db_path=mig_db)
+        self.assertEqual([r["id"] for r in due], [listing_id])
+
+        if os.path.exists(mig_db):
+            os.remove(mig_db)
+
+    def test_verify_schema_reports_missing_columns(self):
+        """MIGRATION-1: verify_schema() must actually report a broken schema."""
+        bad_db = "test_verify_schema_bad.db"
+        if os.path.exists(bad_db):
+            os.remove(bad_db)
+        conn = sqlite3.connect(bad_db)
+        conn.execute(
+            "CREATE TABLE listings (id INTEGER PRIMARY KEY, status TEXT, fingerprint TEXT)"
+        )
+        conn.execute("PRAGMA user_version = 11")
+        conn.commit()
+        conn.close()
+        missing = db.verify_schema(bad_db)
+        self.assertIn("hold_until", missing)
+        self.assertIn("duplicate_of", missing)
+        if os.path.exists(bad_db):
+            os.remove(bad_db)
+
     def test_migration_v8_adds_display_name(self):
         """A pre-v8 DB gains suppliers.display_name; fresh DBs already have it."""
         mig_db = "test_migration_v8.db"
