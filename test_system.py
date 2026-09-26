@@ -3423,9 +3423,11 @@ class TestDestinationsForwarding(unittest.TestCase):
                 return object()
 
         bot = _FakeBot()
-        old_env = _os.environ.get("ADMIN_ID")
+        old_id = main_mod.ADMIN_USER_ID
         old_last = main_mod._LAST_DEST_HEALTH_REPORT
-        _os.environ["ADMIN_ID"] = "5883701139"
+        old_env = _os.environ.get("ADMIN_ID")
+        main_mod.ADMIN_USER_ID = 5883701139
+        _os.environ.pop("ADMIN_ID", None)
         main_mod._LAST_DEST_HEALTH_REPORT = 0.0
         try:
             with mock.patch.object(
@@ -3449,10 +3451,9 @@ class TestDestinationsForwarding(unittest.TestCase):
                 asyncio.run(main_mod._report_destination_health(bot))
                 self.assertEqual(len(bot.sent), 2, "reports again after a day")
         finally:
+            main_mod.ADMIN_USER_ID = old_id
             main_mod._LAST_DEST_HEALTH_REPORT = old_last
-            if old_env is None:
-                _os.environ.pop("ADMIN_ID", None)
-            else:
+            if old_env is not None:
                 _os.environ["ADMIN_ID"] = old_env
 
     def test_destination_health_dm_stays_quiet_when_all_healthy(self):
@@ -3489,9 +3490,11 @@ class TestDestinationsForwarding(unittest.TestCase):
                 return object()
 
         bot = _FakeBot()
-        old_env = _os.environ.get("ADMIN_ID")
+        old_id = main_mod.ADMIN_USER_ID
         old_last = main_mod._LAST_DEST_HEALTH_REPORT
-        _os.environ["ADMIN_ID"] = "5883701139"
+        old_env = _os.environ.get("ADMIN_ID")
+        main_mod.ADMIN_USER_ID = 5883701139
+        _os.environ.pop("ADMIN_ID", None)
         main_mod._LAST_DEST_HEALTH_REPORT = 0.0
         try:
             with mock.patch.object(
@@ -3504,11 +3507,47 @@ class TestDestinationsForwarding(unittest.TestCase):
                 "a quiet board must not consume the daily report slot",
             )
         finally:
+            main_mod.ADMIN_USER_ID = old_id
             main_mod._LAST_DEST_HEALTH_REPORT = old_last
-            if old_env is None:
-                _os.environ.pop("ADMIN_ID", None)
-            else:
+            if old_env is not None:
                 _os.environ["ADMIN_ID"] = old_env
+
+    def test_admin_chat_id_uses_the_variable_this_deployment_sets(self):
+        """An alert resolving to None is an alert that is silently dropped.
+
+        Production sets ADMIN_USER_ID; the alert paths read ADMIN_ID, so a
+        spelled-wrong variable name disables the safety net with no error.
+        """
+        import os as _os
+
+        import main as main_mod
+
+        old_id = main_mod.ADMIN_USER_ID
+        old_alias = _os.environ.pop("ADMIN_ID", None)
+        old_alias2 = _os.environ.pop("ADMIN_CHAT_ID", None)
+        try:
+            main_mod.ADMIN_USER_ID = 0
+            _os.environ.pop("ADMIN_ID", None)
+            _os.environ.pop("ADMIN_CHAT_ID", None)
+            self.assertIsNone(main_mod._admin_chat_id(), "no admin configured")
+
+            main_mod.ADMIN_USER_ID = 5883701139
+            self.assertEqual(main_mod._admin_chat_id(), 5883701139)
+
+            # Aliases still work for deployments that use them.
+            main_mod.ADMIN_USER_ID = 0
+            _os.environ["ADMIN_ID"] = "111"
+            self.assertEqual(main_mod._admin_chat_id(), 111)
+            _os.environ["ADMIN_ID"] = "not-a-number"
+            self.assertIsNone(main_mod._admin_chat_id(), "garbage must not raise")
+        finally:
+            main_mod.ADMIN_USER_ID = old_id
+            _os.environ.pop("ADMIN_ID", None)
+            _os.environ.pop("ADMIN_CHAT_ID", None)
+            if old_alias is not None:
+                _os.environ["ADMIN_ID"] = old_alias
+            if old_alias2 is not None:
+                _os.environ["ADMIN_CHAT_ID"] = old_alias2
 
     def test_destination_health_dm_without_bot_client_is_a_noop(self):
         """The monitor must still run when the admin bot is not configured."""

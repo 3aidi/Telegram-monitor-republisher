@@ -203,11 +203,29 @@ def _stuck_workers(threshold_seconds: float = STUCK_WORKER_ALERT_SECONDS):
     return sorted(stuck, key=lambda item: -item[2])
 
 
+def _admin_chat_id() -> Optional[int]:
+    """Resolve which chat to DM for operational alerts, or None.
+
+    ADMIN_USER_ID is what this codebase actually uses (approval prompts, the
+    online notice, dedupe warnings). Reading only ADMIN_ID/ADMIN_CHAT_ID meant
+    every alert here resolved to None on a normal deployment and was silently
+    dropped, so the aliases are kept as a fallback instead.
+    """
+    raw = ADMIN_USER_ID or os.environ.get("ADMIN_ID") or os.environ.get(
+        "ADMIN_CHAT_ID"
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value or None
+
+
 async def _alert_stuck_workers(bot_client: Optional[TelegramClient]) -> None:
     """Tell the admin once per worker per hour that a worker is wedged."""
     if bot_client is None:
         return
-    admin = os.environ.get("ADMIN_ID") or os.environ.get("ADMIN_CHAT_ID")
+    admin = _admin_chat_id()
     if not admin:
         return
     for name, count, elapsed in _stuck_workers():
@@ -297,7 +315,7 @@ async def _report_destination_health(bot_client: Optional[TelegramClient]) -> No
     """DM the admin a destination-health summary at most once per day."""
     if bot_client is None:
         return
-    admin = os.environ.get("ADMIN_ID") or os.environ.get("ADMIN_CHAT_ID")
+    admin = _admin_chat_id()
     if not admin:
         return
     global _LAST_DEST_HEALTH_REPORT
@@ -317,7 +335,7 @@ async def _report_destination_health(bot_client: Optional[TelegramClient]) -> No
         return
     _LAST_DEST_HEALTH_REPORT = now
     try:
-        await bot_client.send_message(int(admin), text, parse_mode="html")
+        await bot_client.send_message(admin, text, parse_mode="html")
     except Exception:
         logger.exception("Could not send destination health report")
 
