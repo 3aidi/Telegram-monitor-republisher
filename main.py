@@ -21,6 +21,7 @@ from telethon.errors import (
     ChatAdminRequiredError,
     ChatIdInvalidError,
     ChatWriteForbiddenError,
+    FloodWaitError,
     PeerIdInvalidError,
     UserBannedInChannelError,
     UserKickedError,
@@ -96,11 +97,18 @@ REPHRASE_SWEEP_MIN_AGE_SECONDS = int(
 FORWARD_FLOODWAIT_BUDGET_SECONDS = float(
     os.environ.get("FORWARD_FLOODWAIT_BUDGET_SECONDS", "60") or 60
 )
+# DEST-2: ceiling on a throttle deferral. A FloodWait can ask for hours; the row
+# simply waits for the account to cool down, and is never charged a retry for it.
+FORWARD_FLOODWAIT_MAX_DEFERRAL_SECONDS = int(
+    os.environ.get("FORWARD_FLOODWAIT_MAX_DEFERRAL_SECONDS", "3600") or 3600
+)
 FORWARD_WORKER_INTERVAL = float(os.environ.get("FORWARD_WORKER_INTERVAL", "3") or 3)
 # Pause between each destination forward within one drain pass. Keeps a single
 # listing from burst-forwarding to every destination back-to-back, which is what
 # triggers Telegram flood-limits / spam restrictions on the acting account.
-FORWARD_PACING_SECONDS = float(os.environ.get("FORWARD_PACING_SECONDS", "2.0") or 2.0)
+# 2.0s produced ~270 FloodWaits/hour with ~23 destinations; 5.0s is the measured
+# safe default and pushing it higher only delays delivery.
+FORWARD_PACING_SECONDS = float(os.environ.get("FORWARD_PACING_SECONDS", "5.0") or 5.0)
 # Optional dedicated forward-only account (DEST-ROUTE): a second Telethon session
 # that forwards ONLY to the destinations listed in FORWARD_SESSION_DESTINATIONS.
 # The main account keeps monitoring + publishing and forwards to everything else.
@@ -164,6 +172,12 @@ _WORKER_FAILURES: Dict[str, List[float]] = {}  # name -> [first_failure_at, coun
 STUCK_WORKER_ALERT_SECONDS = 120.0
 _STUCK_ALERTED: Dict[str, float] = {}
 
+# DEST-HEALTH: how often the admin gets a destination-health DM. The first
+# report goes out as soon as something is actually wrong; after that it is
+# throttled to once a day so a permanently banned group cannot spam the admin.
+DEST_HEALTH_REPORT_SECONDS = 24 * 3600.0
+_LAST_DEST_HEALTH_REPORT: float = 0.0
+
 
 def _note_worker_failure(name: str) -> None:
     entry = _WORKER_FAILURES.get(name)
@@ -210,6 +224,102 @@ async def _alert_stuck_workers(bot_client: Optional[TelegramClient]) -> None:
             )
         except Exception:
             logger.exception("Could not send stuck-worker alert for %s", name)
+
+
+def _format_destination_health_report(rows: list) -> str:
+    """Render a DM listing every destination that is not fully healthy.
+
+    DEST-HEALTH: the admin had no way to see that several destination groups
+    were banned until the log filled with forward warnings. This names each
+    unhealthy destination with its @username/chat id, the failure rate, and the
+    last error, so the fix (remove it, or re-join the account) is obvious.
+
+    Throttled destinations are reported separately on purpose: a FloodWait is
+    the forwarding ACCOUNT being rate-limited, not a bad group, and telling the
+    admin to delete a working destination would lose real reach.
+    """
+    dead = [r for r in rows if r.get("is_dead")]
+    flapping = [r for r in rows if r.get("is_flapping")]
+    throttled = [r for r in rows if r.get("is_throttled")]
+
+    if not dead and not flapping and not throttled:
+        return ""
+
+    lines = [
+        "📊 <b>Destination health</b>",
+        "",
+    ]
+    if dead:
+        lines.append(f"<b>❌ Not delivering at all ({len(dead)})</b>")
+        for r in sorted(dead, key=lambda x: -x["failures"]):
+            handle = r["chat_id"] if str(r["chat_id"]).startswith("@") else f"id {r['chat_id']}"
+            last = (r["last_error"] or "unknown error").split(" (caused by")[0][:90]
+            lines.append(
+                f"• <code>{handle}</code>\n"
+                f"   {r['failures']}/{r['attempts']} failed · {r['fail_pct']:.0f}%\n"
+                f"   {last}"
+            )
+        lines.append("")
+    if flapping:
+        lines.append(f"<b>⚠️ Intermittent ({len(flapping)})</b>")
+        for r in sorted(flapping, key=lambda x: -x["consecutive_failures"]):
+            handle = r["chat_id"] if str(r["chat_id"]).startswith("@") else f"id {r['chat_id']}"
+            lines.append(
+                f"• <code>{handle}</code> — {r['fail_pct']:.0f}% fail, "
+                f"{r['consecutive_failures']} in a row (still succeeds sometimes)"
+            )
+        lines.append("")
+    if throttled:
+        lines.append(f"<b>⏳ Waiting on Telegram rate limit ({len(throttled)})</b>")
+        for r in sorted(throttled, key=lambda x: -x.get("deferred", 0)):
+            handle = r["chat_id"] if str(r["chat_id"]).startswith("@") else f"id {r['chat_id']}"
+            lines.append(
+                f"• <code>{handle}</code> — {r.get('deferred', 0)} queued, "
+                f"waiting for the rate limit to clear"
+            )
+        lines.append("")
+
+    if dead or flapping:
+        lines.append(
+            "Banned or private groups can never be delivered to. Disable them in "
+            "Destinations so they stop being retried."
+        )
+    if throttled:
+        lines.append(
+            "Rate-limit waits are the forwarding account's fault, not the "
+            "group's — these will deliver on their own. Raise "
+            "FORWARD_PACING_SECONDS to queue fewer at once."
+        )
+    return "\n".join(lines)
+
+
+async def _report_destination_health(bot_client: Optional[TelegramClient]) -> None:
+    """DM the admin a destination-health summary at most once per day."""
+    if bot_client is None:
+        return
+    admin = os.environ.get("ADMIN_ID") or os.environ.get("ADMIN_CHAT_ID")
+    if not admin:
+        return
+    global _LAST_DEST_HEALTH_REPORT
+    now = time.monotonic()
+    if _LAST_DEST_HEALTH_REPORT and now - _LAST_DEST_HEALTH_REPORT < DEST_HEALTH_REPORT_SECONDS:
+        return
+    # Only mark the report as sent once there is something to say, so the first
+    # genuinely unhealthy destination is reported immediately instead of being
+    # swallowed by a quiet start-up window.
+    try:
+        rows = await db.run_async(db.get_destination_health)
+    except Exception:
+        logger.exception("Could not read destination health")
+        return
+    text = _format_destination_health_report(rows)
+    if not text:
+        return
+    _LAST_DEST_HEALTH_REPORT = now
+    try:
+        await bot_client.send_message(int(admin), text, parse_mode="html")
+    except Exception:
+        logger.exception("Could not send destination health report")
 
 
 def _runtime_health_suffix() -> str:
@@ -919,6 +1029,30 @@ async def _drain_forward_queue(
             )
         except asyncio.CancelledError:
             raise
+        except FloodWaitError as fwe:
+            # DEST-2: the forwarding ACCOUNT is throttled, not this destination.
+            # run_with_floodwait_retry already slept up to
+            # FORWARD_FLOODWAIT_BUDGET_SECONDS; anything past that is a long
+            # throttle. Defer the row WITHOUT spending a retry, because charging
+            # throttling against FORWARD_MAX_RETRIES is what burned all 8
+            # attempts and marked healthy destinations dead, and every later post
+            # then re-queued the same doomed row.
+            wait = max(int(getattr(fwe, "seconds", 60) or 60), 60)
+            capped = min(wait, FORWARD_FLOODWAIT_MAX_DEFERRAL_SECONDS)
+            await db.run_async(
+                db.defer_forwarding,
+                fwd_id,
+                f"throttled: FloodWait {wait}s",
+                capped,
+            )
+            logger.warning(
+                "Forward to destination %s deferred %ss: forwarding account "
+                "throttled by Telegram (retry budget untouched). [%s]",
+                row["destination_chat_id"],
+                capped,
+                sender_tag,
+            )
+            continue
         except Exception as exc:
             raise_as_error = exc
             # Ambiguous failure: the forward may have landed before the error
@@ -2130,8 +2264,16 @@ async def approved_listings_worker(
             pass
 
 
-async def health_check_worker(stop_event: asyncio.Event) -> None:
-    """Periodic health check logging every hour."""
+async def health_check_worker(
+    stop_event: asyncio.Event, bot_client: Optional[TelegramClient] = None
+) -> None:
+    """Periodic health check logging every hour.
+
+    Also carries the once-a-day destination-health DM (DEST-HEALTH), which
+    rides along here rather than getting its own task: this loop already owns
+    "tell the admin when something is wrong", and the report is throttled
+    independently so it fires at most once a day.
+    """
     while not stop_event.is_set():
         try:
             stats = await db.run_async(db.get_today_stats)
@@ -2159,6 +2301,22 @@ async def health_check_worker(stop_event: asyncio.Event) -> None:
                     _count,
                     _elapsed / 60,
                 )
+            # Log the health picture every hour, but only DM the admin when
+            # something is actually broken (throttled to once a day).
+            try:
+                _health_rows = await db.run_async(db.get_destination_health)
+                _unhealthy = [r for r in _health_rows if r.get("is_dead") or r.get("is_flapping")]
+                if _unhealthy:
+                    logger.warning(
+                        "Destination health: %d unhealthy of %d configured (%d not "
+                        "delivering at all).",
+                        len(_unhealthy),
+                        len(_health_rows),
+                        len([r for r in _health_rows if r.get("is_dead")]),
+                    )
+            except Exception:
+                logger.exception("Could not read destination health for logging")
+            await _report_destination_health(bot_client)
         except Exception:
             logger.exception("Error in health check worker")
 
@@ -2504,7 +2662,7 @@ async def main() -> None:
     rephrase_task = None
     backfill_task = None
     if not MANUAL_MODE:
-        health_task = asyncio.create_task(health_check_worker(stop_event))
+        health_task = asyncio.create_task(health_check_worker(stop_event, bot_client))
         resolve_task = asyncio.create_task(
             supplier_resolution_worker(user_client, bot_client, stop_event)
         )

@@ -863,7 +863,31 @@ def _sources_buttons(suppliers: List[dict], page: int = 0) -> List[List[object]]
 
 # ---- Destinations submenu (DEST-1) ----------------------------------------
 def _destination_icon(d: dict) -> str:
-    return "🟢" if d.get("active") else "🔴"
+    if not d.get("active"):
+        return "🔴"
+    # DEST-HEALTH: the active/not-active dot is not enough on its own. A group
+    # the account was banned from still shows as "active" and still swallows a
+    # doomed forward on every post, so surface delivery health next to it.
+    if d.get("is_dead"):
+        return "❌"
+    if d.get("is_flapping"):
+        return "⚠️"
+    if d.get("is_throttled"):
+        return "⏳"
+    return "🟢"
+
+
+def _destination_health_note(d: dict) -> str:
+    """Short delivery-health suffix for a destination row, or '' if healthy."""
+    if not d.get("active"):
+        return " (disabled)"
+    if d.get("is_dead"):
+        return f" — not delivering ({d.get('failures', 0)}/{d.get('attempts', 0)} failed)"
+    if d.get("is_flapping"):
+        return f" — {d.get('fail_pct', 0):.0f}% failed"
+    if d.get("is_throttled"):
+        return f" — rate limited, {d.get('deferred', 0)} queued"
+    return ""
 
 
 def _destination_label(d: dict) -> str:
@@ -897,7 +921,7 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
     buttons = []
     for d in destinations[start:end]:
         icon = _destination_icon(d)
-        label = f"{icon} {_destination_label(d)}"
+        label = f"{icon} {_destination_label(d)}{_destination_health_note(d)}"
         buttons.append([Button.inline(label, data=f"dest:{d['id']}")])
     buttons.extend(_nav_row("dest", page, page_count))
     buttons.append([
@@ -912,11 +936,43 @@ async def _edit_destination_menu(event, d: dict) -> None:
     icon = _destination_icon(d)
     label = _destination_label(d)
     toggle_label = "⏸ Pause " if d["active"] else "▶ Resume"
+    # DEST-HEALTH: show WHY a destination is not receiving, and the last error,
+    # so a banned group is diagnosable without reading the journal.
+    health_lines = ""
+    attempts = int(d.get("attempts") or 0)
+    if d.get("is_throttled"):
+        # Rate limiting is the account's problem, not this group's. Say so, so
+        # the admin does not disable a destination that will deliver fine.
+        health_lines = (
+            "\nDelivery: ⏳ waiting on Telegram rate limit"
+            f"\nQueued and retrying automatically: {d.get('deferred', 0)}"
+            "\nThis is not a problem with this destination."
+        )
+    elif attempts:
+        if d.get("is_dead"):
+            verdict = "❌ Not delivering at all — likely banned or private"
+        elif d.get("is_flapping"):
+            verdict = f"⚠️ Intermittent — {d.get('fail_pct', 0):.0f}% of recent forwards failed"
+        elif d.get("fail_pct", 0) >= 25:
+            verdict = f"⚠️ {d.get('fail_pct', 0):.0f}% of recent forwards failed"
+        else:
+            verdict = "✅ Delivering normally"
+        health_lines = (
+            f"\nDelivery: {verdict}\n"
+            f"Recent: {d.get('successes', 0)}/{attempts} forwarded"
+        )
+        if d.get("last_success_at"):
+            health_lines += f"\nLast success: `{d['last_success_at'][:16].replace('T', ' ')}`"
+    else:
+        health_lines = "\nDelivery: no forwards attempted yet"
+    if d.get("last_error"):
+        reason = str(d["last_error"]).split(" (caused by")[0][:120]
+        health_lines += f"\nLast error: `{reason}`"
     await _message_delete_send(
         event,
         f"{icon} **{label}**\n"
         f"Status: `{'Active' if d['active'] else 'Disabled'}`\n"
-        f"ID: `{d['chat_id']}`\n\n"
+        f"ID: `{d['chat_id']}`{health_lines}\n\n"
         f"What would you like to do?",
         buttons=[
             [Button.inline(toggle_label, data=f"desttoggle:{did}")],
@@ -1444,7 +1500,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
     async def handle_destinations(event):
         if not await check_admin(event):
             return
-        destinations = db.list_destinations(active_only=False)
+        destinations = db.get_destination_health()
         await event.reply(
             _destinations_menu_text(destinations),
             buttons=_destinations_buttons(destinations),
@@ -1687,7 +1743,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         if data_str == "menu:destinations":
-            destinations = db.list_destinations(active_only=False)
+            destinations = db.get_destination_health()
             text = _destinations_menu_text(destinations)
             await _message_delete_send(
                 event, text, buttons=_destinations_buttons(destinations), parse_mode=None
@@ -1811,7 +1867,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         destpage_match = re.match(r"^dest:page:(-?\d+)$", data_str)
         if destpage_match:
             raw_page = int(destpage_match.group(1))
-            destinations = db.list_destinations(active_only=False)
+            destinations = db.get_destination_health()
             start, _, _, _, _ = _page_window(len(destinations), raw_page)
             page = start // _PAGE_SIZE
             await _message_delete_send(
@@ -1953,7 +2009,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         dest_match = re.match(r"^dest:(\d+)$", data_str)
         if dest_match:
             did = int(dest_match.group(1))
-            d = db.get_destination_by_id(did)
+            d = db.get_destination_by_id(did, with_health=True)
             if not d:
                 await event.answer("Destination not found.", alert=True)
                 return
@@ -1975,7 +2031,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 actor_id=ADMIN_USER_ID,
                 detail=str(did),
             )
-            refreshed = db.get_destination_by_id(did)
+            refreshed = db.get_destination_by_id(did, with_health=True)
             if refreshed:
                 await _edit_destination_menu(event, refreshed)
             return
@@ -2028,7 +2084,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 )
             except Exception:
                 pass
-            destinations = db.list_destinations(active_only=False)
+            destinations = db.get_destination_health()
             await event.client.send_message(
                 ADMIN_USER_ID,
                 _destinations_menu_text(destinations),

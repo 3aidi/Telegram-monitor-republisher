@@ -2565,15 +2565,116 @@ def list_destinations(
         return [dict(row) for row in rows]
 
 
-def get_destination_by_id(
-    destination_id: int, db_path: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
-    """Return one destination row by its primary key."""
+# DEST-HEALTH: how many recent attempts define a destination's health. Small
+# enough that a group banned yesterday is flagged quickly, large enough that one
+# bad post does not condemn a healthy destination.
+DESTINATION_HEALTH_WINDOW = 50
+
+
+def get_destination_health(
+    window: int = DESTINATION_HEALTH_WINDOW, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Per-destination forward success/failure health over the recent window.
+
+    Counts only the most recent ``window`` attempts per destination, so a
+    destination that recovered is reported healthy again. Includes destinations
+    that have never been forwarded to (all counters zero) so the caller can
+    show every configured destination.
+
+    Only CONCLUDED attempts are scored. ``pending``/``forwarding`` rows are
+    unresolved work, not failures: a destination throttled by Telegram still has
+    50 pending rows, and counting those as failures reported healthy groups as
+    banned. They are surfaced separately as ``deferred``/``is_throttled``.
+
+    ``consecutive_failures`` counts back from the newest attempt while rows are
+    still failing, which is what separates "one flaky post" from "permanently
+    banned". A destination with successes in the window but recent consecutive
+    failures is flapping, not dead.
+    """
     with db_session(db_path) as conn:
-        row = conn.execute(
-            "SELECT * FROM destinations WHERE id = ?", (destination_id,)
-        ).fetchone()
-        return dict(row) if row else None
+        rows = conn.execute(
+            "SELECT * FROM destinations ORDER BY id ASC"
+        ).fetchall()
+        destinations = [dict(r) for r in rows]
+
+        for dest in destinations:
+            attempts = conn.execute(
+                """
+                SELECT status, error, updated_at
+                FROM forwardings
+                WHERE destination_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (dest["id"], window),
+            ).fetchall()
+
+            successes = sum(1 for a in attempts if a["status"] == "forwarded")
+            failures = sum(1 for a in attempts if a["status"] == "failed")
+            deferred = sum(
+                1 for a in attempts if a["status"] in ("pending", "forwarding")
+            )
+            total = successes + failures
+
+            consecutive = 0
+            for a in attempts:  # newest first
+                if a["status"] == "forwarded":
+                    break
+                if a["status"] == "failed":
+                    consecutive += 1
+                # Unresolved rows are neither a success nor a failure, so they
+                # neither extend nor break a run of real failures.
+
+            last_success = next(
+                (a["updated_at"] for a in attempts if a["status"] == "forwarded"),
+                None,
+            )
+            last_error = next(
+                (a["error"] for a in attempts if a["status"] == "failed" and a["error"]),
+                None,
+            )
+            newest = attempts[0] if attempts else None
+            is_throttled = bool(
+                newest
+                and newest["status"] == "pending"
+                and str(newest["error"] or "").startswith("throttled")
+            )
+
+            dest["attempts"] = total
+            dest["successes"] = successes
+            dest["failures"] = failures
+            dest["deferred"] = deferred
+            dest["fail_pct"] = round(100.0 * failures / total, 1) if total else 0.0
+            dest["consecutive_failures"] = consecutive
+            dest["last_success_at"] = last_success
+            dest["last_error"] = last_error
+            dest["is_throttled"] = is_throttled
+
+            # A destination is only "dead" once it has a real sample and has
+            # stopped succeeding entirely. One failure is never enough.
+            dest["is_dead"] = total >= 5 and successes == 0
+            dest["is_flapping"] = total >= 5 and successes > 0 and consecutive >= 3
+        return destinations
+
+
+def get_destination_by_id(
+    destination_id: int, db_path: Optional[str] = None, with_health: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Return one destination row by its primary key.
+
+    ``with_health`` merges in the same delivery-health fields as
+    get_destination_health(), for admin screens that render a single row.
+    """
+    if not with_health:
+        with db_session(db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM destinations WHERE id = ?", (destination_id,)
+            ).fetchone()
+            return dict(row) if row else None
+    for row in get_destination_health(db_path=db_path):
+        if row["id"] == destination_id:
+            return row
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2724,6 +2825,34 @@ def mark_forward_failed(
             WHERE id = ?
             """,
             (error[:500], now_iso, forwarding_id),
+        )
+
+
+def defer_forwarding(
+    forwarding_id: int,
+    error: str,
+    delay_seconds: int,
+    db_path: Optional[str] = None,
+) -> None:
+    """Push a row's next attempt out WITHOUT consuming its retry budget.
+
+    DEST-2: a FloodWait is the account being throttled, not the destination
+    being broken. Counting it against FORWARD_MAX_RETRIES meant a burst of
+    throttling burned all 8 attempts and marked a perfectly healthy
+    destination dead. This defers the row instead, so the same budget is still
+    available if the destination is genuinely broken later.
+    """
+    now = datetime.now(timezone.utc)
+    retry_at = (now + timedelta(seconds=max(1, delay_seconds))).isoformat()
+    with db_session(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE forwardings
+            SET status = 'pending', error = ?, retry_count = retry_count,
+                retry_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (error[:500], retry_at, now.isoformat(), forwarding_id),
         )
 
 

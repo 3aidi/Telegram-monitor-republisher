@@ -3128,6 +3128,396 @@ class TestDestinationsForwarding(unittest.TestCase):
         conn.close()
         return dict(row) if row else None
 
+    def _attempt(self, dest_id, status, error=None, retry_count=0):
+        """Insert one concluded forward attempt for a specific destination.
+
+        queue_forwarding() deliberately fans out to every active destination and
+        returns a count, so health fixtures are written straight to the table.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        # NB: `with sqlite3.connect(...)` commits but does NOT close, which locks
+        # the temp DB file and breaks the next test's setUp.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            nxt = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 FROM forwardings"
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO forwardings
+                    (listing_id, published_chat_id, published_message_id,
+                     destination_id, status, error, retry_count,
+                     created_at, updated_at)
+                VALUES (1, '@dest', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (nxt, dest_id, status, error, retry_count, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return nxt
+
+    def test_destination_health_classifies_dead_and_flapping(self):
+        """DEST-HEALTH: dead/flapping/healthy must be told apart correctly.
+
+        The admin had no way to see that several destination groups were banned
+        until the log filled with forward warnings, so health is derived from
+        real attempt history. A destination is only 'dead' once it has a real
+        sample AND has stopped succeeding entirely - one bad post must never
+        condemn a working group.
+        """
+        healthy = db.add_destination("@healthy", "Healthy", db_path=self.db_path)
+        dead = db.add_destination("@dead", "Dead", db_path=self.db_path)
+        flappy = db.add_destination("@flappy", "Flappy", db_path=self.db_path)
+        never = db.add_destination("@never", "Never Used", db_path=self.db_path)
+
+        for _ in range(8):
+            self._attempt(healthy, "forwarded")
+        for _ in range(6):
+            self._attempt(dead, "failed", "You're banned from sending messages")
+        # Succeeds, then fails repeatedly: flapping, not dead.
+        for _ in range(3):
+            self._attempt(flappy, "forwarded")
+        for _ in range(4):
+            self._attempt(flappy, "failed", "The specified message ID is invalid")
+        rows = {r["id"]: r for r in db.get_destination_health(db_path=self.db_path)}
+
+        h = rows[healthy]
+        self.assertEqual(h["successes"], 8)
+        self.assertEqual(h["failures"], 0)
+        self.assertEqual(h["fail_pct"], 0.0)
+        self.assertFalse(h["is_dead"])
+        self.assertFalse(h["is_flapping"])
+
+        d = rows[dead]
+        self.assertEqual(d["successes"], 0)
+        self.assertEqual(d["failures"], 6)
+        self.assertEqual(d["consecutive_failures"], 6)
+        self.assertTrue(d["is_dead"])
+        self.assertIn("banned", d["last_error"])
+        self.assertIsNone(d["last_success_at"])
+
+        f = rows[flappy]
+        self.assertEqual(f["successes"], 3)
+        self.assertEqual(f["consecutive_failures"], 4)
+        self.assertTrue(f["is_flapping"])
+        self.assertFalse(f["is_dead"])
+
+        n = rows[never]
+        self.assertEqual(n["attempts"], 0)
+        self.assertFalse(n["is_dead"])
+        self.assertFalse(n["is_flapping"])
+
+        # Every configured destination is represented, including unused ones.
+        self.assertEqual(set(rows), {healthy, dead, flappy, never})
+
+    def test_destination_health_ignores_failures_outside_window(self):
+        """A destination that recovered must read healthy again.
+
+        The window is the most recent N ATTEMPTS, so a run of clean forwards has
+        to push the old failures out of it before the destination stops being
+        reported as broken.
+        """
+        from db import DESTINATION_HEALTH_WINDOW
+
+        dest = db.add_destination("@recovered", "Recovered", db_path=self.db_path)
+        for _ in range(DESTINATION_HEALTH_WINDOW + 10):
+            self._attempt(dest, "failed", "transient")
+        for _ in range(DESTINATION_HEALTH_WINDOW):
+            self._attempt(dest, "forwarded")
+
+        row = {r["id"]: r for r in db.get_destination_health(db_path=self.db_path)}[dest]
+        self.assertEqual(row["failures"], 0)
+        self.assertEqual(row["successes"], DESTINATION_HEALTH_WINDOW)
+        self.assertEqual(row["attempts"], DESTINATION_HEALTH_WINDOW)
+        self.assertEqual(row["fail_pct"], 0.0)
+        self.assertFalse(row["is_dead"])
+        self.assertFalse(row["is_flapping"])
+
+    def test_destination_health_does_not_condemn_throttled_destination(self):
+        """DEST-2: a FloodWait is the ACCOUNT's fault, not the group's.
+
+        Deferral leaves rows pending. If pending counted as failure, a healthy
+        group slowed down by Telegram would be reported banned and the admin
+        would delete a destination that still delivers.
+        """
+        dest = db.add_destination("@throttled_but_fine", "Fine", db_path=self.db_path)
+        for _ in range(4):
+            self._attempt(dest, "forwarded")
+        for _ in range(20):
+            self._attempt(dest, "pending", "throttled: FloodWait 900s")
+
+        row = {r["id"]: r for r in db.get_destination_health(db_path=self.db_path)}[dest]
+        self.assertEqual(row["failures"], 0, "unresolved rows are not failures")
+        self.assertEqual(row["attempts"], 4)
+        self.assertEqual(row["successes"], 4)
+        self.assertEqual(row["deferred"], 20)
+        self.assertEqual(row["fail_pct"], 0.0)
+        self.assertTrue(row["is_throttled"])
+        self.assertFalse(row["is_dead"], "a rate-limited group is not a dead group")
+        self.assertFalse(row["is_flapping"])
+
+    def test_defer_forwarding_does_not_consume_retry_budget(self):
+        """DEST-2: a FloodWait must never spend one of the 8 real retries.
+
+        Charging throttling against FORWARD_MAX_RETRIES is what marked healthy
+        destinations dead after 8 throttled attempts; every later post then
+        re-queued the same doomed row.
+        """
+        from db import FORWARD_MAX_RETRIES
+
+        dest = db.add_destination("@throttled", "Throttled", db_path=self.db_path)
+        fwd_id = self._attempt(dest, "pending")
+
+        for _ in range(FORWARD_MAX_RETRIES + 3):
+            db.defer_forwarding(
+                fwd_id, "throttled: FloodWait 900s", 900, db_path=self.db_path
+            )
+
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute(
+            "SELECT status, retry_count, error, retry_at FROM forwardings WHERE id=?",
+            (fwd_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row[0], "pending", "row must stay pending, not failed")
+        self.assertEqual(row[1], 0, "throttling must not consume the retry budget")
+        self.assertIn("FloodWait", row[2])
+        self.assertIsNotNone(row[3], "row must be deferred, not retried immediately")
+        self.assertIsNotNone(dest)
+
+    def test_defer_forwarding_retry_at_is_in_the_future(self):
+        dest = db.add_destination("@d2", "D2", db_path=self.db_path)
+        fwd_id = self._attempt(dest, "pending")
+        before = datetime.now(timezone.utc)
+        db.defer_forwarding(fwd_id, "throttled", 300, db_path=self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        retry_at = conn.execute(
+            "SELECT retry_at FROM forwardings WHERE id=?", (fwd_id,)
+        ).fetchone()[0]
+        conn.close()
+        parsed = datetime.fromisoformat(retry_at)
+        self.assertGreater(parsed, before)
+        self.assertLessEqual(parsed, before + timedelta(seconds=320))
+        self.assertIsNotNone(dest)
+
+    def test_destination_health_report_names_failed_destinations(self):
+        """The admin DM must name the dead groups and their @usernames."""
+        import main as main_mod
+
+        db.add_destination("@bannedgroup", "Banned Group", db_path=self.db_path)
+        rows = [
+            {
+                "id": 1,
+                "chat_id": "@bannedgroup",
+                "title": "Banned Group",
+                "active": 1,
+                "attempts": 9,
+                "successes": 0,
+                "failures": 9,
+                "fail_pct": 100.0,
+                "consecutive_failures": 9,
+                "last_success_at": None,
+                "last_error": "You're banned from sending messages in supergroups/channels (caused by ForwardMessagesRequest)",
+                "is_dead": True,
+                "is_flapping": False,
+            },
+            {
+                "id": 2,
+                "chat_id": "-100123456",
+                "title": "Fine",
+                "active": 1,
+                "attempts": 10,
+                "successes": 10,
+                "failures": 0,
+                "fail_pct": 0.0,
+                "consecutive_failures": 0,
+                "last_success_at": "2026-09-26T13:00:00+00:00",
+                "last_error": None,
+                "is_dead": False,
+                "is_flapping": False,
+            },
+        ]
+        text = main_mod._format_destination_health_report(rows)
+        self.assertIn("@bannedgroup", text)
+        self.assertIn("banned", text)
+        self.assertNotIn("Fine", text)
+        # An all-healthy board must not DM the admin at all.
+        self.assertEqual(main_mod._format_destination_health_report(rows[1:]), "")
+
+    def test_destination_health_report_includes_numeric_ids(self):
+        import main as main_mod
+
+        rows = [
+            {
+                "id": 3,
+                "chat_id": "-1003885053436",
+                "title": "chat -1003885053436",
+                "active": 1,
+                "attempts": 90,
+                "successes": 0,
+                "failures": 90,
+                "fail_pct": 100.0,
+                "consecutive_failures": 90,
+                "last_success_at": None,
+                "last_error": "The channel specified is private and you lack permission to access it",
+                "is_dead": True,
+                "is_flapping": False,
+            }
+        ]
+        text = main_mod._format_destination_health_report(rows)
+        self.assertIn("-1003885053436", text)
+        self.assertIn("private", text)
+
+    def test_destination_icon_and_label_show_health(self):
+        """The Destinations list must make an undelivering group visible."""
+        import admin_bot
+
+        base = {"id": 1, "chat_id": "@g", "title": "G", "active": 1}
+        self.assertEqual(admin_bot._destination_icon(base), "🟢")
+        self.assertEqual(admin_bot._destination_health_note(base), "")
+
+        dead = dict(base, is_dead=True, is_flapping=False, failures=9, attempts=9, fail_pct=100.0)
+        self.assertEqual(admin_bot._destination_icon(dead), "❌")
+        self.assertIn("not delivering", admin_bot._destination_health_note(dead))
+
+        flap = dict(base, is_dead=False, is_flapping=True, fail_pct=40.0)
+        self.assertEqual(admin_bot._destination_icon(flap), "⚠️")
+        self.assertIn("40%", admin_bot._destination_health_note(flap))
+
+        off = dict(base, active=0, is_dead=True)
+        self.assertEqual(admin_bot._destination_icon(off), "🔴")
+        self.assertIn("disabled", admin_bot._destination_health_note(off))
+
+    def test_destination_health_dm_is_throttled_to_once_a_day(self):
+        """A permanently banned group must not DM the admin every hour."""
+        import asyncio
+        import os as _os
+
+        import main as main_mod
+
+        dead = {
+            "id": 1,
+            "chat_id": "@banned",
+            "title": "Banned",
+            "active": 1,
+            "attempts": 10,
+            "successes": 0,
+            "failures": 10,
+            "deferred": 0,
+            "fail_pct": 100.0,
+            "consecutive_failures": 10,
+            "last_success_at": None,
+            "last_error": "You're banned from sending messages in supergroups/channels",
+            "is_dead": True,
+            "is_flapping": False,
+            "is_throttled": False,
+        }
+
+        class _FakeBot:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, chat, text, **kw):
+                self.sent.append(text)
+                return object()
+
+        bot = _FakeBot()
+        old_env = _os.environ.get("ADMIN_ID")
+        old_last = main_mod._LAST_DEST_HEALTH_REPORT
+        _os.environ["ADMIN_ID"] = "5883701139"
+        main_mod._LAST_DEST_HEALTH_REPORT = 0.0
+        try:
+            with mock.patch.object(
+                main_mod.db, "get_destination_health", return_value=[dead]
+            ):
+                asyncio.run(main_mod._report_destination_health(bot))
+                self.assertEqual(len(bot.sent), 1, "first unhealthy check reports at once")
+                self.assertIn("@banned", bot.sent[0])
+
+                # The hourly health loop keeps running; it must not re-DM.
+                for _ in range(3):
+                    asyncio.run(main_mod._report_destination_health(bot))
+                self.assertEqual(len(bot.sent), 1, "must be throttled to once a day")
+
+                # Once the window passes it reports again.
+                main_mod._LAST_DEST_HEALTH_REPORT = (
+                    main_mod._LAST_DEST_HEALTH_REPORT
+                    - main_mod.DEST_HEALTH_REPORT_SECONDS
+                    - 1
+                )
+                asyncio.run(main_mod._report_destination_health(bot))
+                self.assertEqual(len(bot.sent), 2, "reports again after a day")
+        finally:
+            main_mod._LAST_DEST_HEALTH_REPORT = old_last
+            if old_env is None:
+                _os.environ.pop("ADMIN_ID", None)
+            else:
+                _os.environ["ADMIN_ID"] = old_env
+
+    def test_destination_health_dm_stays_quiet_when_all_healthy(self):
+        """No news is not worth a DM: a clean board sends nothing."""
+        import asyncio
+        import os as _os
+
+        import main as main_mod
+
+        healthy = {
+            "id": 1,
+            "chat_id": "@fine",
+            "title": "Fine",
+            "active": 1,
+            "attempts": 20,
+            "successes": 20,
+            "failures": 0,
+            "deferred": 0,
+            "fail_pct": 0.0,
+            "consecutive_failures": 0,
+            "last_success_at": "2026-09-26T13:00:00+00:00",
+            "last_error": None,
+            "is_dead": False,
+            "is_flapping": False,
+            "is_throttled": False,
+        }
+
+        class _FakeBot:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, chat, text, **kw):
+                self.sent.append(text)
+                return object()
+
+        bot = _FakeBot()
+        old_env = _os.environ.get("ADMIN_ID")
+        old_last = main_mod._LAST_DEST_HEALTH_REPORT
+        _os.environ["ADMIN_ID"] = "5883701139"
+        main_mod._LAST_DEST_HEALTH_REPORT = 0.0
+        try:
+            with mock.patch.object(
+                main_mod.db, "get_destination_health", return_value=[healthy]
+            ):
+                asyncio.run(main_mod._report_destination_health(bot))
+            self.assertEqual(bot.sent, [])
+            self.assertEqual(
+                main_mod._LAST_DEST_HEALTH_REPORT, 0.0,
+                "a quiet board must not consume the daily report slot",
+            )
+        finally:
+            main_mod._LAST_DEST_HEALTH_REPORT = old_last
+            if old_env is None:
+                _os.environ.pop("ADMIN_ID", None)
+            else:
+                _os.environ["ADMIN_ID"] = old_env
+
+    def test_destination_health_dm_without_bot_client_is_a_noop(self):
+        """The monitor must still run when the admin bot is not configured."""
+        import asyncio
+
+        import main as main_mod
+
+        asyncio.run(main_mod._report_destination_health(None))  # must not raise
+
     def test_add_and_list_destinations(self):
         a = db.add_destination(-100111, "Team Buyers", db_path=self.db_path)
         b = db.add_destination("@mygroup", "My Group", db_path=self.db_path)
@@ -3327,7 +3717,17 @@ class TestDestinationsForwarding(unittest.TestCase):
         by_dest = {r["destination_chat_id"]: r for r in rows}
         self.assertEqual(by_dest["-100710"]["status"], "forwarded")
         self.assertEqual(by_dest["-100712"]["status"], "pending", "flooded dest is deferred, not failed")
-        self.assertEqual(by_dest["-100712"]["retry_count"], 1)
+        # DEST-2: a FloodWait is the ACCOUNT being throttled, not a bad
+        # destination. Charging it a retry is what burned all 8 attempts and
+        # marked working groups dead, so the budget must stay untouched.
+        self.assertEqual(
+            by_dest["-100712"]["retry_count"], 0,
+            "throttling must not consume a forwarding retry",
+        )
+        self.assertIsNotNone(
+            by_dest["-100712"]["retry_at"],
+            "deferred row must wait for the rate limit to clear",
+        )
         os.remove(db_path)
 
     def test_worker_drain_marks_permanent_failure_terminal(self):
