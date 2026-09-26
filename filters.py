@@ -22,7 +22,7 @@ REASON_CHATTER = "chatter"
 
 def is_duplicate_listing(
     clean_text: str,
-    hours: int = 12,
+    hours: int = 8,
     price: Optional[float] = None,
     exclude_listing_id: Optional[int] = None,
     db_path: Optional[str] = None,
@@ -60,7 +60,7 @@ def is_duplicate_listing(
 
 def check_filters(
     clean_text: str,
-    hours: int = 12,
+    hours: int = 8,
     price: Optional[float] = None,
     exclude_listing_id: Optional[int] = None,
     db_path: Optional[str] = None,

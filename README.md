@@ -25,7 +25,8 @@ An automated, robust Telegram channel monitor and republisher for digital accoun
    - Logs matched keywords to SQLite for audit.
 7. **Idempotent Storage & Deduplication**:
    - A unique index on `(supplier_id, source_message_id)` guarantees no source message is ever processed twice.
-   - Fingerprint-based 48-hour duplicate detection using `(platform, rounded price, normalized text)`.
+   - Fingerprint-based 8-hour duplicate detection using `(normalized text, price)`, plus a 100s quarantine hold so a burst of identical re-posts is fully present before the first one is decided, plus a 3-hour memory of admin rejections.
+   - Dedup is exact (SHA1 of the normalized text). A re-post that changes a price, an emoji, or a word is treated as a new listing.
 8. **Contact / DM Footer**:
    - Adds `📞 Contact : @username` to the footer of every republished post so buyers can contact you directly.
    - Price is always shown as the static `Price DM` — never republished, negotiated privately.
@@ -50,7 +51,7 @@ An automated, robust Telegram channel monitor and republisher for digital accoun
 ```
 ├── main.py            # Main entry point & orchestrator
 ├── parser.py          # Emoji stripping, platform/price/intent extraction & formatting
-├── filters.py         # Keyword blocklist & 48h duplicate detection
+├── filters.py         # Keyword blocklist & fingerprint duplicate detection
 ├── db.py              # SQLite schema, migrations & helper queries
 ├── admin_bot.py       # Telegram bot for admin management & inline approvals
 ├── test_system.py     # Automated unit test suite

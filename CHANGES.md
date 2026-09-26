@@ -6,6 +6,56 @@
 
 ---
 
+## Changeset (2026-09-26) — Dedup quarantine, rejection memory, live duplicate alerts
+
+**Verification:** `python -m pytest test_system.py` **191 passed / 4 failed** (the 4 are
+pre-existing UI-only failures in `_destinations_buttons` / `_sources_buttons` /
+`_skip_notification` / empty-queue copy, untouched by this work and failing on the
+pre-change baseline too). `ruff check` clean for every line added here. Migration
+re-verified against a copy of the live `monitor.db`: v10 -> v11, 122 rows in / 122 rows
+out, `PRAGMA integrity_check` ok, the 8 pre-existing duplicate groups left alone.
+
+Root cause of the reported duplicates: the pipeline decided on **arrival**. The first
+copy of a burst was evaluated, published, and only *then* did its twins land, so
+dedup could not see them. Separately, rejecting a post erased it from dedup entirely,
+and nothing re-checked immediately before a send.
+
+1. **100s dedup quarantine (the actual fix)** — ingest now only *parks* a listing as
+   `held` with `hold_until`; every filter/AI/publish decision moved into
+   `_evaluate_listing`, run by the new `held_listings_worker` (5s tick, so 100–105s
+   latency). By the time a row is due, the rest of its burst has arrived.
+   `db.claim_held_listing` then decides atomically: the **oldest** copy of a burst
+   wins and is processed, the rest become `skipped_duplicate` with `duplicate_of`
+   pointing at the winner. `drain_held_listings()` is the one testable entry point.
+2. **Rejection memory (3h)** — `rejected` / `skipped_admin` rows now match dedup for
+   `REJECT_MEMORY_MINUTES` (180m). This is what let #95 publish 1m43s after #94 was
+   rejected, and #31 publish 15m after #30. A mistaken rejection only silences a
+   listing for 3h, not all day.
+3. **Dedup window 48h -> 8h** in `.env`, `.env.example`, `main.py`, `filters.py`,
+   README.
+4. **Atomic final dedup gate** — `claim_listing_for_publish` is now itself
+   fingerprint-aware (`NOT EXISTS` on a committed twin), so admin-Approve and the
+   approved worker can no longer both read "no twin" and both send. The TOCTOU window
+   between the old `assert_still_unique` read and the claim is closed; the pre-check
+   stays for a good error message, and the new `get_earlier_duplicate_twin` tells a
+   lost claim race apart from a plain double-tap.
+5. **`admin_bot.send_skipped_alert()` actually implemented** — the 2026-09-21 entry
+   below claimed it was wired into every skip, but the function did not exist, so each
+   call raised `AttributeError` and was swallowed by the caller's bare `except`: the
+   admin was never told a duplicate had been dropped. Duplicate bursts are also
+   *grouped* — one card naming the winner and every id folded into it — and the alert
+   is emitted after the whole batch so it can name the complete burst instead of
+   only the first twin. Every other reason alerts immediately, as documented.
+6. **Migration v11** — additive only: `listings.hold_until`, `listings.duplicate_of`,
+   `idx_listings_hold`. No rows rewritten or deleted.
+
+Costs, stated plainly: every post waits ~100s longer, and matching is still exact
+(SHA1 of normalized text + parsed price), so a re-post with a changed price, added
+emoji, or lightly edited wording is still a different listing and can still publish.
+Already-published duplicates in the channel are not retroactively removed.
+
+---
+
 ## Changeset (2026-09-21) — Own-channel publishing + live skip alerts
 
 **Verification:** `python -m unittest test_system` **192/192 OK**; `py_compile` clean on `main.py`, `admin_bot.py`, `test_system.py`.
@@ -20,7 +70,7 @@
 
 **Verification:** `python -m unittest test_system` **128/128 OK**; `ruff check .` (F+E9) **clean**.
 
-1. **P1 — Deduplication (DEDUP)**: unique `(supplier_id, source_message_id)` index on `listings`; fresh insert conflict-resistant; dedup fingerprint includes `(platform, rounded price, normalized text)`; `find_recent_similar_listing` keeps the 48h window, excludes self, ignores stale `received` rows; concurrency test proves two true twins can never both publish.
+1. **P1 — Deduplication (DEDUP)**: unique `(supplier_id, source_message_id)` index on `listings`; fresh insert conflict-resistant; dedup fingerprint includes `(platform, rounded price, normalized text)`; `find_recent_similar_listing` keeps the 8h window, excludes self, ignores stale `received` rows; concurrency test proves two true twins can never both publish.
 2. **P2 — Type-safety**: `db.get_supplier_by_chat()` never returns `None` where the caller expects a row.
 3. **P3 — Concurrent-safety**: per-message in-flight locks (`_processing_locks`) serialize identical concurrent messages and release on completion (no leaking entries).
 4. **P4 — Bounded rephrase sweep**: `db.get_unpublished_listings(limit, min_age_seconds)`; startup rephrase loop is time/age bounded via `REPHRASE_SWEEP_LIMIT` / `REPHRASE_SWEEP_MIN_AGE_SECONDS`.

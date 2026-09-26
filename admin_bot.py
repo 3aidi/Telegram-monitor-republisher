@@ -32,6 +32,12 @@ CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "")
 # action (edit wizard, Approve tap) must be refused, not silently applied.
 EDITABLE_LISTING_STATUSES = ("pending_approval", "pending_review")
 
+# Same dedup window main.py publishes with. Duplicated here (rather than
+# imported) because admin_bot is a separate entry point that reads its config
+# from the environment directly; the two MUST agree or an approve could apply a
+# different duplicate window than the pipeline that queued the listing.
+DEDUP_HOURS = int(os.environ.get("DEDUP_HOURS", "8") or 8)
+
 # Skip digest: at most once per 10-minute window, only when there are NEW
 # skipped messages since the last digest marker (SKIP-1). Each newly-skipped
 # message goes out as ONE send_published_alert-style card (with its own
@@ -249,6 +255,79 @@ def _skip_notification(k: dict) -> Tuple[str, List[List[object]]]:
     if src_url:
         buttons[0].append(Button.url("View in Buyer channel", src_url))
     return text, buttons
+
+
+# Human labels for the skip reasons the pipeline can report.
+_SKIP_REASON_LABELS = {
+    "duplicate": "duplicate",
+    "chatter": "chatter",
+    "no_content": "no_content",
+    "not_a_listing": "not_a_listing",
+    "admin_skip": "admin_skip",
+}
+
+
+async def send_skipped_alert(
+    bot_client: TelegramClient,
+    admin_id: int,
+    listing: dict,
+    reason: str,
+) -> None:
+    """Alert the admin that an inbound message was dropped.
+
+    main.py has called this on every skip since long before the function existed,
+    so each call raised AttributeError and was swallowed by the caller's bare
+    ``except`` — the admin was never told a duplicate had been dropped. This is
+    that missing function.
+
+    Duplicates are GROUPED per burst. When the quarantine collapses five identical
+    re-posts it calls this five times; each call looks up the other copies that
+    lost to the same winner, and only the FIRST one (the lowest suppressed id)
+    speaks. The result names the winner and every id folded into it, so a burst
+    arrives as a single "kept #1, dropped #2 #3 #4 #5" card instead of five
+    separate notifications — which is what made the review queue look flooded.
+    Every other reason alerts individually, one line, as the pipeline intends.
+    """
+    listing_id = listing.get("id")
+    winner_id = listing.get("duplicate_of")
+
+    if reason == "duplicate" and winner_id:
+        suppressed = [
+            sid
+            for sid in db.get_duplicate_suppressed_ids(winner_id)
+            if sid != listing_id
+        ]
+        # Only the lowest-id member of the burst speaks for the group, so N twins
+        # produce exactly one alert.
+        if suppressed and listing_id != min([listing_id] + suppressed):
+            return
+        dropped = sorted(suppressed + [listing_id])
+        dropped_text = " ".join(f"#{i}" for i in dropped if i is not None)
+        src = _pretty_source(
+            listing.get("supplier_username"), listing.get("supplier_display_name")
+        )
+        text = (
+            f"♻️ **Duplicate burst collapsed**\n"
+            f"Kept Listing #{winner_id} from {src}.\n"
+            f"{len(dropped)} identical cop{'y' if len(dropped) == 1 else 'ies'} "
+            f"dropped: {dropped_text}"
+        )
+    else:
+        label = _SKIP_REASON_LABELS.get(reason, reason)
+        src = _pretty_source(
+            listing.get("supplier_username"), listing.get("supplier_display_name")
+        )
+        src_part = f" from {src}" if src and src != "?" else ""
+        text = f"⏭️ Skipped — {label} — Listing #{listing_id}{src_part}"
+
+    try:
+        await bot_client.send_message(admin_id, text, parse_mode="markdown")
+    except Exception:
+        logger.exception(
+            "Failed to send skip alert for listing #%s (reason %s)",
+            listing_id,
+            reason,
+        )
 
 
 async def skip_digest_worker(bot: TelegramClient) -> None:
@@ -2281,24 +2360,87 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
 
             if user_client_ref and user_client_ref.is_connected() and DEST_CHANNEL:
+                # DEDUP-RECHECK: last line of defence before an external send.
+                # Dedup only ever ran at ingest, so a listing that sat in review
+                # for hours (or was reopened from /skipped) would publish with no
+                # duplicate check at all — and two identical rows both awaiting
+                # the admin could each win their own claim and both ship. Runs
+                # BEFORE claim_listing_for_publish so a blocked approve does not
+                # consume the claim. Fails closed.
+                unique_ok, twin_id = await db.run_async(
+                    db.assert_still_unique, listing_id, DEDUP_HOURS
+                )
+                if not unique_ok:
+                    await db.run_async(db.mark_duplicate_of, listing_id, twin_id)
+                    await db.run_async(
+                        db.record_audit,
+                        "duplicate_at_publish",
+                        listing_id,
+                        actor_id=event.sender_id,
+                        detail=f"already published as #{twin_id}",
+                    )
+                    await event.client.send_message(
+                        ADMIN_USER_ID,
+                        f"♻️ **Listing #{listing_id} NOT published** — it is "
+                        f"identical to #{twin_id}, which is already published.\n"
+                        f"Marked as a duplicate instead of posting a second copy.",
+                        parse_mode="markdown",
+                        buttons=_home_keyboard(),
+                    )
+                    await _advance_review(bot)
+                    return
                 # CONC-3: share the same lock + rate-limit as the worker and the
                 # auto-publish path so admin-approve and worker never interleave.
                 #
                 # F3: atomic claim BEFORE the external send. Only the single
                 # winner may publish; a second Approve tap, a second worker, or a
                 # crash-retry sees status 'publishing' and must not send again.
+                #
+                # The claim is ALSO the authoritative final dedup gate, so it can
+                # return False because a twin won the race between the pre-check
+                # above and here. Distinguish that from a plain double-tap.
                 claimed = await db.run_async(
-                    db.claim_listing_for_publish, listing_id, post_number
+                    db.claim_listing_for_publish,
+                    listing_id,
+                    post_number,
+                    DEDUP_HOURS,
                 )
                 if not claimed:
-                    try:
-                        await event.client.send_message(
-                            ADMIN_USER_ID,
-                            f"⚠️ Listing #{listing_id} already being published elsewhere — nothing duplicate sent.",
-                            parse_mode="markdown",
+                    race_twin = await db.run_async(
+                        db.get_earlier_duplicate_twin, listing_id, DEDUP_HOURS
+                    )
+                    if race_twin is not None:
+                        await db.run_async(
+                            db.mark_duplicate_of, listing_id, race_twin
                         )
-                    except Exception:
-                        pass
+                        await db.run_async(
+                            db.record_audit,
+                            "duplicate_at_publish",
+                            listing_id,
+                            actor_id=event.sender_id,
+                            detail=f"lost publish claim race to #{race_twin}",
+                        )
+                        try:
+                            await event.client.send_message(
+                                ADMIN_USER_ID,
+                                f"♻️ **Listing #{listing_id} NOT published** — "
+                                f"an identical copy (#{race_twin}) reached the "
+                                f"channel first.\nMarked as a duplicate; "
+                                f"nothing duplicate was sent.",
+                                parse_mode="markdown",
+                                buttons=_home_keyboard(),
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await event.client.send_message(
+                                ADMIN_USER_ID,
+                                f"⚠️ Listing #{listing_id} already being published elsewhere — nothing duplicate sent.",
+                                parse_mode="markdown",
+                            )
+                        except Exception:
+                            pass
                     await _advance_review(bot)
                     return
                 await publish_guard.throttle()

@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -62,7 +63,24 @@ DETERMINISTIC_FALLBACK = os.environ.get("DETERMINISTIC_FALLBACK", "1").strip().l
 AI_CACHE_TTL_HOURS = float(os.environ.get("AI_CACHE_TTL_HOURS", "48") or 48)
 # How long identical content stays blocked as a duplicate: a re-post of the
 # same listing within DEDUP_HOURS is skipped (content fingerprint + price).
-DEDUP_HOURS = int(os.environ.get("DEDUP_HOURS", "48") or 48)
+DEDUP_HOURS = int(os.environ.get("DEDUP_HOURS", "8") or 8)
+# REJECT-MEM: how long an admin REJECTION keeps blocking the same content.
+# Rejecting a post used to erase it from dedup memory entirely, so the very next
+# identical copy (the "two buyers, same minute, both published" case) walked
+# straight through. Rejections are a deliberate admin decision, so they block
+# like a publish does — just for a shorter, separate window.
+REJECT_MEMORY_MINUTES = int(os.environ.get("REJECT_MEMORY_MINUTES", "180") or 180)
+# QUARANTINE: nothing is decided on arrival. A listing is inserted as 'held' and
+# the held-listings worker waits this long before evaluating it, so an entire
+# burst of identical re-posts is present in the DB *before* the first decision.
+# Without it the first message of a burst is published before its twins even
+# arrive, which is precisely why they had to be cleaned up by hand. Observed
+# bursts land within ~35s, so 100s carries ~3x margin.
+QUARANTINE_SECONDS = int(os.environ.get("QUARANTINE_SECONDS", "100") or 100)
+# Stand-in text stored for a media-only post (no caption). It is a marker, not
+# content: the held-listings worker re-detects media-only posts by this prefix
+# long after the original Telegram event is gone, so it must stay in one place.
+MEDIA_ONLY_MARKER = "[📷 Media-only post — no text caption]"
 # Startup stale-body rephrase sweep (REPHR-1): bounded to a small batch of
 # listings older than a few minutes, so restart recovery never becomes an
 # unbounded AI batch and never races messages the live pipeline is still
@@ -623,8 +641,15 @@ async def _alert_admin_on_skip(
     supplier: dict,
     listing_id: int,
     reason: str,
+    duplicate_of: Optional[int] = None,
 ) -> None:
-    """DM the admin whenever an inbound message is skipped (never silent)."""
+    """DM the admin whenever an inbound message is skipped (never silent).
+
+    ``duplicate_of`` names the copy that won the claim. It is passed through so
+    the alert can group a whole burst into ONE message: a five-post re-post
+    burst would otherwise send five near-identical DMs, which is exactly the
+    noise that made the review queue look flooded.
+    """
     if not (bot_client and ADMIN_USER_ID):
         return
     try:
@@ -633,9 +658,41 @@ async def _alert_admin_on_skip(
             return
         listing_dict["supplier_username"] = supplier.get("channel_username")
         listing_dict["supplier_display_name"] = supplier.get("display_name")
-        await admin_bot.send_skipped_alert(bot_client, ADMIN_USER_ID, listing_dict, reason)
+        listing_dict["duplicate_of"] = duplicate_of
+        await admin_bot.send_skipped_alert(
+            bot_client, ADMIN_USER_ID, listing_dict, reason
+        )
     except Exception:
         logger.exception("Failed to alert admin about skipped listing #%s", listing_id)
+
+
+async def _alert_admin_duplicate_at_publish(
+    bot_client: Optional[TelegramClient], listing_id: int, twin_id: Optional[int]
+) -> None:
+    """Tell the admin an approved listing was NOT published because it was a copy.
+
+    Separate from ``_alert_admin_on_skip`` because this one is actionable in a
+    different way: the admin spent a real approval on this listing, so silently
+    dropping it would look like a bug rather than a decision.
+    """
+    if not (bot_client and ADMIN_USER_ID):
+        return
+    try:
+        listing_dict = db.get_listing_by_id(listing_id)
+        if not listing_dict:
+            return
+        listing_dict["supplier_username"] = listing_dict.get("supplier_username")
+        text = (
+            f"♻️ **Not published — duplicate**\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"Listing #{listing_id} is identical to #{twin_id}, which is already "
+            f"published. Marked as a duplicate instead of posting a second copy."
+        )
+        await bot_client.send_message(ADMIN_USER_ID, text, parse_mode="markdown")
+    except Exception:
+        logger.exception(
+            "Failed to alert admin about duplicate-at-publish for #%s", listing_id
+        )
 
 
 async def _alert_admin_on_published(
@@ -990,7 +1047,7 @@ async def _process_supplier_message(
         return
     media_only = has_media and not raw_text.strip()
     if media_only:
-        raw_text = "[📷 Media-only post — no text caption]"
+        raw_text = MEDIA_ONLY_MARKER
 
     # Idempotency guard: if this source message is already recorded, ignore
     # re-deliveries so nothing is double-processed or double-published.
@@ -1016,21 +1073,71 @@ async def _process_supplier_message(
     # Fingerprint is computed and stored with the row itself (CONC-2 race fix):
     # the dedup query reads fingerprints from the DB, so a concurrent identical
     # twin arriving right after this insert must be able to match this row while
-    # it is still in-flight (status 'received').
+    # it is still in-flight (status 'held').
     source_price, _ = parser.extract_price(raw_text)
     fingerprint = db.make_listing_fingerprint(raw_text, price=source_price)
 
+    # QUARANTINE: the listing is inserted as 'held' and this function returns
+    # immediately. Nothing is filtered, analyzed, or published on arrival —
+    # the held-listings worker evaluates the row once hold_until has passed, by
+    # which time the whole burst of identical re-posts is present. Deciding on
+    # arrival is what let the first copy of a burst publish before its twins
+    # even landed, which is why duplicates had to be cleaned up by hand.
+    hold_until = (
+        datetime.now(timezone.utc) + timedelta(seconds=QUARANTINE_SECONDS)
+    ).isoformat()
     listing_id = await db.run_async(
         db.insert_listing,
         supplier_id=supplier_id,
         source_message_id=source_msg_id,
         game_name=None,
         rank_tier=None,
-        status="received",
+        status="held",
         raw_text=raw_text,
         clean_text=fallback_clean_text,
         fingerprint=fingerprint,
+        hold_until=hold_until,
     )
+    logger.info(
+        "Listing #%s held for dedup quarantine until %s (%ds).",
+        listing_id,
+        hold_until,
+        QUARANTINE_SECONDS,
+    )
+    return
+
+
+async def _evaluate_listing(
+    client: TelegramClient,
+    bot_client: Optional[TelegramClient],
+    listing: dict,
+) -> None:
+    """Decide one quarantined listing: filter, analyze, publish or route to review.
+
+    Split out of the ingest path (QUARANTINE) so the held-listings worker can
+    call it long after the Telegram event was received. Everything it needs comes
+    from the ``listing`` row plus its joined supplier, because the in-memory
+    values from ingest no longer exist by the time the hold expires.
+
+    The dedup check that used to live here is GONE — the worker's atomic claim
+    (``db.claim_held_listing``) is now the dedup decision, and it must run
+    before this function is called. Re-checking here would reintroduce the
+    read-then-write race the claim exists to close.
+    """
+    listing_id = listing["id"]
+    supplier_id = listing.get("supplier_id")
+    source_msg_id = listing.get("source_message_id")
+    raw_text = listing.get("raw_text") or ""
+    fallback_clean_text = listing.get("clean_text") or parser.strip_all_emoji(
+        raw_text
+    )
+    supplier = {
+        "id": supplier_id,
+        "channel_username": listing.get("supplier_username"),
+        "display_name": listing.get("supplier_display_name"),
+    }
+    media_only = raw_text.startswith(MEDIA_ONLY_MARKER)
+    _mark_activity()
 
     # Media-only posts have no analyzable text: skip fingerprint/AI entirely and
     # route straight to admin review (never silently dropped, never auto-published).
@@ -1056,24 +1163,11 @@ async def _process_supplier_message(
                 )
         return
 
-    # Step 1: Content-based filter check FIRST — plain-text fingerprint
-    # (normalized text + parsed price), no AI needed. Skip identical listings
-    # already processed within DEDUP_HOURS; reason is logged to the skips
-    # table so the daily report can break skipped stats down per rule (DEDUP-2).
-    # exclude_listing_id prevents a message from matching itself.
-    skip_reason = filters.check_filters(
-        raw_text,
-        hours=DEDUP_HOURS,
-        price=source_price,
-        exclude_listing_id=listing_id,
-    )
-    if skip_reason:
-        await db.run_async(db.update_listing_status, listing_id, f"skipped_{skip_reason}")
-        await db.run_async(db.log_skip, supplier_id, source_msg_id, skip_reason, raw_text)
-        await db.run_async(db.record_audit, skip_reason, listing_id, detail=raw_text[:200])
-        logger.info("Listing #%s skipped by filter '%s'.", listing_id, skip_reason)
-        await _alert_admin_on_skip(bot_client, supplier, listing_id, skip_reason)
-        return
+    # Step 1: content-based dedup is NOT re-checked here. It already happened,
+    # atomically, in db.claim_held_listing — a listing only reaches this function
+    # after winning that claim, so an older identical twin does not exist. A
+    # second check here would be a plain read that races the writes happening
+    # around it, which is exactly what the claim replaced.
 
     # Step 1.5 (optional): cheap chatter pre-filter. Obvious non-listings
     # (rule posts, admin pins, welcome greetings, bot tests) never reach the AI
@@ -1082,7 +1176,7 @@ async def _process_supplier_message(
         chatter_reason = filters.obvious_non_listing(raw_text)
         if chatter_reason == filters.REASON_CHATTER:
             await db.run_async(db.update_listing_status, listing_id, f"skipped_{chatter_reason}")
-            await db.run_async(db.log_skip, supplier_id, source_msg_id, chatter_reason, raw_text)
+            await db.run_async(db.log_skip, supplier_id, listing.get("source_message_id"), chatter_reason, raw_text)
             await db.run_async(db.record_audit, chatter_reason, listing_id, detail=raw_text[:200])
             logger.info(
                 "Listing #%s skipped by chatter pre-filter '%s'.",
@@ -1123,8 +1217,9 @@ async def _process_supplier_message(
     analysis = await ai_rephraser.analyze_message(raw_text)
 
     if analysis is None:
-        # AI unavailable / failed. Record the neutral intent (the regex price is
-        # used only for the dedup fingerprint, never for publishing).
+        # AI unavailable / failed. Record the neutral intent; price is never a
+        # publishing input (the regex price only ever fed the dedup fingerprint,
+        # which the atomic claim has already consumed).
         await db.run_async(
             db.update_listing_fields,
             listing_id,
@@ -1573,6 +1668,156 @@ async def _recover_stale_publish_claims(client: TelegramClient) -> None:
             )
 
 
+async def drain_held_listings(
+    client: TelegramClient,
+    bot_client: Optional[TelegramClient],
+    limit: int = 10,
+) -> int:
+    """Evaluate one batch of due quarantine rows. Returns how many were drained.
+
+    Extracted from ``held_listings_worker`` so there is exactly ONE definition of
+    the claim-then-decide sequence, callable directly by tests without running
+    the worker loop (or waiting out the real 100s hold).
+
+    Per due row:
+      * claim it atomically — WIN means no older identical listing is active, so
+        proceed to _evaluate_listing (filter, AI, publish or review);
+      * LOSE means an older identical copy already claimed it, so record
+        skipped_duplicate + duplicate_of.
+
+    Duplicate alerts are DEFERRED to the end of the batch and sent once per
+    winner. Alerting inline would fire on the first twin, before the rest of the
+    burst had been marked, so the card could only ever name one dropped id
+    ("kept #1, dropped #2") while silently swallowing #3 #4 #5 — which is the
+    flood the user complained about, just with the extra copies invisible. The
+    deferral lets send_skipped_alert re-read every copy that lost to the same
+    winner and name the whole burst in one card.
+
+    Never raises for a single bad row: it is failed loudly and the batch
+    continues, so one poisoned listing cannot stall the queue.
+    """
+    due = await db.run_async(db.get_held_listings_due, limit)
+    drained = 0
+    # winner_id -> a representative loser, filled as twins lose their claim.
+    burst_losers: dict = {}
+    for listing in due:
+        listing_id = listing["id"]
+        try:
+            won_id = await db.run_async(
+                db.claim_held_listing, listing_id, DEDUP_HOURS
+            )
+            if won_id == listing_id:
+                await _evaluate_listing(client, bot_client, listing)
+                drained += 1
+                continue
+
+            # Lost the claim: an older identical copy owns this content.
+            await db.run_async(db.mark_duplicate_of, listing_id, won_id)
+            await db.run_async(
+                db.log_skip,
+                listing.get("supplier_id"),
+                listing.get("source_message_id"),
+                filters.REASON_DUPLICATE,
+                listing.get("raw_text") or "",
+            )
+            await db.run_async(
+                db.record_audit,
+                filters.REASON_DUPLICATE,
+                listing_id,
+                detail=f"duplicate of #{won_id}",
+            )
+            logger.info(
+                "Listing #%s is a duplicate of #%s (quarantine claim); skipped.",
+                listing_id,
+                won_id,
+            )
+            # Keep the LOWEST loser id per winner: that is the one card the
+            # grouped alert allows to speak for the whole burst.
+            prior = burst_losers.get(won_id)
+            if prior is None or listing_id < prior["id"]:
+                burst_losers[won_id] = listing
+            drained += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A failure evaluating one listing must not stall the queue: fail
+            # that row loudly and keep draining the rest.
+            try:
+                await db.run_async(
+                    db.mark_listing_failed,
+                    listing_id,
+                    f"quarantine evaluation error: {str(exc)[:500]}",
+                )
+                await db.run_async(
+                    db.record_audit,
+                    "quarantine_error_failed",
+                    listing_id,
+                    detail=str(exc)[:500],
+                )
+            except Exception:
+                logger.exception(
+                    "Could not mark listing #%s failed after quarantine error",
+                    listing_id,
+                )
+            logger.exception("Error evaluating quarantined listing #%s", listing_id)
+            _record_failure("drain_held_listings", str(exc))
+
+    # One grouped card per burst, emitted only after every twin in this batch has
+    # been marked, so the card can name the complete set of dropped ids.
+    for won_id, loser in burst_losers.items():
+        try:
+            await _alert_admin_on_skip(
+                bot_client,
+                {
+                    "channel_username": loser.get("supplier_username"),
+                    "display_name": loser.get("supplier_display_name"),
+                },
+                loser["id"],
+                filters.REASON_DUPLICATE,
+                duplicate_of=won_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A failed alert must never undo the dedup that already happened.
+            logger.exception(
+                "Failed to send grouped duplicate alert for winner #%s", won_id
+            )
+            _record_failure("drain_held_listings.alert", str(exc))
+
+    return drained
+
+
+async def held_listings_worker(
+    client: TelegramClient, stop_event: asyncio.Event, bot_client: Optional[TelegramClient]
+) -> None:
+    """Drain the dedup quarantine: decide each listing once its hold expires.
+
+    Ingest only parks a listing as 'held' (see _process_supplier_message). This
+    worker is where every decision actually happens, which is the whole point:
+    by the time a row is due, the rest of its burst has arrived, so the claim can
+    see the twins that a decision made on arrival would have missed.
+
+    Crash safety needs no repair path: a row stranded in 'held' by a hard kill
+    is already past its hold_until, so the drain query picks it up. The claim is
+    idempotent, so re-draining a row that was mid-evaluation is harmless.
+    """
+    while not stop_event.is_set():
+        _mark_worker_heartbeat("held_worker")
+        try:
+            await drain_held_listings(client, bot_client, 10)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error in held listings worker")
+            _record_failure("held_listings_worker", "loop error")
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def approved_listings_worker(
     client: TelegramClient, stop_event: asyncio.Event, bot_client: Optional[TelegramClient]
 ) -> None:
@@ -1593,6 +1838,34 @@ async def approved_listings_worker(
             approved = await db.run_async(db.get_approved_listings_to_publish, 5)
             for listing in approved:
                 listing_id = listing["id"]
+                # DEDUP-RECHECK: the last line of defence before an external
+                # send. Dedup used to run only at ingest, so a listing that sat
+                # in the review queue for hours published with no duplicate check
+                # at all — and two rows both awaiting the admin could each win
+                # their own claim and both ship. Fails closed.
+                unique_ok, twin_id = await db.run_async(
+                    db.assert_still_unique, listing_id, DEDUP_HOURS
+                )
+                if not unique_ok:
+                    await db.run_async(
+                        db.mark_duplicate_of, listing_id, twin_id
+                    )
+                    await db.run_async(
+                        db.record_audit,
+                        "duplicate_at_publish",
+                        listing_id,
+                        detail=f"already published as #{twin_id}",
+                    )
+                    logger.warning(
+                        "Listing #%s blocked at publish: identical copy already "
+                        "published as #%s. Marked skipped_duplicate.",
+                        listing_id,
+                        twin_id,
+                    )
+                    await _alert_admin_duplicate_at_publish(
+                        bot_client, listing_id, twin_id
+                    )
+                    continue
                 # clean_text already holds the AI-rewritten body (or the raw fallback
                 # for listings captured before AI was available).
                 content_text = listing.get("clean_text") or listing.get("raw_text") or ""
@@ -1604,14 +1877,47 @@ async def approved_listings_worker(
                 # winner proceeds; a second worker, admin double-tap, or
                 # crash-retry sees status 'publishing' / non-NULL msg id here and
                 # must NOT send another Telegram message.
+                #
+                # The claim is ALSO the authoritative final dedup gate, so a
+                # twin that committed between the pre-check above and here makes
+                # this return False. Distinguish the two causes: re-read the twin
+                # to tell "a copy beat me to the channel" from "someone else
+                # already owns this row".
                 claimed = await db.run_async(
-                    db.claim_listing_for_publish, listing_id, post_number
+                    db.claim_listing_for_publish,
+                    listing_id,
+                    post_number,
+                    DEDUP_HOURS,
                 )
                 if not claimed:
-                    logger.info(
-                        "Listing #%s already claimed for publishing by another path; skipping.",
-                        listing_id,
+                    race_twin = await db.run_async(
+                        db.get_earlier_duplicate_twin, listing_id, DEDUP_HOURS
                     )
+                    if race_twin is not None:
+                        await db.run_async(
+                            db.mark_duplicate_of, listing_id, race_twin
+                        )
+                        await db.run_async(
+                            db.record_audit,
+                            "duplicate_at_publish",
+                            listing_id,
+                            detail=f"lost publish claim race to #{race_twin}",
+                        )
+                        logger.warning(
+                            "Listing #%s lost the publish claim race to twin #%s; "
+                            "marked skipped_duplicate.",
+                            listing_id,
+                            race_twin,
+                        )
+                        await _alert_admin_duplicate_at_publish(
+                            bot_client, listing_id, race_twin
+                        )
+                    else:
+                        logger.info(
+                            "Listing #%s already claimed for publishing by another "
+                            "path; skipping.",
+                            listing_id,
+                        )
                     continue
 
                 out_text, entities = parser.build_ai_message(
@@ -2014,6 +2320,11 @@ async def main() -> None:
                 logger.exception("Could not send startup online notice")
 
     # Start background workers
+    # The held worker is registered FIRST and unconditionally: it is what makes
+    # dedup correct, so it must be running whenever the pipeline is.
+    held_task = asyncio.create_task(
+        held_listings_worker(user_client, stop_event, bot_client)
+    )
     worker_task = asyncio.create_task(approved_listings_worker(user_client, stop_event, bot_client))
     forward_task = asyncio.create_task(
         forwarding_worker(user_client, stop_event, forward_client=forward_client)
@@ -2050,6 +2361,7 @@ async def main() -> None:
     finally:
         logger.info("Shutting down workers and clients...")
         stop_event.set()
+        held_task.cancel()
         worker_task.cancel()
         forward_task.cancel()
         for task in (health_task, resolve_task, rephrase_task):
@@ -2059,7 +2371,7 @@ async def main() -> None:
             backfill_task.cancel()
         # SHUT-1: actually await the cancelled tasks so their finally-blocks and
         # DB connection check-ins complete instead of leaking as orphans.
-        pending_tasks = [worker_task, forward_task]
+        pending_tasks = [held_task, worker_task, forward_task]
         for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 pending_tasks.append(task)

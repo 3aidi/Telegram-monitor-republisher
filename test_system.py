@@ -2483,7 +2483,10 @@ class TestMonitorSystem(unittest.TestCase):
         the deterministic keyword screen re-runs AFTER the AI, untrusting it."""
         import inspect
         import main as main_mod
-        handler_src = inspect.getsource(main_mod._process_supplier_message)
+        # QUARANTINE: the post-AI decisions live in _evaluate_listing (the
+        # quarantine drain), not in the ingest half _process_supplier_message,
+        # which now only parks the row.
+        handler_src = inspect.getsource(main_mod._evaluate_listing)
         self.assertIn(
             "filters.contains_blocked_keyword(raw_text)",
             handler_src,
@@ -3747,10 +3750,11 @@ class TestPhase5Handlers(unittest.TestCase):
         return 510000 + self._seq * 1000 + self._seq
 
     def _add_listing(self, status="pending_approval", text="WTS Bybit verified account $100",
-                     supplier_id=None):
+                     supplier_id=None, src_msg_id=None):
         if supplier_id is None:
             supplier_id = self._new_supplier_id(f"l{self._seq}")
-        src_msg_id = self._src_id()
+        if src_msg_id is None:
+            src_msg_id = self._src_id()
         return db.insert_listing(
             supplier_id,
             src_msg_id,
@@ -3774,10 +3778,50 @@ class TestPhase5Handlers(unittest.TestCase):
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def _release_hold(self):
+        """Force every held listing's quarantine to have expired.
+
+        QUARANTINE: ingest only parks a row as 'held'; the real 100s wait is
+        exercised by the held-listings worker, not by unit tests. Tests that want
+        a final decision call this so drain_held_listings picks the row up.
+        """
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        with db.db_session() as conn:
+            conn.execute(
+                "UPDATE listings SET hold_until = ? WHERE status = 'held'", (past,)
+            )
+
+    async def _ingest_and_drain(self, sup, msg, limit=50):
+        """Run the FULL pipeline for one message: ingest, then drain the hold.
+
+        Mirrors production end-to-end (Telegram event -> quarantine -> claim ->
+        decide) without waiting out the real hold, so a test asserting a final
+        status exercises the same code path the worker runs.
+        """
+        await self.main_mod._process_supplier_message(
+            self.user_client, self.bot, sup, msg
+        )
+        self._release_hold()
+        return await self.main_mod.drain_held_listings(
+            self.user_client, self.bot, limit
+        )
+
     def _age_row(self, table, row_id, seconds=400):
         old = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
         with db.db_session() as conn:
             conn.execute(f"UPDATE {table} SET updated_at = ? WHERE id = ?", (old, row_id))
+
+    def _age_created(self, table, row_id, seconds=400):
+        """Backdate created_at.
+
+        Dedup windows are measured from created_at (when the message arrived),
+        not updated_at, so ageing a row out of a dedup window needs this.
+        """
+        old = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+        with db.db_session() as conn:
+            conn.execute(
+                f"UPDATE {table} SET created_at = ? WHERE id = ?", (old, row_id)
+            )
 
     async def _drain_worker_once(self, client):
         """Run one full iteration of the real approved_listings_worker loop and
@@ -3809,6 +3853,203 @@ class TestPhase5Handlers(unittest.TestCase):
         reopened = db.get_approved_listings_to_publish()
         self.assertEqual([r["id"] for r in reopened], [lid],
                          "releasing the claim must put the listing back on the queue")
+
+    # ---------------- Dedup quarantine + rejection memory ----------------
+
+    def test_quarantine_burst_collapses_to_one_publish_and_one_alert(self):
+        """Five identical re-posts inside the quarantine window produce exactly
+        ONE publish, four skipped_duplicate rows pointing at the winner, and a
+        SINGLE grouped admin card. This is the failure the quarantine exists to
+        stop: the old decide-on-arrival pipeline published the first copy before
+        its twins had even landed, then flooded the admin with per-copy alerts."""
+
+        async def _run():
+            self._add_destination()
+            sup = self._add_supplier("burst_src")
+            chat = _types.SimpleNamespace(id=-1009990009)
+            text = "WTS Bybit verified account $250"
+
+            for i in range(5):
+                msg = _P5FakeMsg(700000 + self._seq * 10 + i, text=text,
+                                 media=None, chat=chat)
+                await self.main_mod._process_supplier_message(
+                    self.user_client, self.bot, sup, msg
+                )
+
+            rows = [
+                db.get_listing_by_source(sup["id"], 700000 + self._seq * 10 + i)
+                for i in range(5)
+            ]
+            self.assertTrue(all(r is not None for r in rows))
+            self.assertTrue(
+                all(r["status"] == "held" for r in rows),
+                "ingest only parks rows; nothing is decided on arrival",
+            )
+
+            self._release_hold()
+            await self.main_mod.drain_held_listings(self.user_client, self.bot, 50)
+
+            rows = [db.get_listing_by_id(r["id"]) for r in rows]
+            dupes = [r for r in rows if r["status"] == "skipped_duplicate"]
+            kept = [r for r in rows if r["status"] != "skipped_duplicate"]
+            self.assertEqual(
+                len(dupes), 4, "four of the five identical copies must be dropped"
+            )
+            self.assertEqual(
+                len(kept), 1, "exactly one copy may survive a burst"
+            )
+            self.assertLessEqual(
+                len(self.user_client.sent), 1,
+                "at most one send may leave the burst (0 here: with AI "
+                "unavailable the survivor routes to manual review, which is "
+                "still the point — the other four never get a send)",
+            )
+
+            # Whichever copy survived, the four dropped ones point at it and it
+            # is the OLDEST id: arrival order decides, not drain timing.
+            winner = kept[0]["id"]
+            self.assertEqual(winner, min(r["id"] for r in rows))
+            self.assertTrue(
+                all(r["duplicate_of"] == winner for r in dupes),
+                "every dropped copy must point at the listing that was kept",
+            )
+
+            alerts = [
+                m for m in self.bot.sent
+                if "Duplicate burst collapsed" in m.get("text", "")
+            ]
+            self.assertEqual(
+                len(alerts), 1,
+                "a burst of five must raise ONE grouped alert, not five",
+            )
+            for r in dupes:
+                self.assertIn(f"#{r['id']}", alerts[0]["text"])
+            self.assertIn(f"#{winner}", alerts[0]["text"])
+
+        asyncio.run(_run())
+
+    def test_rejected_listing_blocks_an_identical_repost_within_memory_window(self):
+        """An admin rejection must suppress an identical re-post for
+        REJECT_MEMORY_MINUTES (3h) — the gap that let #95 publish 1m43s after
+        # #94 was rejected. A rejection older than the window does not block."""
+
+        async def _run():
+            sup = self._add_supplier("reject_src")
+            text = "WTS Bybit account $100"
+            src_id = 710000 + self._seq
+
+            rejected = db.insert_listing(
+                sup["id"], src_id, game_name="Bybit", rank_tier=None,
+                status="rejected", raw_text=text, clean_text=text,
+                fingerprint=db.make_listing_fingerprint(text, price=100.0),
+            )
+            db.update_listing_status(rejected, "rejected")
+            # Dedup windows run from created_at, so backdate arrival time.
+            self._age_created("listings", rejected, seconds=60 * 60)  # 1h old
+
+            self.assertIsNotNone(
+                db.find_recent_similar_listing(text, price=100.0, hours=8),
+                "a 1h-old rejection must still block the re-post",
+            )
+
+            # Past the 3h rejection memory the copy is free again.
+            self._age_created("listings", rejected, seconds=60 * 60 * 4)
+            self.assertIsNone(
+                db.find_recent_similar_listing(text, price=100.0, hours=8),
+                "a 4h-old rejection must have aged out",
+            )
+
+        asyncio.run(_run())
+
+    def test_null_fingerprint_never_dedups(self):
+        """Rows with no fingerprint (unparseable price/text) must never block or
+        be blocked — otherwise legacy rows would silently swallow fresh posts."""
+
+        sup = self._add_supplier("nullfp_src")
+        a = db.insert_listing(
+            sup["id"], 720000 + self._seq, game_name=None, rank_tier=None,
+            status="published", raw_text="WTS something", clean_text="WTS something",
+            fingerprint=None,
+        )
+        db.update_listing_status(a, "published", published_message_id=1,
+                                 post_number=1)
+        self.assertIsNone(
+            db.find_recent_similar_listing("WTS something", price=None, hours=8),
+        )
+        self.assertTrue(
+            db.claim_listing_for_publish(
+                db.insert_listing(
+                    sup["id"], 720001 + self._seq, game_name=None, rank_tier=None,
+                    status="approved", raw_text="WTS something",
+                    clean_text="WTS something", fingerprint=None,
+                ),
+                db.next_post_number(), 8,
+            ),
+            "a null fingerprint must never be blocked by another null fingerprint",
+        )
+        ok, twin = db.assert_still_unique(a, 8)
+        self.assertTrue(ok)
+        self.assertIsNone(twin)
+
+    def test_publish_claim_is_the_atomic_final_dedup_gate(self):
+        """Two identical listings both sitting in the review queue: the publish
+        claim itself must let only one through, closing the TOCTOU window where
+        admin-Approve and the worker both read 'no twin' and both sent."""
+
+        text = "WTS Bybit verified account $500"
+        sup_id = self._new_supplier_id(f"gate{self._seq}")
+        first = self._add_listing(status="approved", text=text, supplier_id=sup_id,
+                                  src_msg_id=self._src_id())
+        twin = self._add_listing(status="approved", text=text, supplier_id=sup_id,
+                                 src_msg_id=self._src_id() + 1)
+        self.assertNotEqual(
+            first, twin,
+            "the fixture must create two genuinely distinct rows",
+        )
+
+        pn = db.next_post_number()
+        self.assertTrue(
+            db.claim_listing_for_publish(first, pn, 8),
+            "the first claimer wins",
+        )
+        self.assertFalse(
+            db.claim_listing_for_publish(twin, pn + 1, 8),
+            "an identical copy must not also claim — even from a different path",
+        )
+        self.assertEqual(
+            db.get_earlier_duplicate_twin(twin, 8), first,
+            "the loser must be able to name the twin that beat it",
+        )
+        # A plain double-claim on the SAME row is not a duplicate.
+        self.assertIsNone(
+            db.get_earlier_duplicate_twin(first, 8),
+            "a listing must never be its own twin",
+        )
+
+    def test_review_queue_twin_blocked_when_copied_while_awaiting_admin(self):
+        """A listing that sat in the review queue for hours must not publish if
+        an identical copy shipped in the meantime (dedup used to run at ingest
+        only, so this case published with no check at all)."""
+
+        text = "WTS Bybit verified account $700"
+        sup_id = self._new_supplier_id(f"q{self._seq}")
+        old = self._add_listing(status="approved", text=text, supplier_id=sup_id,
+                                src_msg_id=self._src_id())
+        twin = self._add_listing(status="pending_review", text=text,
+                                 supplier_id=sup_id, src_msg_id=self._src_id() + 1)
+        self.assertNotEqual(old, twin)
+
+        self.assertTrue(db.claim_listing_for_publish(old, db.next_post_number(), 8))
+        db.update_listing_status(old, "published", published_message_id=555,
+                                 post_number=1)
+
+        ok, winner = db.assert_still_unique(twin, 8)
+        self.assertFalse(ok, "the twin must be blocked by the published copy")
+        self.assertEqual(winner, old)
+        self.assertFalse(
+            db.claim_listing_for_publish(twin, db.next_post_number(), 8),
+            "and the claim must refuse it even if the pre-check were bypassed",
+        )
 
     def test_stale_claim_with_message_verified_recovered_no_resend(self):
         """Claim -> send lands -> process crashes before bookkeeping. Recovery
@@ -4275,9 +4516,7 @@ class TestPhase5Handlers(unittest.TestCase):
             chat = _types.SimpleNamespace(id=-1009990001)
             msg = _P5FakeMsg(610000 + self._seq, text="", media=object(), chat=chat)
 
-            await self.main_mod._process_supplier_message(
-                self.user_client, self.bot, sup, msg
-            )
+            await self._ingest_and_drain(sup, msg)
 
             listing = db.get_listing_by_source(sup["id"], 610000 + self._seq)
             self.assertIsNotNone(listing, "media-only posts must never be dropped")
@@ -4342,9 +4581,7 @@ class TestPhase5Handlers(unittest.TestCase):
                              "the seeded published listing must trip the duplicate filter")
 
             msg = _P5FakeMsg(640000 + self._seq, text=text, media=None, chat=chat)
-            await self.main_mod._process_supplier_message(
-                self.user_client, self.bot, sup, msg
-            )
+            await self._ingest_and_drain(sup, msg)
 
             new_listing = db.get_listing_by_source(sup_id, 640000 + self._seq)
             self.assertIsNotNone(new_listing)
@@ -4352,10 +4589,18 @@ class TestPhase5Handlers(unittest.TestCase):
             self.assertEqual(self.user_client.sent, [], "never published")
             self.assertEqual(self._forward_rows(new_listing["id"]), [],
                              "skipped content must never be forwarded")
-            self.assertTrue(
-                any("Skipped — duplicate" in m.get("text", "") for m in self.bot.sent),
-                "admin must be DM'd on a duplicate skip",
+            # The admin gets ONE grouped card naming the winner that was kept
+            # and the copy that was dropped, not a per-copy "skipped" line.
+            dup_alerts = [
+                m for m in self.bot.sent
+                if "Duplicate burst collapsed" in m.get("text", "")
+            ]
+            self.assertEqual(
+                len(dup_alerts), 1,
+                "a duplicate burst must produce exactly one grouped alert",
             )
+            self.assertIn(f"#{sid_listing}", dup_alerts[0]["text"])
+            self.assertIn(f"#{new_listing['id']}", dup_alerts[0]["text"])
 
         asyncio.run(_run())
 
@@ -4378,9 +4623,7 @@ class TestPhase5Handlers(unittest.TestCase):
                 chat = _types.SimpleNamespace(id=-1009990003)
                 text = "WTS Bybit full $100\nContact  : @fwfwdsf"
                 msg = _P5FakeMsg(650000 + self._seq, text=text, media=None, chat=chat)
-                await self.main_mod._process_supplier_message(
-                    self.user_client, self.bot, sup, msg
-                )
+                await self._ingest_and_drain(sup, msg)
 
                 listing = db.get_listing_by_source(sup["id"], 650000 + self._seq)
                 self.assertIsNotNone(listing, "the self-echo-looking message must be processed")
@@ -4414,9 +4657,7 @@ class TestPhase5Handlers(unittest.TestCase):
                 chat = _types.SimpleNamespace(id=-1009990004)
                 msg = _P5FakeMsg(660000 + self._seq, text="Hi everyone, welcome!",
                                  media=None, chat=chat)
-                await self.main_mod._process_supplier_message(
-                    self.user_client, self.bot, sup, msg
-                )
+                await self._ingest_and_drain(sup, msg)
 
                 listing = db.get_listing_by_source(sup["id"], 660000 + self._seq)
                 self.assertIsNotNone(listing)

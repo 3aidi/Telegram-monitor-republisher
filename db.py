@@ -493,6 +493,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         cursor.execute("PRAGMA user_version = 10")
 
+    if version < 11:
+        # QUARANTINE: the dedup hold. Purely additive — two nullable columns and
+        # one index, no existing row is read, rewritten, or deleted, so this is
+        # safe on a live database mid-burst.
+        #
+        # hold_until  : when the held-listings worker may evaluate this listing.
+        # duplicate_of: the listing id that won the dedup race, so every
+        #              suppressed twin is traceable to the copy that shipped.
+        table_info = cursor.execute("PRAGMA table_info(listings)").fetchall()
+        cols = {r["name"] for r in table_info}
+        if "hold_until" not in cols:
+            cursor.execute("ALTER TABLE listings ADD COLUMN hold_until TEXT")
+        if "duplicate_of" not in cols:
+            cursor.execute("ALTER TABLE listings ADD COLUMN duplicate_of INTEGER")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_listings_hold "
+            "ON listings(status, hold_until)"
+        )
+        cursor.execute("PRAGMA user_version = 11")
+
 
 # ---------------------------------------------------------------------------
 # Fingerprinting (canonical, shared between store + dedup lookup)
@@ -501,6 +521,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
 # a row stranded in 'received' (e.g. after a hard kill) cannot blind duplicate
 # detection for the full dedup window (CONC-2).
 _RECEIVED_DEDUP_MINUTES = 30
+
+# REJECT-MEM: how long an admin rejection keeps blocking the same fingerprint.
+# Separate from (and much shorter than) the publish dedup window, because a
+# rejection is a judgement call about ONE post, not a standing statement that
+# the content is worthless for a whole day. Overridable via the environment so
+# it can be tuned without a code change; main.py owns the live value.
+_REJECT_MEMORY_MINUTES = int(os.environ.get("REJECT_MEMORY_MINUTES", "180") or 180)
+
+# QUARANTINE: statuses that represent a listing the system is actively holding
+# or has decided about. A held listing blocks nothing on its own — only the
+# atomic claim turns 'held' into a decision — but it must be in this set so a
+# twin arriving during the hold window is visible to the claim's NOT EXISTS.
+_ACTIVE_DEDUP_STATUSES = (
+    "held",
+    "claimed",
+    "publishing",
+    "published",
+    "pending_approval",
+    "pending_review",
+    "approved",
+)
 
 
 def make_listing_fingerprint(
@@ -1061,6 +1102,7 @@ def insert_listing(
     clean_text: str,
     published_message_id: Optional[int] = None,
     fingerprint: Optional[str] = None,
+    hold_until: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> int:
     """Insert a captured listing record (idempotent per supplier+message).
@@ -1068,6 +1110,11 @@ def insert_listing(
     ``fingerprint`` must be set at insert time (CONC-2 race fix): the dedup
     query reads it from the DB, so writing it later left a window in which two
     identical concurrent messages could both pass the duplicate check.
+
+    ``hold_until`` (QUARANTINE) marks the row as one the held-listings worker
+    must wait for before evaluating. It is stored rather than kept in memory so
+    a restart cannot lose the hold and re-introduce the publish-before-twins-
+    arrive race.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
@@ -1077,8 +1124,9 @@ def insert_listing(
             INSERT INTO listings (
                 supplier_id, source_message_id, game_name, rank_tier,
                 status, raw_text, clean_text,
-                fingerprint, published_message_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fingerprint, published_message_id, created_at, updated_at,
+                hold_until
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(supplier_id, source_message_id) DO NOTHING
             """,
             (
@@ -1093,6 +1141,7 @@ def insert_listing(
                 published_message_id,
                 now_iso,
                 now_iso,
+                hold_until,
             ),
         )
         row = cursor.execute(
@@ -1290,9 +1339,10 @@ def record_blocklist_hit(
 
 def find_recent_similar_listing(
     clean_text: str,
-    hours: int = 48,
+    hours: int = 8,
     price: Optional[float] = None,
     exclude_listing_id: Optional[int] = None,
+    reject_memory_minutes: Optional[int] = None,
     db_path: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -1306,15 +1356,26 @@ def find_recent_similar_listing(
     in ``received`` (e.g. after a hard kill) stops blinding duplicates for a
     few minutes instead of the whole window. The caller's own row is excluded
     (``exclude_listing_id``) because it always carries the same fingerprint.
+
+    REJECT-MEM: rows the admin REJECTED (or skipped via the admin's skip button)
+    are ALSO matched, for their own shorter ``reject_memory_minutes`` window.
+    Previously they were invisible to dedup, which meant rejecting a post erased
+    it from memory entirely and the very next identical copy published instead of
+    being caught — the "two buyers post the same thing a minute apart and both go
+    out" failure. A rejection is a deliberate decision and must block like a
+    publish does, so it uses a separate short window rather than the full
+    ``hours`` (a mistaken rejection should not silence a listing all day).
     """
     if not (clean_text or "").strip():
         return None
 
     fingerprint = make_listing_fingerprint(clean_text, price=price)
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-    received_cutoff = (
-        datetime.now(timezone.utc) - timedelta(minutes=_RECEIVED_DEDUP_MINUTES)
-    ).isoformat()
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=hours)).isoformat()
+    received_cutoff = (now - timedelta(minutes=_RECEIVED_DEDUP_MINUTES)).isoformat()
+    if reject_memory_minutes is None:
+        reject_memory_minutes = _REJECT_MEMORY_MINUTES
+    reject_cutoff = (now - timedelta(minutes=reject_memory_minutes)).isoformat()
 
     query = """
         SELECT * FROM listings
@@ -1323,9 +1384,10 @@ def find_recent_similar_listing(
           AND (
                 status IN ('published', 'pending_approval', 'pending_review', 'approved')
                 OR (status = 'received' AND created_at >= ?)
+                OR (status IN ('rejected', 'skipped_admin') AND created_at >= ?)
               )
     """
-    params: List[Any] = [cutoff, fingerprint, received_cutoff]
+    params: List[Any] = [cutoff, fingerprint, received_cutoff, reject_cutoff]
     if exclude_listing_id is not None:
         query += " AND id != ?"
         params.append(exclude_listing_id)
@@ -1334,6 +1396,244 @@ def find_recent_similar_listing(
     with db_session(db_path) as conn:
         row = conn.execute(query, params).fetchone()
         return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Quarantine hold + atomic dedup claim (QUARANTINE)
+# ---------------------------------------------------------------------------
+# The hold is what makes dedup correct rather than merely likely. Previously a
+# listing was decided the instant it arrived, so the FIRST message of a burst
+# published before its twins had even landed — nothing could catch what had not
+# arrived yet. That is why duplicate bursts had to be cleaned up by hand.
+#
+# Now nothing is decided on arrival. A listing is inserted as 'held' with a
+# hold_until stamp; the held-listings worker waits that long, by which time the
+# whole burst is present, and then drains in id order (oldest first) so the
+# first-arrived copy deterministically wins and every twin collapses onto it.
+#
+# The win/lose decision is a SINGLE conditional UPDATE. Because that is one
+# SQLite write transaction, two claims cannot interleave: the loser's WHERE
+# clause evaluates against the winner's already-committed row and simply does
+# not match. Correctness by construction rather than by timing.
+
+
+def get_held_listings_due(
+    limit: int = 10, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Held listings whose quarantine has expired, oldest arrival first.
+
+    Ordering by id is what makes the winner of a burst deterministic: the
+    first-arrived copy is always claimed first, so the suppressed twins can name
+    it as their ``duplicate_of``. Rows stranded in 'held' by a hard kill are
+    already past ``hold_until``, so the next tick picks them up with no separate
+    repair path needed.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT l.*,
+                   s.channel_username AS supplier_username,
+                   s.display_name     AS supplier_display_name
+            FROM listings l
+            LEFT JOIN suppliers s ON l.supplier_id = s.id
+            WHERE l.status = 'held'
+              AND l.hold_until IS NOT NULL
+              AND l.hold_until <= ?
+            ORDER BY l.id ASC
+            LIMIT ?
+            """,
+            (now_iso, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def claim_held_listing(
+    listing_id: int, hours: int = 8, db_path: Optional[str] = None
+) -> Optional[int]:
+    """Atomically claim a held listing for evaluation, or report the winner.
+
+    Returns the listing's own id when the claim WON (proceed with filtering,
+    AI and publishing), or the older twin's id when it LOST — in which case the
+    caller must mark this listing ``skipped_duplicate`` and must NOT publish it.
+
+    The single-statement ``UPDATE ... WHERE NOT EXISTS`` IS the claim. SQLite
+    runs one UPDATE as one write transaction, so two concurrent claims on the
+    same fingerprint serialize: the second sees the first's committed row and its
+    NOT EXISTS is satisfied, so its rowcount is 0. This replaces the old
+    read-then-write check, where a sync read was followed by an await-ed write
+    and a twin arriving in that gap published too.
+
+    Only strictly OLDER rows (``x.id < listings.id``) can beat a listing, so the
+    earliest arrival in any burst always wins and the outcome does not depend on
+    drain order or timing.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    placeholders = ",".join("?" for _ in _ACTIVE_DEDUP_STATUSES)
+    with db_session(db_path) as conn:
+        cursor = conn.execute(
+            f"""
+            UPDATE listings
+            SET status = 'claimed', updated_at = ?
+            WHERE id = ?
+              AND status = 'held'
+              AND (
+                    fingerprint IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM listings x
+                        WHERE x.fingerprint = listings.fingerprint
+                          AND x.id < listings.id
+                          AND x.created_at >= ?
+                          AND x.status IN ({placeholders})
+                      )
+                  )
+            """,
+            (now_iso, listing_id, cutoff, *_ACTIVE_DEDUP_STATUSES),
+        )
+        if cursor.rowcount > 0:
+            return listing_id
+
+        row = conn.execute(
+            """
+            SELECT id FROM listings
+            WHERE fingerprint = (
+                    SELECT fingerprint FROM listings WHERE id = ?
+                 )
+              AND id < ?
+              AND created_at >= ?
+              AND status IN (%s)
+            ORDER BY id ASC
+            LIMIT 1
+            """
+            % placeholders,
+            (listing_id, listing_id, cutoff, *_ACTIVE_DEDUP_STATUSES),
+        ).fetchone()
+        return row["id"] if row else None
+
+
+def mark_duplicate_of(
+    listing_id: int, winner_id: int, db_path: Optional[str] = None
+) -> None:
+    """Record that ``listing_id`` lost the dedup claim to ``winner_id``."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        conn.execute(
+            "UPDATE listings SET status = 'skipped_duplicate', duplicate_of = ?, "
+            "updated_at = ? WHERE id = ?",
+            (winner_id, now_iso, listing_id),
+        )
+
+
+def get_duplicate_suppressed_ids(
+    winner_id: int, db_path: Optional[str] = None
+) -> List[int]:
+    """Ids of the twins that were suppressed in favour of ``winner_id``.
+
+    Lets the alert name the whole burst ("published #1, dropped #2 #3 #4") so a
+    five-post burst produces ONE admin message instead of five separate
+    notifications — which is what flooded the review queue.
+    """
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id FROM listings WHERE duplicate_of = ? ORDER BY id ASC",
+            (winner_id,),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+
+def assert_still_unique(
+    listing_id: int, hours: int = 8, db_path: Optional[str] = None
+) -> Tuple[bool, Optional[int]]:
+    """Final pre-publish duplicate guard. Returns ``(ok, winner_id)``.
+
+    Dedup historically ran at exactly ONE place: ingest. Nothing re-checked
+    before an actual publish, so a listing that sat in the review queue for
+    hours — or was revived from the skipped list by restore_skipped_to_pending
+    — would publish with no duplicate check at all, even if an identical copy
+    had already shipped in the meantime.
+
+    Both publish paths (the approved-listings worker and the admin's approve
+    button) call this immediately before sending and fail closed: on ``False``
+    the listing is marked ``skipped_duplicate`` instead of published.
+
+    Only COMMITTED states block — ``claimed``/``publishing``/``published``, i.e.
+    content that is out or provably on its way out. Two rows merely awaiting the
+    admin do not block each other: that is a legitimate review queue, and
+    blocking on it would wedge the queue so an approved listing could never
+    publish. Arrival order is deliberately NOT considered — a copy that published
+    while this listing sat in review always has a higher id than it, so
+    restricting the search to newer rows would miss precisely the case this
+    guard exists to catch.
+    """
+    committed = ("claimed", "publishing", "published")
+    with db_session(db_path) as conn:
+        row = conn.execute(
+            "SELECT fingerprint FROM listings WHERE id = ?", (listing_id,)
+        ).fetchone()
+        if row is None:
+            return False, None
+        fingerprint = row["fingerprint"]
+        if not fingerprint:
+            return True, None
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        placeholders = ",".join("?" for _ in committed)
+        twin = conn.execute(
+            f"""
+            SELECT id FROM listings
+            WHERE fingerprint = ?
+              AND id != ?
+              AND created_at >= ?
+              AND status IN ({placeholders})
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (fingerprint, listing_id, cutoff, *committed),
+        ).fetchone()
+        if twin is None:
+            return True, None
+        return False, twin["id"]
+
+
+def get_earlier_duplicate_twin(
+    listing_id: int, hours: int = 8, db_path: Optional[str] = None
+) -> Optional[int]:
+    """Id of an identical listing already COMMITTED (claimed/publishing/published).
+
+    Same twin rule as ``assert_still_unique``, but returns the id instead of a
+    (ok, id) pair. Used to tell a *failed publish claim* apart from a *duplicate*:
+    ``claim_listing_for_publish`` now returns False for both "another path already
+    owns this row" and "an identical copy won the race to the channel", and only
+    the second one deserves a skipped_duplicate verdict and an admin alert.
+
+    Returns None when no committed twin exists (a plain claim race) and when the
+    listing has no fingerprint (null fingerprints never dedup).
+    """
+    committed = ("claimed", "publishing", "published")
+    with db_session(db_path) as conn:
+        row = conn.execute(
+            "SELECT fingerprint FROM listings WHERE id = ?", (listing_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        fingerprint = row["fingerprint"]
+        if not fingerprint:
+            return None
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        placeholders = ",".join("?" for _ in committed)
+        twin = conn.execute(
+            f"""
+            SELECT id FROM listings
+            WHERE fingerprint = ?
+              AND id != ?
+              AND created_at >= ?
+              AND status IN ({placeholders})
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (fingerprint, listing_id, cutoff, *committed),
+        ).fetchone()
+        return twin["id"] if twin else None
 
 
 # ---------------------------------------------------------------------------
@@ -1641,7 +1941,10 @@ def get_approved_listings_to_publish(
 
 
 def claim_listing_for_publish(
-    listing_id: int, post_number: int, db_path: Optional[str] = None
+    listing_id: int,
+    post_number: int,
+    hours: int = 8,
+    db_path: Optional[str] = None,
 ) -> bool:
     """Atomically claim a listing for one external Telegram publish (once-only).
 
@@ -1655,12 +1958,28 @@ def claim_listing_for_publish(
     after the claim but before bookkeeping can be reconstructed byte-for-byte
     during stale-claim recovery (same inputs -> same deterministic message).
 
+    DEDUP (concurrency): the claim is ALSO the authoritative final duplicate
+    gate. ``assert_still_unique`` used to be a separate read that both publish
+    paths called just before this claim, leaving a TOCTOU window: two paths
+    (admin Approve + the approved worker) could both read "no twin" and then both
+    claim and send. Folding the twin check into this one UPDATE makes the
+    decision atomic — SQLite serialises the write, so whichever transaction lands
+    first moves its row to 'publishing' and the loser's NOT EXISTS sees it and
+    returns False. The loser is then marked skipped_duplicate and never sent.
+
+    Only COMMITTED states block (see _ACTIVE_DEDUP_STATUSES); two rows merely
+    awaiting the admin do not block each other, matching assert_still_unique so
+    the pre-check and the gate can never disagree about a legitimate queue.
+
     Returns True only for the single winner.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    committed = ("claimed", "publishing", "published")
+    placeholders = ",".join("?" for _ in committed)
     with db_session(db_path) as conn:
         cursor = conn.execute(
-            """
+            f"""
             UPDATE listings
             SET status = 'publishing',
                 post_number = ?,
@@ -1668,8 +1987,16 @@ def claim_listing_for_publish(
             WHERE id = ?
               AND status IN ('approved', 'pending_approval', 'pending_review')
               AND published_message_id IS NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM listings AS twin
+                    WHERE twin.fingerprint IS NOT NULL
+                      AND twin.fingerprint = listings.fingerprint
+                      AND twin.id != listings.id
+                      AND twin.created_at >= ?
+                      AND twin.status IN ({placeholders})
+              )
             """,
-            (post_number, now_iso, listing_id),
+            (post_number, now_iso, listing_id, cutoff, *committed),
         )
         return cursor.rowcount > 0
 
