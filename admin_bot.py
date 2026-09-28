@@ -995,16 +995,11 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
     for d in destinations[start:end]:
         icon = _destination_icon(d)
         label = f"{icon} {_destination_label(d)}{_destination_health_note(d)}"
-        # The inline button stays the management entry point ('dest:<id>' opens
-        # the detail screen). A public destination additionally gets a direct
-        # t.me link to the chat itself, so the admin can jump into the group
-        # without navigating through the menu — and without losing management.
-        # Private destinations get no such button (no public URL exists).
-        row = [Button.inline(label, data=f"dest:{d['id']}")]
-        open_chat = _destination_open_button(d.get("chat_id"))
-        if open_chat is not None:
-            row.append(open_chat)
-        buttons.append(row)
+        # The list is a management menu only: every row stays a single 'dest:<id>'
+        # button that opens the detail screen. The chat's t.me link lives on that
+        # screen (_edit_destination_menu), not here, so this list keeps one
+        # predictable tap target per destination.
+        buttons.append([Button.inline(label, data=f"dest:{d['id']}")])
     buttons.extend(_nav_row("dest", page, page_count))
     buttons.append([
         Button.inline("➕ Add Destination", data="destadd"),

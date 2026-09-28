@@ -3431,8 +3431,12 @@ class TestDestinationsForwarding(unittest.TestCase):
         self.assertEqual(admin_bot._destination_id_line(None), "")
         self.assertEqual(admin_bot._destination_id_line(""), "")
 
-    def test_destination_buttons_keep_management_and_add_open_chat(self):
-        """Public rows keep 'dest:<id>' management AND gain an Open Chat link."""
+    def test_destinations_list_rows_are_management_only(self):
+        """The list keeps one 'dest:<id>' management button per row, no t.me link.
+
+        The chat's t.me link belongs to the detail screen the row opens, not to
+        the list itself, so each list row stays a single predictable tap target.
+        """
         import admin_bot
 
         public = {"id": 1, "title": "OTC_Market_Binance",
@@ -3441,19 +3445,12 @@ class TestDestinationsForwarding(unittest.TestCase):
                    "chat_id": "-1001234567890", "active": 1}
         rows = admin_bot._destinations_buttons([public, private], 0)
 
-        def urls(row):
-            return [b.url for b in row if getattr(b, "url", None)]
-
-        def cbs(row):
-            return [b.data.decode() for b in row if getattr(b, "data", None)]
-
-        # Row 0: still a management button, plus a real t.me deep link.
-        self.assertEqual(cbs(rows[0]), ["dest:1"])
-        self.assertEqual(urls(rows[0]), ["https://t.me/otc_market_binance"])
-        self.assertIn("Open Chat", rows[0][1].text)
-        # Row 1: management only — a private destination gets no broken link.
-        self.assertEqual(cbs(rows[1]), ["dest:2"])
-        self.assertEqual(urls(rows[1]), [])
+        for row, expected in ((rows[0], "dest:1"), (rows[1], "dest:2")):
+            self.assertEqual(len(row), 1, "a list row is one management button")
+            self.assertEqual(row[0].data.decode(), expected)
+            self.assertIsNone(getattr(row[0], "url", None),
+                              "the list must not render a URL button")
+        self.assertNotIn("Open Chat", rows[0][0].text)
 
     def test_edit_destination_menu_open_chat_row_and_untouched_callbacks(self):
         """Public destinations get an Open Chat row; all management callbacks stay."""
