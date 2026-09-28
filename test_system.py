@@ -3389,6 +3389,141 @@ class TestDestinationsForwarding(unittest.TestCase):
         self.assertEqual(admin_bot._destination_icon(off), "🔴")
         self.assertIn("disabled", admin_bot._destination_health_note(off))
 
+    def test_destination_open_url_only_for_public_usernames(self):
+        """t.me links are built from @handles only — never from internal ids."""
+        import admin_bot
+
+        self.assertEqual(admin_bot._destination_username("@otc_market_binance"),
+                         "otc_market_binance")
+        self.assertEqual(
+            admin_bot.destination_open_url("@otc_market_binance"),
+            "https://t.me/otc_market_binance",
+        )
+        # A private supergroup/channel id is an internal identifier: no public
+        # URL exists, so nothing may be invented for it.
+        for private in ("-1001234567890", -1001234567890, "1001234567890", ""):
+            self.assertIsNone(admin_bot.destination_open_url(private))
+            self.assertEqual(admin_bot._destination_username(private), "")
+        # Handles that could never have been stored must not become dead links.
+        for bad in ("@", "@has space", "@bad/handle", None, "https://t.me/x"):
+            self.assertIsNone(admin_bot.destination_open_url(bad))
+
+    def test_destination_id_line_links_usernames_and_leaves_ids_plain(self):
+        """The detail screen's ID line: clickable handle, plain numeric id."""
+        import admin_bot
+        from telethon.extensions.markdown import parse
+
+        line = admin_bot._destination_id_line("@otc_market_binance")
+        self.assertNotIn("`", line, "an identifier must never be a code span")
+        text, entities = parse(line, None)
+        urls = [e.url for e in entities if type(e).__name__ == "MessageEntityTextUrl"]
+        self.assertEqual(urls, ["https://t.me/otc_market_binance"])
+        # The link must cover exactly the username, and nothing else.
+        entity = [e for e in entities if type(e).__name__ == "MessageEntityTextUrl"][0]
+        self.assertEqual(text[entity.offset:entity.offset + entity.length],
+                         "@otc_market_binance")
+
+        numeric = admin_bot._destination_id_line("-1001234567890")
+        self.assertEqual(numeric, "ID: -1001234567890")
+        self.assertEqual(parse(numeric, None)[1], [],
+                         "a numeric id must not be a clickable link")
+        # A missing reference drops the line instead of rendering "ID: None".
+        self.assertEqual(admin_bot._destination_id_line(None), "")
+        self.assertEqual(admin_bot._destination_id_line(""), "")
+
+    def test_destination_buttons_keep_management_and_add_open_chat(self):
+        """Public rows keep 'dest:<id>' management AND gain an Open Chat link."""
+        import admin_bot
+
+        public = {"id": 1, "title": "OTC_Market_Binance",
+                  "chat_id": "@otc_market_binance", "active": 1}
+        private = {"id": 2, "title": "Private Group",
+                   "chat_id": "-1001234567890", "active": 1}
+        rows = admin_bot._destinations_buttons([public, private], 0)
+
+        def urls(row):
+            return [b.url for b in row if getattr(b, "url", None)]
+
+        def cbs(row):
+            return [b.data.decode() for b in row if getattr(b, "data", None)]
+
+        # Row 0: still a management button, plus a real t.me deep link.
+        self.assertEqual(cbs(rows[0]), ["dest:1"])
+        self.assertEqual(urls(rows[0]), ["https://t.me/otc_market_binance"])
+        self.assertIn("Open Chat", rows[0][1].text)
+        # Row 1: management only — a private destination gets no broken link.
+        self.assertEqual(cbs(rows[1]), ["dest:2"])
+        self.assertEqual(urls(rows[1]), [])
+
+    def test_edit_destination_menu_open_chat_row_and_untouched_callbacks(self):
+        """Public destinations get an Open Chat row; all management callbacks stay."""
+        import asyncio
+
+        import admin_bot
+
+        async def render(d):
+            sent = {}
+
+            class FakeClient:
+                async def send_message(self, chat, text, buttons=None, parse_mode=None):
+                    sent["text"] = text
+                    sent["buttons"] = buttons
+
+            class FakeEvent:
+                client = FakeClient()
+
+                async def delete(self):
+                    return None
+
+            await admin_bot._edit_destination_menu(FakeEvent(), d)
+            return sent
+
+        base = {"id": 7, "title": "OTC_Market_Binance", "active": 1}
+        public = dict(base, chat_id="@otc_market_binance")
+        out = asyncio.run(render(public))
+        self.assertEqual(out["text"].splitlines()[:3],
+                         ["🟢 **OTC_Market_Binance**", "Status: Active",
+                          "ID: [@otc_market_binance](https://t.me/otc_market_binance)"])
+        rows = out["buttons"]
+        self.assertEqual(rows[0][0].text, "🔗 Open Chat")
+        self.assertEqual(rows[0][0].url, "https://t.me/otc_market_binance")
+        # Pause/Resume, Delete and Back keep their exact callback data.
+        cbs = [b.data.decode() for r in rows for b in r
+               if getattr(b, "data", None) is not None]
+        self.assertEqual(cbs, ["desttoggle:7", "destdel:7", "menu:destinations"])
+        self.assertEqual([r[0].text for r in rows[1:]],
+                         ["⏸ Pause ", "🗑 Delete Permanently", "⬅️ Back"])
+
+        # Private destination: no link row, plain numeric ID, same callbacks.
+        out = asyncio.run(render(dict(base, chat_id="-1001234567890", active=0)))
+        self.assertIn("ID: -1001234567890", out["text"])
+        self.assertEqual(out["text"].splitlines()[1], "Status: Disabled")
+        self.assertNotIn("t.me", out["text"])
+        self.assertEqual([b.url for r in out["buttons"] for b in r
+                          if getattr(b, "url", None)], [],
+                         "a private destination must not be given a t.me link")
+        cbs = [b.data.decode() for r in out["buttons"] for b in r
+               if getattr(b, "data", None) is not None]
+        self.assertEqual(cbs, ["desttoggle:7", "destdel:7", "menu:destinations"])
+        self.assertEqual(out["buttons"][0][0].text, "▶ Resume")
+
+    def test_destination_health_report_links_usernames_not_numeric_ids(self):
+        """The health DM links a public handle and leaves a private id plain."""
+        import main as main_mod
+
+        dead = {
+            "id": 1, "chat_id": "@bannedgroup", "title": "B", "active": 1,
+            "attempts": 9, "successes": 0, "failures": 9, "fail_pct": 100.0,
+            "consecutive_failures": 9, "last_success_at": None,
+            "last_error": "You're banned from sending messages in supergroups",
+            "is_dead": True, "is_flapping": False,
+        }
+        private = dict(dead, id=2, chat_id="-1003885053436", failures=3, attempts=9)
+        text = main_mod._format_destination_health_report([dead, private])
+        self.assertIn('<a href="https://t.me/bannedgroup">@bannedgroup</a>', text)
+        self.assertIn("id -1003885053436", text)
+        self.assertNotIn("<code>", text, "identifiers must not be code spans")
+
     def test_destination_health_dm_is_throttled_to_once_a_day(self):
         """A permanently banned group must not DM the admin every hour."""
         import asyncio

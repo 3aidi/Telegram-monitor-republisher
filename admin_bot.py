@@ -902,6 +902,79 @@ def _destination_label(d: dict) -> str:
     return ref or "?"
 
 
+def _destination_username(chat_ref) -> str:
+    """Public @handle of a destination peer, or '' when it has no public username.
+
+    A destination stores exactly one peer reference in chat_id: '@username' for a
+    public chat/channel/group, or the marked numeric id ('-100...') for a private
+    one (see db._destination_chat_ref). Only the '@' form names a chat Telegram
+    can open from a link, so a numeric id deliberately yields no handle. The
+    handle grammar mirrors db._destination_chat_ref, so anything that could be
+    stored can be linked and a half-typed handle never becomes a dead link.
+    """
+    ref = str(chat_ref or "").strip()
+    if not ref.startswith("@"):
+        return ""
+    handle = ref[1:]
+    if not handle or not all(c.isalnum() or c == "_" for c in handle):
+        return ""
+    return handle
+
+
+def destination_open_url(chat_ref) -> Optional[str]:
+    """t.me URL that opens a destination chat, or None when it isn't public.
+
+    Public rather than module-private because the destination health DM in
+    main.py links the same handles.
+
+    'https://t.me/<handle>' is the one deep link that reliably opens a public
+    chat, channel or group. A private destination has no handle and therefore no
+    public URL, so nothing is built for it: its 't.me/c/<id>' form only resolves
+    inside a client that already holds the entity, so handing it out would add a
+    button that silently fails. Callers must treat None as "show plain text".
+    """
+    handle = _destination_username(chat_ref)
+    return f"https://t.me/{handle}" if handle else None
+
+
+def _destination_open_button(chat_ref, label: str = "🔗 Open Chat"):
+    """A Button.url that opens the destination chat, or None if it is private."""
+    url = destination_open_url(chat_ref)
+    return Button.url(label, url) if url else None
+
+
+def _destination_id_line(chat_ref) -> str:
+    """The detail screen's 'ID:' line.
+
+    A public @username is rendered as a normal clickable link, so tapping it
+    opens the chat in Telegram. A numeric chat id is an internal identifier with
+    no public URL, so it stays plain text — no code span (which read as
+    copyable code) and no link Telegram could not open. Missing refs render as ''
+    so the caller can drop the line entirely.
+    """
+    ref = str(chat_ref or "").strip()
+    if not ref:
+        return ""
+    url = destination_open_url(ref)
+    return f"ID: [{ref}]({url})" if url else f"ID: {ref}"
+
+
+def _destination_markup(text, link_ref=None) -> str:
+    """Render a destination identifier for the admin: a t.me link when public.
+
+    Used by the one-off add/confirm messages, where an identifier is shown inline
+    instead of on the detail screen. `link_ref` is the stored peer reference
+    ('@handle' or a numeric id) that decides whether a link is possible, so a
+    public username is tappable while a numeric id or an unrecognised reference
+    stays plain text rather than becoming a link that cannot resolve.
+    """
+    shown = str(text or "").strip()
+    if not shown:
+        return ""
+    url = destination_open_url(link_ref if link_ref is not None else text)
+    return f"[{shown}]({url})" if url else shown
+
+
 def _destinations_menu_text(destinations: List[dict], page: int = 0) -> str:
     if not destinations:
         return (
@@ -922,7 +995,16 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
     for d in destinations[start:end]:
         icon = _destination_icon(d)
         label = f"{icon} {_destination_label(d)}{_destination_health_note(d)}"
-        buttons.append([Button.inline(label, data=f"dest:{d['id']}")])
+        # The inline button stays the management entry point ('dest:<id>' opens
+        # the detail screen). A public destination additionally gets a direct
+        # t.me link to the chat itself, so the admin can jump into the group
+        # without navigating through the menu — and without losing management.
+        # Private destinations get no such button (no public URL exists).
+        row = [Button.inline(label, data=f"dest:{d['id']}")]
+        open_chat = _destination_open_button(d.get("chat_id"))
+        if open_chat is not None:
+            row.append(open_chat)
+        buttons.append(row)
     buttons.extend(_nav_row("dest", page, page_count))
     buttons.append([
         Button.inline("➕ Add Destination", data="destadd"),
@@ -968,17 +1050,29 @@ async def _edit_destination_menu(event, d: dict) -> None:
     if d.get("last_error"):
         reason = str(d["last_error"]).split(" (caused by")[0][:120]
         health_lines += f"\nLast error: `{reason}`"
+    # 'ID:' is clickable for a public @username and plain text for a private
+    # numeric id; either way it is not a code span, so it never reads as
+    # copyable code. A leading 'Open Chat' row is only added when a real t.me
+    # deep link exists. The pause/resume, delete and back callbacks below are
+    # unchanged, so destination management is untouched.
+    id_line = _destination_id_line(d.get("chat_id"))
+    open_chat = _destination_open_button(d.get("chat_id"))
+    rows = []
+    if open_chat is not None:
+        rows.append([open_chat])
+    rows.append([Button.inline(toggle_label, data=f"desttoggle:{did}")])
+    rows.append([Button.inline("🗑 Delete Permanently", data=f"destdel:{did}")])
+    rows.append([Button.inline("⬅️ Back", data="menu:destinations")])
+    # health_lines always carries its own leading newline, so the ID line is
+    # appended without one and the layout matches the old screen exactly.
+    header = f"{icon} **{label}**\nStatus: {'Active' if d['active'] else 'Disabled'}"
+    if id_line:
+        header += f"\n{id_line}"
     await _message_delete_send(
         event,
-        f"{icon} **{label}**\n"
-        f"Status: `{'Active' if d['active'] else 'Disabled'}`\n"
-        f"ID: `{d['chat_id']}`{health_lines}\n\n"
+        f"{header}{health_lines}\n\n"
         f"What would you like to do?",
-        buttons=[
-            [Button.inline(toggle_label, data=f"desttoggle:{did}")],
-            [Button.inline("🗑 Delete Permanently", data=f"destdel:{did}")],
-            [Button.inline("⬅️ Back", data="menu:destinations")],
-        ],
+        buttons=rows,
     )
 
 
@@ -1021,7 +1115,8 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             detail=f"forwarded post -> {display} (id {chat_ref})",
         )
         await event.reply(
-            f"✅ **Destination added by forward**: `{display}` (ID `{chat_ref}`)\n"
+            f"✅ **Destination added by forward**: {_destination_markup(display)} "
+            f"(ID {_destination_markup(chat_ref)})\n"
             f"Every bot post published from now on will be forwarded here.",
             buttons=_home_keyboard(),
         )
@@ -1071,7 +1166,8 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             detail=f"{text} -> {display}",
         )
         await event.reply(
-            f"✅ **Destination added**: `{display}`\n"
+            f"✅ **Destination added**: "
+            f"{_destination_markup(store_ref if entity_username else display, store_ref)}\n"
             f"Every bot post published from now on will be forwarded here.",
             buttons=_home_keyboard(),
         )
@@ -1089,7 +1185,8 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             detail=f"{marked_id} (numeric) -> {display}",
         )
         await event.reply(
-            f"✅ **Destination added**: `{display}` (ID `{marked_id}`)\n"
+            f"✅ **Destination added**: {_destination_markup(display)} "
+            f"(ID {_destination_markup(marked_id)})\n"
             f"Every bot post published from now on will be forwarded here.",
             buttons=_home_keyboard(),
         )
@@ -1097,8 +1194,8 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
 
     _wizard_state[ADMIN_USER_ID] = {"step": "adddest_confirm_unresolved", "raw": text}
     await event.reply(
-        f"I couldn't verify `{text}` as a chat I can send to. It may be a private "
-        f"group I'm not a member of.\n\n"
+        f"I couldn't verify {_destination_markup(text)} as a chat I can send to. "
+        f"It may be a private group I'm not a member of.\n\n"
         f"• **Forward a message FROM the group** and I'll grab its exact ID, or\n"
         f"• Add it anyway and I'll retry delivery on every post (failures show "
         f"up in the queue).",
@@ -2045,7 +2142,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
             await _message_delete_send(
                 event,
-                f"🗑 **Delete {_destination_label(d)} permanently?**\n"
+                f"🗑 **Delete {_destination_markup(_destination_label(d), d.get('chat_id'))} "
+                f"permanently?**\n"
                 f"This removes the destination and stops forwarding posts to it.\n"
                 f"Existing forward history stays.\n"
                 f"This cannot be undone.",
@@ -2079,7 +2177,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await event.client.send_message(
                     ADMIN_USER_ID,
                     f"🗑 **Destination permanently deleted.**\n"
-                    f"{_destination_label(d)} is gone. History is kept.",
+                    f"{_destination_markup(_destination_label(d), d.get('chat_id'))} "
+                    f"is gone. History is kept.",
                     parse_mode="markdown",
                 )
             except Exception:
@@ -2120,7 +2219,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             await _message_delete_send(
                 event,
-                f"⚠️ **Destination added (unverified)**: `{raw}`\n"
+                f"⚠️ **Destination added (unverified)**: {_destination_markup(raw)}\n"
                 f"I couldn't confirm I can send to it yet — delivery will be "
                 f"retried on every post until it succeeds, and failures show up "
                 f"in the queue. Make sure the bot account is a member.",
