@@ -775,6 +775,45 @@ async def resolve_supplier_for_event(event) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # Publish helpers (retry + flood-wait + throttle)
 # ---------------------------------------------------------------------------
+async def header_emoji_for_listing(listing_id: int) -> list:
+    """Return the listing's header as a list of ``(alt, document_id)`` pairs.
+
+    The pick is made by ``db.resolve_header_for_listing`` and is STICKY: the
+    first render of a listing draws one at random from the admin's pool and
+    every later render (approve, edit, stale-claim recovery) reuses it, so the
+    admin preview is always the post that ships. Returns ``[]`` when the admin
+    has not added any header yet, which renders the post with no header line.
+
+    The pick is a DB WRITE on first call, so it runs in a worker thread like
+    every other write from async code (db.py ASYNC-1). Both DB calls share one
+    thread hop and one connection.
+    """
+    return (await resolve_listing_header(listing_id))[1]
+
+
+async def resolve_listing_header(listing_id: int) -> Tuple[Optional[int], list]:
+    """Resolve this listing's header once, returning ``(header_id, emoji)``.
+
+    ``header_id`` is what gets persisted so the choice is reproducible; ``emoji``
+    is the ``[(alt, document_id), ...]`` the formatter needs. Either is None/empty
+    when no header is configured.
+
+    Callers that both persist and render (the evaluate path) use this so the pick
+    happens exactly once; callers that only render (stale-claim recovery, admin
+    preview/approve) use header_emoji_for_listing.
+    """
+    def _resolve() -> Tuple[Optional[int], list]:
+        header_id = db.resolve_header_for_listing(listing_id)
+        if header_id is None:
+            return None, []
+        header = db.get_header(header_id)
+        if not header:
+            return None, []
+        return header_id, [(p["alt"], p["doc_id"]) for p in header["emoji"]]
+
+    return await db.run_async(_resolve)
+
+
 async def publish_to_destination(
     client: TelegramClient, text: str, entities: list
 ) -> int:
@@ -1507,9 +1546,7 @@ async def _evaluate_listing(
                 content_lines=content_lines,
                 platform=None,
                 contact_username=CONTACT_USERNAME,
-                intent="neutral",
-                header_word=None,
-                listing_seed=listing_id,
+                header_emoji=await header_emoji_for_listing(listing_id),
                 post_number=post_number,
                 source_text=raw_text,
             )
@@ -1623,13 +1660,16 @@ async def _evaluate_listing(
     ai_clean_text = "\n".join(content_lines) if content_lines else fallback_clean_text
 
     # Persist the AI-rewritten body so the worker / admin preview reuse it as-is.
-    # platform is informational only — it does NOT gate publishing.
+    # platform is informational only — it does NOT gate publishing. The header is
+    # the admin's own custom emoji, drawn at random from their pool and pinned to
+    # this listing here, which makes every later render of it reproducible.
+    header_id, header_emoji = await resolve_listing_header(listing_id)
     await db.run_async(
         db.update_listing_fields,
         listing_id,
         platform_name=platform_name,
         intent=intent,
-        header_word=analysis.get("header"),
+        header_id=header_id,
     )
     if ai_clean_text:
         await db.run_async(db.update_listing_content, listing_id, clean_text=ai_clean_text)
@@ -1654,9 +1694,7 @@ async def _evaluate_listing(
             content_lines=body_lines,
             platform=platform_name,
             contact_username=CONTACT_USERNAME,
-            intent=intent,
-            header_word=analysis.get("header"),
-            listing_seed=listing_id,
+            header_emoji=header_emoji,
             post_number=post_number,
             source_text=raw_text,
         )
@@ -1765,7 +1803,6 @@ async def process_edited_message(client: TelegramClient, event) -> None:
     intent = analysis.get("intent") or "neutral"
     content_lines = analysis.get("content") or []
     ai_clean_text = "\n".join(content_lines) if content_lines else parser.strip_all_emoji(raw_text)
-    header_word = analysis.get("header")
 
     # AI-only decision: update the destination post from whatever the analysis
     # returns (the footer price is always the static "Price DM" line).
@@ -1775,13 +1812,13 @@ async def process_edited_message(client: TelegramClient, event) -> None:
         logger.debug("Edit on source msg %s is a no-op; skipping", source_msg_id)
         return
 
+    # An edit must not reshuffle the header: the listing's already-pinned header
+    # is reused, so the post keeps the emoji it published with.
     updated_text, entities = parser.build_ai_message(
         content_lines=content_lines,
         platform=platform_name,
         contact_username=CONTACT_USERNAME,
-        intent=intent,
-        header_word=header_word,
-        listing_seed=existing["id"],
+        header_emoji=await header_emoji_for_listing(existing["id"]),
         post_number=existing.get("post_number"),
         source_text=raw_text,
     )
@@ -1798,7 +1835,6 @@ async def process_edited_message(client: TelegramClient, event) -> None:
             listing_id=existing["id"],
             platform_name=platform_name,
             intent=intent,
-            header_word=header_word,
         )
         await db.run_async(
             db.update_listing_content,
@@ -1880,9 +1916,7 @@ async def _recover_stale_publish_claims(client: TelegramClient) -> None:
                 content_lines=content_lines,
                 platform=row.get("platform_name"),
                 contact_username=CONTACT_USERNAME,
-                intent=row.get("intent") or "neutral",
-                header_word=row.get("header_word"),
-                listing_seed=listing_id,
+                header_emoji=await header_emoji_for_listing(listing_id),
                 post_number=row.get("post_number"),
                 source_text=row.get("raw_text"),
             )
@@ -2179,7 +2213,6 @@ async def approved_listings_worker(
                 # for listings captured before AI was available).
                 content_text = listing.get("clean_text") or listing.get("raw_text") or ""
                 content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
-                intent = listing.get("intent") or "neutral"
                 post_number = await db.run_async(db.next_post_number)
 
                 # F3: atomic claim BEFORE any external send. Only the single
@@ -2233,9 +2266,7 @@ async def approved_listings_worker(
                     content_lines=content_lines,
                     platform=listing.get("platform_name"),
                     contact_username=CONTACT_USERNAME,
-                    intent=intent,
-                    header_word=listing.get("header_word"),
-                    listing_seed=listing_id,
+                    header_emoji=await header_emoji_for_listing(listing_id),
                     post_number=post_number,
                     source_text=listing.get("raw_text"),
                 )

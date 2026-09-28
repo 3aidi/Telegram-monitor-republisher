@@ -104,18 +104,16 @@ class TestMonitorSystem(unittest.TestCase):
 
     def test_build_ai_message_never_emits_numeric_price(self):
         """Prices must NEVER reach rendered output: every post carries the
-        static '🤑 Price  DM' footer and the frozen 'WTB ✦ DM FAST' header no
-        matter what the source text contained."""
+        static '🤑 Price  DM' footer no matter what the source text contained."""
         import re
         for source in ("Tuyo full access", "Tuyo full access 50$", "Tuyo 1000 EUR", "Tuyo 12,50€"):
             msg, _ = parser.build_ai_message(
                 content_lines=["Tuyo full access"],
                 platform="tuyo",
                 contact_username="@buyer",
-                intent="sell",
                 source_text=source,
             )
-            self.assertIn("TUYO WTB ✦ DM FAST", msg, f"header default broken for {source}")
+            self.assertIn("TUYO", msg, f"platform line missing for {source}")
             self.assertIn("🤑 Price  DM", msg, f"static price footer missing for {source}")
             leaked = re.findall(r"\$\s?\d|€|\b(?:USD|USDT|EUR)\b", msg)
             self.assertEqual(leaked, [], f"numeric price leaked in output for {source}: {msg!r}")
@@ -126,10 +124,8 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["Bybit kyc", "da"],
             platform="bybit",
             contact_username="@x",
-            intent="sell",
         )
         self.assertIn("🤑 Price  DM", msg)
-        self.assertIn("WTB ✦ DM FAST", msg)
         self.assertNotIn("$38", msg)
         self.assertNotIn("€", msg)
 
@@ -139,7 +135,8 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["Netflix 1 month", "4K ready"],
             platform="netflix",
             contact_username="@buy",
-            intent="sell",
+            header_emoji=[("W", 1), ("T", 2), ("B", 3)],
+            post_number=7,
         )
         units = len(msg.encode("utf-16-le")) // 2
         prev = -1
@@ -148,9 +145,13 @@ class TestMonitorSystem(unittest.TestCase):
             self.assertGreaterEqual(e.offset, 0)
             self.assertLessEqual(e.offset + e.length, units)
             prev = e.offset
-        # Header: second custom emoji sits right after "🔥 NETFLIX WTB ✦ DM FAST "
-        header_prefix = parser.PH_FIRE + " NETFLIX WTB ✦ DM FAST "
-        self.assertEqual(entities[1].offset, len(header_prefix.encode("utf-16-le")) // 2)
+        # The header emoji sit right after the "#N" banner and are contiguous.
+        self.assertEqual(msg[:3], "#7\n")
+        self.assertEqual(entities[0].offset, 3)
+        utf16 = msg.encode("utf-16-le")
+        self.assertEqual(utf16[6:8].decode("utf-16-le"), "W")
+        self.assertEqual(entities[1].offset, 4)
+        self.assertEqual(entities[2].offset, 5)
 
     # -------------------------------------------------------------
     # COUNTRY -> CUSTOM EMOJI TESTS
@@ -225,7 +226,6 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["Available"],
             platform="netflix",
             contact_username="@buy",
-            intent="sell",
             source_text="USA\nEgypt\nSaudi Arabia",
         )
         self.assertIn("USA  🇺🇸", msg)
@@ -258,7 +258,6 @@ class TestMonitorSystem(unittest.TestCase):
         msg, entities = parser.build_ai_message(
             content_lines=["Plain line"],
             platform="netflix",
-            intent="sell",
         )
         self.assertNotIn("United States", msg)
         self.assertTrue(all(not hasattr(e, "document_id")
@@ -269,7 +268,6 @@ class TestMonitorSystem(unittest.TestCase):
         msg, entities = parser.build_ai_message(
             content_lines=["Available"],
             platform="netflix",
-            intent="sell",
             source_text="Applicable in DR Congo and South Sudan only",
         )
         self.assertNotIn("DR Congo", msg)
@@ -287,7 +285,6 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["KYC BY LINK", "ANY EUROPE", "NO POLAND"],
             platform="bybit",
             contact_username="@b",
-            intent="sell",
             source_text="KYC BY LINK ANY EUROPE NO POLAND",
         )
         lines = [ln.strip() for ln in msg.split("\n")]
@@ -313,7 +310,6 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["UK, USA and Germany"],
             platform="netflix",
             contact_username="@b",
-            intent="sell",
         )
         lines = [ln.strip() for ln in msg.split("\n")]
         self.assertIn("UK  🇬🇧", lines)
@@ -336,7 +332,6 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["ship to Grenada"],
             platform="netflix",
             contact_username="@b",
-            intent="sell",
             source_text="ship to Grenada",
         )
         self.assertIn("ship to Grenada", msg)
@@ -412,14 +407,14 @@ class TestMonitorSystem(unittest.TestCase):
 
     def test_flag_offset_math_survives_multibyte_emoji_prefix(self):
         """UTF-16 offsets must survive non-BMP emoji BEFORE the flag — the exact
-        ordering that broke in production (🔥🔥 header, country flags, 💀 order
-        line). A Python-len() computation would be off by 2 for every flag here;
-        the shared helper uses real UTF-16 length."""
+        ordering that broke in production (custom-emoji header, country flags, 💀
+        order line). A Python-len() computation would be off by 2 for every flag
+        here; the shared helper uses real UTF-16 length."""
         text = "🔥🔥 NETFLIX\nNO POLAND 🇵🇱\nANY EUROPE 🇪🇺\n💀 Price  : DM\n"
         poland = countries.alt_for("Poland")
         eu = countries.alt_for("European Union")
         entities = [
-            parser._make_custom_emoji_entity(0, parser.CE_FIRE, parser.PH_FIRE),
+            parser._make_custom_emoji_entity(0, 4242, "🔥"),
             parser._make_custom_emoji_entity(
                 parser._utf16_len(text[:text.index(poland)]),
                 countries.emoji_for("Poland"), poland),
@@ -427,7 +422,7 @@ class TestMonitorSystem(unittest.TestCase):
                 parser._utf16_len(text[:text.index(eu)]),
                 countries.emoji_for("European Union"), eu),
         ]
-        for e, anchor in zip(entities, (parser.PH_FIRE, poland, eu)):
+        for e, anchor in zip(entities, ("🔥", poland, eu)):
             start = _utf16_to_char(text, e.offset)
             end = _utf16_to_char(text, e.offset + e.length)
             self.assertEqual(text[start:end], anchor,
@@ -449,7 +444,7 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["KYC BY LINK", "ANY EUROPE", "NO POLAND", "UK and USA"],
             platform="bybit",
             contact_username="@b",
-            intent="sell",
+            header_emoji=[("\U0001F525", 900), ("T", 901), ("B", 902)],
             post_number=17,
             source_text="KYC BY LINK ANY EUROPE NO POLAND UK and USA",
         )
@@ -469,11 +464,13 @@ class TestMonitorSystem(unittest.TestCase):
             self.assertGreaterEqual(e.offset, prev_end)
             self.assertLessEqual(e.offset + e.length, units)
             prev_end = e.offset + e.length
-        # The ‼ header flames must be rebased past the #N banner prefix.
-        header_prefix = msg[:msg.index(parser.PH_FIRE)]
+        # The header emoji are rebased past the "#N" banner prefix.
+        self.assertTrue(msg.startswith("#17\n"), msg)
+        self.assertIn("🔥TB", msg)
+        header_prefix = msg[:msg.index("\U0001F525")]
         self.assertEqual(entities[0].offset, parser._utf16_len(header_prefix))
-        self.assertIn("NO POLAND  🇵🇱", msg)
-        self.assertIn("ANY EUROPE  🇪🇺", msg)
+        self.assertIn("NO POLAND  \U0001F1F5\U0001F1F1", msg)
+        self.assertIn("ANY EUROPE  \U0001F1EA\U0001F1FA", msg)
 
     def test_sanitizer_never_strips_inserted_flag_anchors(self):
         """Flag glyphs are real emoji; they reach the post only because they
@@ -512,7 +509,6 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["Available"],
             platform="netflix",
             contact_username="@b",
-            intent="sell",
             source_text="Lithuania\nAustralia",
         )
         self.assertIn("Lithuania  🇱🇹", msg)
@@ -541,7 +537,6 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["**ESTY KYC**", "Full access now"],
             platform="bybit",
             contact_username="@b",
-            intent="sell",
         )
         self.assertIn("\nESTY KYC\n", out)
         self.assertNotIn("*", out)
@@ -1763,7 +1758,6 @@ class TestMonitorSystem(unittest.TestCase):
                 content_lines=["Bybit full kyc"],
                 platform="bybit",
                 contact_username="@buyer",
-                intent="buy",
             )
             self.assertNotIn("Buyer away, back shortly", msg_off)
 
@@ -1773,7 +1767,6 @@ class TestMonitorSystem(unittest.TestCase):
                 content_lines=["Bybit full kyc"],
                 platform="bybit",
                 contact_username="@buyer",
-                intent="buy",
             )
             self.assertIn("Back soon", msg_on)
             self.assertTrue(msg_on.rstrip().endswith("Back soon"), msg_on)
@@ -2649,9 +2642,10 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["Spain region", "Includes Tuyo account", "ID card + proof of address"],
             platform="ikualo",
             contact_username="@buyer",
-            intent="sell",
+            header_emoji=[("W", 11), ("T", 12), ("B", 13)],
+            post_number=1,
         )
-        self.assertIn("IKUALO WTB ✦ DM FAST", out)
+        self.assertTrue(out.startswith("#1\nWTB\n\nIKUALO\n\n"), out)
         # A body line mentioning a country carries that country's flag on the
         # SAME line — the real alt emoji, anchored post-sanitization.
         self.assertIn("\nSpain region  🇪🇸\n", out)
@@ -2666,24 +2660,19 @@ class TestMonitorSystem(unittest.TestCase):
         doc_ids = [e.document_id for e in entities]
         self.assertIn(countries.emoji_for("Spain"), doc_ids)
 
-    def test_build_ai_message_header_rotates_by_seed(self):
-        """Header emoji alternates fire/lightning deterministically per listing seed."""
-        _, e0 = parser.build_ai_message(
-            content_lines=["line"], platform="x", contact_username="@b", intent="sell",
-            listing_seed=0,
-        )
-        _, e1 = parser.build_ai_message(
-            content_lines=["line"], platform="x", contact_username="@b", intent="sell",
-            listing_seed=1,
-        )
-        _, e0b = parser.build_ai_message(
-            content_lines=["line"], platform="x", contact_username="@b", intent="sell",
-            listing_seed=0,
-        )
-        self.assertEqual(e0[0].document_id, parser.CE_FIRE)
-        self.assertEqual(e1[0].document_id, parser.CE_LIGHTNING)
-        self.assertEqual(e0b[0].document_id, e0[0].document_id,
-                         "same seed must pick the same emoji")
+    def test_build_ai_message_header_is_whatever_the_pool_picked(self):
+        """The parser renders the emoji it is handed verbatim — it never picks
+        or rotates one. Choosing (and pinning) a header per listing is
+        db.resolve_header_for_listing's job."""
+        for doc_id in (1, 2, 3):
+            out, entities = parser.build_ai_message(
+                content_lines=["line"], platform="x", contact_username="@b",
+                header_emoji=[("W", 7), ("T", 8), ("B", doc_id)],
+            )
+            self.assertIn("WTB", out)
+            ids = [e.document_id for e in entities
+                   if e.__class__.__name__ == "MessageEntityCustomEmoji"]
+            self.assertEqual(ids[:3], [7, 8, doc_id])
 
     def test_build_ai_message_body_is_emoji_free(self):
         """Emoji appear ONLY in the header/footer lines, never in the body."""
@@ -2691,7 +2680,7 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["Plain body line one", "Plain body line two"],
             platform="revolut",
             contact_username="@b",
-            intent="sell",
+            header_emoji=[("W", 1), ("T", 2), ("B", 3)],
         )
         lines = out.split("\n")
         body_lines = [ln for ln in lines if ln.startswith("Plain body")]
@@ -2701,8 +2690,8 @@ class TestMonitorSystem(unittest.TestCase):
                 parser.strip_all_emoji(ln), ln,
                 "body line must not contain any emoji",
             )
-        # The only emoji characters in the whole post are header + footer placeholders.
-        allowed = {parser.PH_FIRE, parser.PH_LIGHT, parser.PH_PRICE, parser.PH_PHONE}
+        # The only emoji characters in the whole post are header + footer.
+        allowed = {"W", "T", "B", parser.PH_PRICE, parser.PH_PHONE}
         present = {ch for ch in out if emoji.is_emoji(ch)}
         self.assertTrue(present.issubset(allowed), f"unexpected emoji in post: {present}")
 
@@ -2713,7 +2702,6 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=countries,
             platform="kyc",
             contact_username="@b",
-            intent="sell",
         )
         body_lines = [ln.strip() for ln in out.split("\n") if ln.strip().startswith("Country ")]
         self.assertEqual(len(body_lines), 9)
@@ -2725,63 +2713,78 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(len(parsed.get("content", [])), 9)
 
-    def test_build_ai_message_defaults_to_buyer_header(self):
-        """Every post carries a buyer-framed header, whatever the source intent."""
-        out, _ = parser.build_ai_message(
-            content_lines=["Need curve pay"], platform="curve", contact_username="@buyer", intent="buy",
+    def test_build_ai_message_renders_configured_custom_emoji_header(self):
+        """The admin's header is emitted verbatim, with no spaces and real
+        custom-emoji entities, above the platform line."""
+        out, entities = parser.build_ai_message(
+            content_lines=["Need curve pay"], platform="curve", contact_username="@buyer",
+            header_emoji=[("W", 1111), ("T", 2222), ("B", 3333)],
+            post_number=1,
         )
-        self.assertIn("CURVE WTB ✦ DM FAST", out)
+        self.assertIn("WTB", out)
+        self.assertNotIn("W T B", out, "the header must not be spaced out")
+        ids = [e.document_id for e in entities
+               if e.__class__.__name__ == "MessageEntityCustomEmoji"]
+        self.assertEqual(ids[:3], [1111, 2222, 3333])
+        lines = out.split("\n")
+        self.assertEqual(lines[0], "#1", "the post number stays the very first line")
+        self.assertEqual(lines[1], "WTB", "header sits on its own line, no spaces")
+        self.assertEqual(lines[3], "CURVE", "platform is the first line of the body")
         self.assertNotIn("FOR SALE", out)
 
-    def test_build_ai_message_uses_validated_ai_header(self):
-        """A buyer-framed AI tagline is used; seller wording falls back to default."""
+    def test_build_ai_message_no_header_when_pool_empty(self):
+        """With no configured header there is no header line at all — no
+        placeholder, no default, and the platform still leads the body."""
         out, _ = parser.build_ai_message(
-            content_lines=["Netflix"], platform="netflix", contact_username="@b",
-            header_word="WANTED ✦ DM FAST",
+            content_lines=["Need curve pay"], platform="curve", contact_username="@buyer",
+            post_number=1,
         )
-        self.assertIn("NETFLIX WANTED ✦ DM FAST", out)
-        out, _ = parser.build_ai_message(
-            content_lines=["Netflix"], platform="netflix", contact_username="@b",
-            header_word="FOR SALE",
+        self.assertNotIn("WTB", out)
+        self.assertNotIn("WANTED", out)
+        lines = out.split("\n")
+        self.assertEqual(lines[0], "#1")
+        self.assertEqual(lines[1], "CURVE")
+        self.assertNotIn("WTB", out)
+
+    def test_build_ai_message_header_entity_offsets_are_utf16(self):
+        """Header entity offsets are UTF-16 code units, so a multi-unit alt
+        after them cannot shift the anchors that follow."""
+        out, entities = parser.build_ai_message(
+            content_lines=["Line"], platform="x", contact_username="@b",
+            header_emoji=[("\U0001F1EB\U0001F1E7", 10), ("T", 20), ("B", 30)],
         )
-        self.assertIn("NETFLIX WTB ✦ DM FAST", out)
+        utf16 = out.encode("utf-16-le")
+        header_ids = {10: "\U0001F1EB\U0001F1E7", 20: "T", 30: "B"}
+        checked = 0
+        for ent in entities:
+            if ent.__class__.__name__ != "MessageEntityCustomEmoji":
+                continue
+            if ent.document_id not in header_ids:
+                continue
+            start = ent.offset * 2
+            got = utf16[start:start + ent.length * 2].decode("utf-16-le")
+            self.assertEqual(got, header_ids[ent.document_id])
+            checked += 1
+        self.assertEqual(checked, 3, "all three header emoji must be anchored")
 
-    def test_sanitize_buyer_header(self):
-        """Buyer taglines pass; seller wording, emoji, and empty input are rejected."""
-        self.assertEqual(parser.sanitize_buyer_header("WTB ✦ DM FAST"), "WTB ✦ DM FAST")
-        self.assertEqual(parser.sanitize_buyer_header("  wanted  "), "wanted")
-        self.assertEqual(parser.sanitize_buyer_header("🔥 DM FAST 🔥"), "DM FAST")
-        self.assertIsNone(parser.sanitize_buyer_header("FOR SALE"))
-        self.assertIsNone(parser.sanitize_buyer_header("SELLING FAST"))
-        self.assertIsNone(parser.sanitize_buyer_header("AVAILABLE"))
-        self.assertIsNone(parser.sanitize_buyer_header("hello world"))
-        self.assertIsNone(parser.sanitize_buyer_header("   "))
-        self.assertIsNone(parser.sanitize_buyer_header(None))
-
-    def test_ai_parse_analysis_json_extracts_header(self):
+    def test_ai_parse_analysis_json_ignores_header(self):
+        """The AI no longer owns the header: a stray "header" in the model
+        output is dropped, and the prompt never asks for one."""
         parsed = ai_rephraser._parse_analysis_json(
-            '{"is_listing": true, "blocked": false, "header": "WANTED ✦ DM FAST", "content": ["a"]}'
+            '{"is_listing": true, "blocked": false, "header": "WANTED ✦ DM FAST", '
+            '"content": ["a"]}'
         )
-        self.assertEqual(parsed["header"], "WANTED ✦ DM FAST")
-        # Seller-framed AI suggestion is rejected -> None, falls back to default.
-        parsed_bad = ai_rephraser._parse_analysis_json(
-            '{"is_listing": true, "blocked": false, "header": "FOR SALE", "content": ["a"]}'
-        )
-        self.assertIsNone(parsed_bad["header"])
-        # Missing header -> None.
-        parsed_missing = ai_rephraser._parse_analysis_json(
-            '{"is_listing": true, "blocked": false, "content": ["a"]}'
-        )
-        self.assertIsNone(parsed_missing["header"])
-        self.assertIn("header", ai_rephraser.ANALYZE_PROMPT)
+        self.assertNotIn("header", parsed)
+        self.assertNotIn('"header":', ai_rephraser.ANALYZE_PROMPT)
+        self.assertNotIn("buyer-framed", ai_rephraser.ANALYZE_PROMPT)
+        self.assertNotIn("FOR SALE", ai_rephraser.ANALYZE_PROMPT)
 
     def test_build_ai_message_no_price_variant(self):
         """Even with no price the static 'Price DM' footer and the frozen buyer
         header are present — the variant used to show 'WANTED' and skip Price."""
         out, _ = parser.build_ai_message(
-            content_lines=["Tuyo full access"], platform="tuyo", contact_username="@buyer", intent="neutral",
+            content_lines=["Tuyo full access"], platform="tuyo", contact_username="@buyer",
         )
-        self.assertIn("TUYO WTB ✦ DM FAST", out)
         self.assertIn("🤑 Price  DM", out)
 
     def test_build_ai_message_price_zero_source_text(self):
@@ -2789,7 +2792,7 @@ class TestMonitorSystem(unittest.TestCase):
         always the static 'Price DM' line."""
         out, _ = parser.build_ai_message(
             content_lines=["Line"], source_text="WTS netflix $0",
-            platform="x", contact_username="@b", intent="sell",
+            platform="x", contact_username="@b",
         )
         self.assertIn("🤑 Price  DM", out)
         self.assertNotIn("$0", out)
@@ -3003,7 +3006,6 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["KYC CURVE PAY", "PRICE: $30", "DM: @godf4therCO"],
             platform="curve",
             contact_username="@buy",
-            intent="buy",
         )
         self.assertNotIn("PRICE: $30", msg)
         self.assertNotIn("@godf4therCO", msg)
@@ -3015,7 +3017,6 @@ class TestMonitorSystem(unittest.TestCase):
             content_lines=["KYC CURVE PAY", "PRICE: $30"],
             platform="curve",
             contact_username="@buy",
-            intent="buy",
             sanitize_body=False,
         )
         self.assertIn("KYC CURVE PAY", msg)
@@ -4305,14 +4306,33 @@ async def _dispatch_message(bot, text, sender_id=None, message=None):
     raise AssertionError(f"No NewMessage handler matched {text!r}")
 
 
-async def _dispatch_wizard(bot, text, sender_id=None):
-    """Run the bare NewMessage() wizard fallback handler (registered last)."""
+async def _dispatch_wizard(bot, text, sender_id=None, message=None):
+    """Run the bare NewMessage() handlers the way Telethon actually does.
+
+    Telethon invokes EVERY matching handler in registration order and does not
+    stop at the first, so a bare helper such as the add-header capture gets its
+    chance BEFORE the generic wizard fallback, and the fallback is what makes it
+    bail (it finds the wizard state already popped). All handlers therefore see
+    the SAME event object and their replies land in one ev.replies.
+
+    This used to call only the first catch-all handler, which silently stopped
+    being the wizard fallback the moment another bare handler was registered.
+
+    `message` is the Telethon message object; pass one carrying custom-emoji
+    entities when testing the header capture, since that handler reads
+    event.message.entities rather than event.text.
+    """
+    event = None
+    matched = 0
     for filt, fn in bot.new_message_handlers():
         if getattr(filt, "pattern", None) is None:
-            event = _P5FakeEvent(sender_id, text=text, bot=bot)
+            matched += 1
+            if event is None:
+                event = _P5FakeEvent(sender_id, text=text, message=message, bot=bot)
             await fn(event)
-            return event
-    raise AssertionError("no catch-all NewMessage wizard handler registered")
+    if not matched:
+        raise AssertionError("no catch-all NewMessage wizard handler registered")
+    return event
 
 
 def _button_datas(msg):
@@ -4752,9 +4772,6 @@ class TestPhase5Handlers(unittest.TestCase):
                 content_lines=content_lines,
                 platform=None,
                 contact_username=self.main_mod.CONTACT_USERNAME,
-                intent="neutral",
-                header_word=None,
-                listing_seed=lid,
                 post_number=pn,
                 source_text=None,
             )
@@ -5102,9 +5119,177 @@ class TestPhase5Handlers(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_add_row_captures_custom_emoji_and_stores_them(self):
+        """The ➕ Add Header row in the /headers list arms the capture (there is
+        no /addheader command); the admin's very next message (3 real custom
+        emoji, nothing else) is saved into the pool. The generic wizard
+        fallback must NOT also claim that message."""
+
+        async def _run():
+            self._add_destination()
+            await _dispatch_callback(self.bot, "headeradd", self.ADMIN)
+            # The callback path replaces the message it was tapped on, so the
+            # prompt lands in bot.sent rather than event.replies.
+            self.assertIn("custom emoji", next(m["text"] for m in self.bot.sent
+                                               if "custom emoji" in m["text"]))
+            self.assertEqual(self.admin_mod._wizard_state.get(self.ADMIN),
+                             {"step": "addheader"})
+
+            msg = _emoji_message("WTB", [("W", 9001), ("T", 9002), ("B", 9003)])
+            ev = await _dispatch_wizard(self.bot, "WTB", self.ADMIN, message=msg)
+            self.assertNotIn(self.ADMIN, self.admin_mod._wizard_state,
+                             "a consumed capture must disarm the wizard")
+            self.assertIn("saved", ev.replies[-1]["text"].lower())
+
+            saved = db.list_headers()
+            self.assertEqual(len(saved), 1)
+            self.assertEqual([p["doc_id"] for p in saved[0]["emoji"]],
+                             [9001, 9002, 9003])
+            self.assertEqual([p["alt"] for p in saved[0]["emoji"]], ["W", "T", "B"])
+            # No draft may be created by the generic wizard on the same message.
+            self.assertEqual(admin_mod_drafts(), {})
+
+        asyncio.run(_run())
+
+    def test_rejected_capture_offers_a_way_back(self):
+        """The Home keyboard no longer has a Headers button, so a refused
+        capture must still hand back a route out (➕ retry / 🏠 Home) instead of
+        stranding the admin on a dead-end error message."""
+
+        async def _run():
+            await _dispatch_callback(self.bot, "headeradd", self.ADMIN)
+            msg = _emoji_message("WT", [("W", 1), ("T", 2)])
+            ev = await _dispatch_wizard(self.bot, "WT", self.ADMIN, message=msg)
+            datas = [b.data.decode()
+                     for row in (ev.replies[-1].get("buttons") or [])
+                     for b in row]
+            self.assertIn("headeradd", datas)
+            self.assertIn("menu:home", datas)
+
+        asyncio.run(_run())
+
+    def test_capture_rejects_wrong_emoji_count(self):
+        """Two emoji is not a header: the bot says so and stores nothing."""
+
+        async def _run():
+            await _dispatch_callback(self.bot, "headeradd", self.ADMIN)
+            msg = _emoji_message("WT", [("W", 1), ("T", 2)])
+            ev = await _dispatch_wizard(self.bot, "WT", self.ADMIN, message=msg)
+            self.assertIn("exactly", ev.replies[-1]["text"])
+            self.assertIn("custom emoji", ev.replies[-1]["text"])
+            self.assertEqual(db.list_headers(), [])
+            self.assertNotIn(self.ADMIN, self.admin_mod._wizard_state)
+
+        asyncio.run(_run())
+
+    def test_capture_rejects_emoji_glued_to_other_text(self):
+        """Emoji plus a price must be refused, not silently half-saved."""
+
+        async def _run():
+            await _dispatch_callback(self.bot, "headeradd", self.ADMIN)
+            msg = _emoji_message("WTB $50 dm me",
+                                 [("W", 1), ("T", 2), ("B", 3)])
+            ev = await _dispatch_wizard(self.bot, "WTB $50 dm me", self.ADMIN, message=msg)
+            self.assertIn("other text", ev.replies[-1]["text"])
+            self.assertIn("$50 dm me", ev.replies[-1]["text"])
+            self.assertEqual(db.list_headers(), [])
+
+        asyncio.run(_run())
+
+    def test_headers_callback_deletes_and_relists(self):
+        """The 🗑 row removes exactly that header and redraws the list."""
+
+        async def _run():
+            keep = db.add_header([{"alt": a, "doc_id": 10 + i} for i, a in enumerate("WTB")])
+            doomed = db.add_header([{"alt": a, "doc_id": 20 + i} for i, a in enumerate("XYZ")])
+            ev = await _dispatch_callback(self.bot, f"delheader:{doomed}", self.ADMIN)
+            self.assertIsNone(db.get_header(doomed))
+            self.assertIsNotNone(db.get_header(keep))
+            self.assertEqual([h["id"] for h in db.list_headers()], [keep])
+            self.assertTrue(any("Deleted" in a for a in ev.answers), ev.answers)
+            # The redrawn menu is sent to the chat (the callback edits in place
+            # in the real bot, so the assertion is on what reached the chat).
+            card = next(m for m in self.bot.sent if "Deleted" in m["text"])
+            self.assertIn(f"delheader:{keep}".encode(), [b.data for row in card["buttons"] for b in row])
+            self.assertNotIn(f"delheader:{doomed}".encode(),
+                             [b.data for row in card["buttons"] for b in row])
+
+        asyncio.run(_run())
+
+    def test_headeradd_callback_arms_the_capture(self):
+        async def _run():
+            await _dispatch_callback(self.bot, "headeradd", self.ADMIN)
+            self.assertEqual(self.admin_mod._wizard_state.get(self.ADMIN),
+                             {"step": "addheader"})
+            self.assertIn("custom emoji", next(m["text"] for m in self.bot.sent
+                                               if "custom emoji" in m["text"]))
+
+        asyncio.run(_run())
+
+    def test_addheader_is_not_a_command(self):
+        """Adding goes through the ➕ row, so no handler should answer the
+        text /addheader — otherwise a removed command lingers as a half-working
+        duplicate entry point."""
+        import admin_bot
+
+        # Telethon stores NewMessage(pattern=...) as a bound .match method,
+        # so the way to ask "does this handler answer?" is to call it.
+        def _matches(filt, text):
+            pat = getattr(filt, "pattern", None)
+            if pat is None:
+                return False
+            try:
+                return pat(text) is not None
+            except Exception:
+                return False
+
+        matching = [fn.__name__ for filt, fn in self.bot.new_message_handlers()
+                    if _matches(filt, "/addheader")]
+        self.assertEqual(matching, [])
+        # …and it must not be advertised in the bot command menu either.
+        menu = [c for c, _ in admin_bot.BOT_MENU]
+        self.assertNotIn("addheader", menu)
+        self.assertIn("headers", menu)
+        # Every menu entry must still have a live handler behind it, so removing
+        # a command can never leave a dead row in Telegram's menu.
+        for cmd in menu:
+            self.assertTrue(
+                any(_matches(filt, f"/{cmd}") for filt, _ in self.bot.new_message_handlers()),
+                f"/{cmd} is in the bot menu but no handler answers it",
+            )
+
+    def test_header_is_sticky_across_preview_and_approve(self):
+        """The preview the admin sees must be the post that ships: both renders
+        go through the same pinned header."""
+
+        async def _run():
+            self._add_destination()
+            for d in (31, 32):
+                db.add_header([{"alt": a, "doc_id": d * 100 + i}
+                               for i, a in enumerate("WTB")])
+            lid = self._add_listing(status="pending_approval", text="WTS Bybit full $100")
+
+            await _dispatch_callback(self.bot, f"preview:{lid}", self.ADMIN)
+            preview = next(m["text"] for m in self.bot.sent
+                           if f"Preview of Listing #{lid}" in m["text"])
+            pinned = db.get_listing_by_id(lid)["header_id"]
+            self.assertIsNotNone(pinned, "preview must pin a header")
+            header = db.get_header(pinned)
+            self.assertEqual([p["doc_id"] for p in header["emoji"]], [3100, 3101, 3102]
+                             if pinned == 1 else [3200, 3201, 3202])
+
+            await _dispatch_callback(self.bot, f"approve:{lid}", self.ADMIN)
+            sent = self.user_client.sent[0]["text"]
+            self.assertEqual(db.get_listing_by_id(lid)["header_id"], pinned,
+                             "approve must reuse the preview's header, not repick")
+            # Same header line, same position, in both renders.
+            self.assertIn("WTB", preview)
+            self.assertIn("WTB", sent)
+            self.assertEqual(sent.split("\n")[1], "WTB")
+
+        asyncio.run(_run())
+
     def test_admin_wizard_cancel_drops_draft(self):
-        """Cancelling the edit wizard must ALSO drop the half-typed draft, so a
-        later Approve can never resurrect stale text (wizard-draft leak fix)."""
 
         async def _run():
             lid = self._add_listing(status="pending_approval", text="WTS Bybit full $100")
@@ -5564,6 +5749,275 @@ class TestPhase5Handlers(unittest.TestCase):
 def admin_mod_drafts():
     import admin_bot
     return admin_bot._drafts
+
+
+def _wtb_header(count=3, base=1000):
+    """A (alt, doc_id) header pool, e.g. [('W',1000),('T',1001),('B',1002)]."""
+    return [(chr(ord("W") + i), base + i) for i in range(count)]
+
+
+def _emoji_message(text, spans):
+    """A message object shaped like Telethon's: .text plus custom-emoji entities.
+
+    `spans` is a list of (alt, doc_id) in TEXT order. Offsets AND lengths are in
+    UTF-16 code units (Telegram's unit), NOT Python characters — an astral alt
+    such as a regional-indicator flag is a surrogate pair and so counts as 2.
+    """
+    from telethon.tl.types import MessageEntityCustomEmoji
+
+    def u16(s):
+        return len(s.encode("utf-16-le")) // 2
+
+    entities = []
+    char_cursor = 0
+    for alt, doc_id in spans:
+        found = text.index(alt, char_cursor)
+        entities.append(MessageEntityCustomEmoji(
+            offset=u16(text[:found]), length=u16(alt), document_id=doc_id,
+        ))
+        char_cursor = found + len(alt)
+    return _types.SimpleNamespace(text=text, entities=entities)
+
+
+class TestCustomEmojiHeaders(unittest.TestCase):
+    """The admin-managed custom-emoji header pool: persistence, the per-listing
+    random-but-sticky pick, the add-header capture flow, and /headers rendering."""
+
+    ADMIN = 777001
+
+    def setUp(self):
+        import admin_bot
+
+        self.admin_mod = admin_bot
+        self._seq = next(_P5_SEQ)
+        self._listing_n = 0
+        self._db_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), f"test_hdr_{self._seq}.db"
+        )
+        db.init_db(self._db_path)
+        self._old_default = db.DEFAULT_DB_PATH
+        self._old_admin_id = admin_bot.ADMIN_USER_ID
+        self._old_wizard = dict(admin_bot._wizard_state)
+        db.DEFAULT_DB_PATH = self._db_path
+        admin_bot.ADMIN_USER_ID = self.ADMIN
+        admin_bot._wizard_state.clear()
+
+    def tearDown(self):
+        import admin_bot
+        db.DEFAULT_DB_PATH = self._old_default
+        admin_bot.ADMIN_USER_ID = self._old_admin_id
+        admin_bot._wizard_state.clear()
+        admin_bot._wizard_state.update(self._old_wizard)
+        for suffix in ("", "-wal", "-shm"):
+            p = self._db_path + suffix
+            if os.path.exists(p):
+                os.remove(p)
+
+    def _new_listing(self):
+        # The fingerprint must be unique per listing: it is what db dedupes on,
+        # so reusing it would silently collapse every extra listing into the
+        # first one and make a "random pick per listing" test meaningless.
+        tag = f"h{self._seq}-{self._listing_n}"
+        self._listing_n += 1
+        return db.insert_listing(
+            self._new_supplier_id(tag),
+            9000 + self._seq * 1000 + self._listing_n,
+            game_name="Bybit",
+            rank_tier=None,
+            status="pending_approval",
+            raw_text="WTS Bybit full $100",
+            clean_text="Bybit full",
+            fingerprint=db.make_listing_fingerprint(tag, price=100.0),
+        )
+
+    def _new_supplier_id(self, name):
+        return db.add_supplier(f"@hdr_{name}_{self._seq}", channel_id=-1009900000 + self._seq)
+
+    # ---- storage ---------------------------------------------------------
+    def test_add_list_get_delete_header_roundtrip(self):
+        emoji = [{"alt": "W", "doc_id": 11}, {"alt": "T", "doc_id": 12},
+                 {"alt": "B", "doc_id": 13}]
+        hid = db.add_header(emoji)
+        self.assertIsInstance(hid, int)
+        self.assertEqual(db.count_headers(), 1)
+
+        got = db.get_header(hid)
+        self.assertEqual([p["doc_id"] for p in got["emoji"]], [11, 12, 13])
+        self.assertEqual([p["alt"] for p in got["emoji"]], ["W", "T", "B"])
+        self.assertEqual(len(db.list_headers()), 1)
+
+        db.delete_header(hid)
+        self.assertIsNone(db.get_header(hid))
+        self.assertEqual(db.count_headers(), 0)
+        self.assertEqual(db.list_headers(), [])
+
+    def test_headers_listed_in_sequential_id_order(self):
+        ids = [db.add_header([{"alt": a, "doc_id": d} for a, d in _wtb_header(base=2000 + n * 10)])
+               for n in range(3)]
+        listed = [h["id"] for h in db.list_headers()]
+        self.assertEqual(listed, sorted(ids))
+
+    def test_resolve_returns_none_when_pool_empty(self):
+        lid = self._new_listing()
+        self.assertIsNone(db.resolve_header_for_listing(lid))
+
+    # ---- the sticky pick -------------------------------------------------
+    def test_resolve_is_sticky_for_the_same_listing(self):
+        for d in (31, 32, 33):
+            db.add_header([{"alt": a, "doc_id": d * 10 + i} for i, a in
+                           enumerate("WTB")])
+        lid = self._new_listing()
+        first = db.resolve_header_for_listing(lid)
+        self.assertIsNotNone(first)
+        for _ in range(25):
+            self.assertEqual(db.resolve_header_for_listing(lid), first,
+                             "a listing must keep the header it was given")
+        self.assertEqual(db.get_listing_by_id(lid)["header_id"], first)
+
+    def test_resolve_covers_the_whole_pool_over_many_listings(self):
+        ids = {db.add_header([{"alt": a, "doc_id": 400 + n * 10 + i} for i, a in
+                              enumerate("WTB")]) for n in range(4)}
+        picked = {db.resolve_header_for_listing(self._new_listing())
+                  for _ in range(60)}
+        self.assertEqual(picked, ids, "every header in the pool should be reachable")
+
+    def test_resolve_repicks_when_the_pinned_header_was_deleted(self):
+        keep = db.add_header([{"alt": a, "doc_id": 501 + i} for i, a in enumerate("WTB")])
+        doomed = db.add_header([{"alt": a, "doc_id": 601 + i} for i, a in enumerate("XYZ")])
+        lid = self._new_listing()
+        with db.db_session() as conn:
+            conn.execute("UPDATE listings SET header_id = ? WHERE id = ?", (doomed, lid))
+        db.delete_header(doomed)
+        self.assertEqual(db.resolve_header_for_listing(lid), keep)
+
+    # ---- admin capture ---------------------------------------------------
+    def test_custom_emoji_spans_read_alt_and_doc_id_in_order(self):
+        import admin_bot
+        msg = _emoji_message("WTB", [("W", 11), ("T", 12), ("B", 13)])
+        self.assertEqual(
+            admin_bot._extract_custom_emoji(msg),
+            [{"alt": "W", "doc_id": 11}, {"alt": "T", "doc_id": 12},
+             {"alt": "B", "doc_id": 13}],
+        )
+
+    def test_custom_emoji_spans_ignore_plain_text_and_entities(self):
+        import admin_bot
+        from telethon.tl.types import MessageEntityBold
+        msg = _types.SimpleNamespace(
+            text="W bold T B",
+            entities=[MessageEntityBold(offset=2, length=4)],
+        )
+        self.assertEqual(admin_bot._extract_custom_emoji(msg), [])
+
+    def test_non_emoji_residue_flags_stray_text(self):
+        import admin_bot
+        msg = _emoji_message("WTB $99 dm me", [("W", 1), ("T", 2), ("B", 3)])
+        spans = admin_bot._custom_emoji_spans(msg)
+        self.assertEqual(admin_bot._non_emoji_residue(msg, spans), "$99 dm me")
+
+    def test_non_emoji_residue_allows_spaces_and_newlines(self):
+        import admin_bot
+        for text in ("WTB", "W T B", "W\nT\nB", "  W T B  "):
+            msg = _emoji_message(text, [("W", 1), ("T", 2), ("B", 3)])
+            spans = admin_bot._custom_emoji_spans(msg)
+            self.assertEqual(admin_bot._non_emoji_residue(msg, spans), "", text)
+
+    def test_non_emoji_residue_handles_multibyte_alt(self):
+        import admin_bot
+        flag = "\U0001F1EB\U0001F1E7"
+        msg = _emoji_message(flag + "TB", [(flag, 1), ("T", 2), ("B", 3)])
+        spans = admin_bot._custom_emoji_spans(msg)
+        self.assertEqual(len(spans), 3)
+        self.assertEqual(spans[0]["alt"], flag)
+        self.assertEqual(admin_bot._non_emoji_residue(msg, spans), "")
+
+    def test_headers_command_is_the_only_way_in(self):
+        """There is no /addheader and no home button: /headers plus its ➕ row is
+        the whole surface. The 🅰 Headers text route survives only so an old
+        keyboard cached on a client still lands somewhere useful."""
+        import admin_bot
+        self.assertEqual(admin_bot.HEADERS_BTN[0], "\U0001F170")
+        self.assertTrue(_re.search(admin_bot.HEADERS_ROUTE_RE, "/headers"))
+        self.assertTrue(_re.search(admin_bot.HEADERS_ROUTE_RE, admin_bot.HEADERS_BTN))
+        self.assertNotIn("/addheader", admin_bot._help_text())
+
+    # ---- rendering -------------------------------------------------------
+    def test_headers_menu_text_lists_saved_headers(self):
+        import admin_bot
+        db.add_header([{"alt": a, "doc_id": 700 + i} for i, a in enumerate("WTB")])
+        text = admin_bot._headers_menu_text(db.list_headers())
+        self.assertIn("1 header saved", text)
+        buttons = admin_bot._headers_buttons(db.list_headers())
+        datas = [b.data.decode() for row in buttons for b in row]
+        self.assertIn("delheader:1", datas)
+
+    def test_headers_menu_text_handles_empty_pool(self):
+        import admin_bot
+        text = admin_bot._headers_menu_text([])
+        self.assertIn("No headers saved", text)
+        self.assertIn("no header line", text)
+        # With nothing saved there is still a way in (the add button) and a way
+        # back, so the submenu is never a dead end.
+        datas = [b.data.decode() for row in admin_bot._headers_buttons([]) for b in row]
+        self.assertIn("headeradd", datas)
+
+    def test_header_buttons_are_not_on_the_home_screens(self):
+        """Headers are command-only: /headers reaches the screen, but neither
+        home keyboard advertises it. A stale client-side keyboard must not be
+        the only way in, and Home should not carry a rarely-used button."""
+        import admin_bot
+        reply_labels = [b.button.text for row in admin_bot._home_keyboard() for b in row]
+        inline_datas = [b.data.decode() for row in admin_bot._home_inline_keyboard()
+                        for b in row]
+        self.assertNotIn(admin_bot.HEADERS_BTN, reply_labels)
+        self.assertNotIn("home:headers", inline_datas)
+        # …and the other Home entries are all still there.
+        for label in ("⏳ Pending", "📋 Sources", "✅ Published", "🚫 Skipped",
+                      admin_bot.DESTINATIONS_BTN):
+            self.assertIn(label, reply_labels)
+        self.assertIn("home:pending", inline_datas)
+        # The command itself still works and is still registered in the bot menu.
+        self.assertTrue(_re.search(admin_bot.HEADERS_ROUTE_RE, "/headers"))
+
+    def test_headeradd_row_still_offered_inside_the_list(self):
+        """Removing the Home entry must not cost the admin the ability to add a
+        header or delete one from the /headers screen."""
+        import admin_bot
+        hid = db.add_header([{"alt": a, "doc_id": 900 + i} for i, a in enumerate("WTB")])
+        datas = [b.data.decode() for row in admin_bot._headers_buttons(db.list_headers())
+                 for b in row]
+        self.assertIn("headeradd", datas)
+        self.assertIn(f"delheader:{hid}", datas)
+        self.assertIn("menu:home", datas, "a way back to Home must remain")
+
+    def test_help_text_names_the_one_command(self):
+        """With no button to tap, /help has to be the thing that names /headers —
+        and must not advertise a command that no longer exists."""
+        import admin_bot
+        text = admin_bot._help_text()
+        self.assertIn("/headers", text)
+        self.assertNotIn("/addheader", text)
+        self.assertIn("➕", text, "help must say the Add row is how you add one")
+
+    def test_resolved_header_flows_into_a_rendered_post(self):
+        """End to end: a saved header is pinned, then rendered into the post
+        that actually goes out — same emoji the admin chose."""
+        import admin_bot
+        db.add_header([{"alt": a, "doc_id": 800 + i} for i, a in enumerate("WTB")])
+        lid = self._new_listing()
+        row = db.get_listing_by_id(lid)
+
+        async def _run():
+            return await admin_bot._header_emoji_for_listing(lid)
+
+        emoji = asyncio.run(_run())
+        self.assertEqual([d for _, d in emoji], [800, 801, 802])
+        out, entities = parser.build_ai_message(
+            content_lines=["Bybit full"], platform=row["platform_name"] or "Bybit",
+            contact_username="@buyer", header_emoji=emoji, post_number=1,
+        )
+        self.assertTrue(out.startswith("#1\nWTB\n\nBYBIT\n\n"), out)
+        self.assertEqual([e.document_id for e in entities][:3], [800, 801, 802])
 
 
 if __name__ == "__main__":

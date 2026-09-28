@@ -16,11 +16,11 @@ import countries
 # ---------------------------------------------------------------------------
 # Fixed custom-emoji document IDs (hardcoded, never fetched at runtime).
 # Countries use the centralized mapping in countries.COUNTRY_EMOJI.
+#
+# The header line has no hardcoded emoji: it is drawn from the pool of
+# admin-managed custom-emoji headers (see db.add_header / the /addheader
+# command), so those document ids live in the database, not here.
 # ---------------------------------------------------------------------------
-# Used as header decoration for the header line (buyer-framed, e.g. WTB)
-CE_FIRE       = 5375452661036358740   # 🔥 header
-# Used as header decoration for the header line
-CE_LIGHTNING  = 5404652296845936873   # ⚡ header
 # Used on price line
 CE_MONEYBAG   = 5384105916331202592   # 🤑 price
 # Used on order/contact line
@@ -28,8 +28,6 @@ CE_PHONE      = 5231197925178089666   # 📞 contact
 
 
 # Placeholder characters that get visually replaced by the entities above
-PH_FIRE   = "🔥"
-PH_LIGHT  = "⚡"
 PH_PRICE  = "🤑"
 PH_PHONE  = "📞"
 
@@ -63,21 +61,34 @@ def _utf16_len(s: str) -> int:
     return len(s.encode("utf-16-le")) // 2
 
 
-def _build_header(platform_display: str, mode_word: str,
-                  first_doc_id: int, second_doc_id: int) -> Tuple[str, list]:
-    """
-    '🔥 PLATFORM MODE 🔥\n' with both emoji replaced by custom emoji entities.
+def _build_custom_emoji_header(
+    emoji: List[Tuple[str, int]], cursor: int
+) -> Tuple[str, list]:
+    """Build the header line from admin-supplied custom emoji.
 
-    Offsets are derived from the *actual* UTF-16 length of the literal text that
-    precedes each emoji, so they can never drift.
+    ``emoji`` is a list of ``(alt, document_id)`` pairs in the order they should
+    appear (one entry per custom emoji, ``alt`` being the glyph Telegram wrote
+    into the message text for it). The rendered text is the alts concatenated
+    with no separators, and each one is wrapped in a MessageEntityCustomEmoji so
+    Telegram swaps in the real emoji.
+
+    ``cursor`` is the absolute UTF-16 offset the header starts at, so entities
+    come back already positioned for the whole post rather than local to this
+    substring. Returns ("", []) for an empty pool, which renders no header line
+    at all.
     """
-    body = f" {platform_display} {mode_word} "
-    text = f"{PH_FIRE}{body}{PH_FIRE}\n"
-    entities = [
-        _make_custom_emoji_entity(0, first_doc_id, PH_FIRE),
-        _make_custom_emoji_entity(_utf16_len(PH_FIRE) + _utf16_len(body), second_doc_id, PH_FIRE),
-    ]
-    return text, entities
+    if not emoji:
+        return "", []
+    text_parts: List[str] = []
+    entities: list = []
+    offset = cursor
+    for alt, document_id in emoji:
+        entities.append(_make_custom_emoji_entity(offset, document_id, alt))
+        text_parts.append(alt)
+        # Advance by this glyph's OWN utf-16 width, so a multi-code-unit alt
+        # (🔥=2, 🇵🇱=4) never desyncs the next entity from its text.
+        offset += _utf16_len(alt)
+    return "".join(text_parts) + "\n", entities
 
 
 # Regex to match prices in various international reseller formats:
@@ -99,38 +110,14 @@ def strip_all_emoji(text: str) -> str:
     return emoji.replace_emoji(text, replace="").strip()
 
 
-# Buyer-side header hint words (the channel is always the buyer).
-_BUYER_HINTS = re.compile(
-    r"\b(WTB|WANTED|WANT|BUY|BUYING|DM|FAST|PAY|PAYING|LOOKING|NEED|SEEKING|PURCHASE|PROCURE)\b",
-    re.IGNORECASE,
-)
-# Seller-side words that must never appear in our header.
-_SELLER_HINTS = re.compile(
-    r"\b(FOR SALE|SELLING|WTS|OFFER|OFFERING|IN STOCK|AVAILABLE|STOCK)\b",
-    re.IGNORECASE,
-)
+def build_header_line(emoji: List[Tuple[str, int]]) -> Tuple[str, list]:
+    """Render one header on its own, starting at offset 0.
 
-
-def sanitize_buyer_header(raw) -> Optional[str]:
-    """Validate an AI-suggested header tagline so it never reads as a seller.
-
-    The destination channel always acts as the BUYER, so any tagline implying
-    an offer for sale (FOR SALE, SELLING, WTS, OFFERING, AVAILABLE, IN STOCK)
-    is rejected and the caller falls back to the default buyer header. Returns
-    None when the tagline is missing, unsafe, or not buyer-framed, else a
-    cleaned emoji-free string.
+    The same builder the post shell uses, exposed so the admin bot can echo a
+    saved header back to the admin (with its real custom emoji attached) to prove
+    it renders. Returns ("", []) for an empty pool.
     """
-    if raw is None:
-        return None
-    text = re.sub(r"\s+", " ", (strip_all_emoji(str(raw)) or "").strip())
-    if not text:
-        return None
-    text = text[:40].rstrip()
-    if _SELLER_HINTS.search(text):
-        return None
-    if not _BUYER_HINTS.search(text):
-        return None
-    return text
+    return _build_custom_emoji_header(emoji, 0)
 
 
 def _parse_amount(raw: str) -> float:
@@ -339,9 +326,7 @@ def build_ai_message(
     content_lines: List[str],
     platform: Optional[str] = None,
     contact_username: Optional[str] = None,
-    intent: str = "sell",
-    header_word: Optional[str] = None,
-    listing_seed: int = 0,
+    header_emoji: Optional[List[Tuple[str, int]]] = None,
     post_number: Optional[int] = None,
     sanitize_body: bool = True,
     source_text: Optional[str] = None,
@@ -350,19 +335,23 @@ def build_ai_message(
     Build the final formatted post from AI-provided clean content lines.
 
     The AI already produced clean, emoji-free body text; this function only
-    wraps it in the fixed emoji shell (header / country lines / footer). Emoji
-    are allowed ONLY in the header, the country lines, and the footer
-    (price/contact lines) — the body is deliberately kept emoji-free. The
-    header emoji rotates between the fire and lightning pools, seeded by
-    listing_seed so the admin preview always matches the post that gets
-    published. When ``post_number`` is given, a small "#N" banner is
-    prepended so each post is individually referenceable.
+    wraps it in the fixed emoji shell (header / platform line / country lines /
+    footer). Emoji are allowed ONLY in the header, the country lines, and the
+    footer (price/contact lines) — the body is deliberately kept emoji-free.
+    When ``post_number`` is given, a small "#N" banner is prepended so each post
+    is individually referenceable.
 
-    The channel always reads as the BUYER: the header label is the AI-suggested
-    ``header_word`` when it is buyer-framed (see sanitize_buyer_header), else the
-    buyer default "WTB ✦ DM FAST". The footer always carries the static
-    "Price DM" line — prices are never computed, rendered, or used in
-    publishing decisions here.
+    The header is the admin's own custom emoji, supplied as ``header_emoji`` — a
+    list of ``(alt, document_id)`` pairs from the headers pool in the database
+    (see db.resolve_header_for_listing, which picks one at random per listing
+    and then keeps it, so the admin preview always matches what publishes). The
+    caller passes an already-resolved list, so this function stays a pure
+    formatter: with ``header_emoji`` empty or None NO header line is rendered at
+    all, which is what happens until the admin has added one.
+
+    The platform name is the first line of the body, on its own. The footer
+    always carries the static "Price DM" line — prices are never computed,
+    rendered, or used in publishing decisions here.
 
     Every country mentioned in the body is flagged on its OWN line where it
     appears: the country's real flag emoji (e.g. 🇵🇱 — the exact
@@ -388,10 +377,6 @@ def build_ai_message(
         lines = ["Available"]
 
     platform_display = platform.upper() if platform else "ACCOUNT"
-    header_word = sanitize_buyer_header(header_word) or "WTB ✦ DM FAST"
-    # Header emoji rotates between fire and lightning so posts don't all share
-    # one fixed decoration. Seeded deterministically per listing id (preview == published).
-    header_doc = CE_FIRE if listing_seed % 2 == 0 else CE_LIGHTNING
 
     parts: List[str] = []
     entities: list = []
@@ -403,20 +388,27 @@ def build_ai_message(
         parts.append(post_num_line)
         cursor += _utf16_len(post_num_line)
 
-    # ── Header line
-    # _build_header returns offsets LOCAL to the header substring; rebase them
-    # onto the absolute UTF-16 cursor so a preceding post-number banner (or any
-    # future prefix) can never shift the flame entities out of place.
-    header_text, header_entities = _build_header(
-        platform_display, header_word, header_doc, header_doc
+    # ── Header line: the admin's custom emoji, already positioned for the whole
+    # post because it is built against `cursor` (so a "#N" banner above can never
+    # shift an entity off its glyph). Empty pool -> no header line, no entities.
+    header_text, header_entities = _build_custom_emoji_header(
+        header_emoji or [], cursor
     )
-    for header_entity in header_entities:
-        header_entity.offset += cursor
     entities.extend(header_entities)
-    parts.append(header_text)
-    cursor += _utf16_len(header_text)
+    if header_text:
+        parts.append(header_text)
+        cursor += _utf16_len(header_text)
+        # ── Empty line separating the header from the body
+        parts.append("\n")
+        cursor += 1
 
-    # ── Empty line separating the header from the body
+    # ── Platform name: the first line of the body, on its own, so it reads as
+    # part of the post rather than as a generated banner. The AI is told to keep
+    # the platform out of `content`, so this never duplicates a body line.
+    parts.append(f"{platform_display}\n")
+    cursor += _utf16_len(platform_display) + 1
+
+    # ── Empty line separating the platform from the body
     parts.append("\n")
     cursor += 1
 

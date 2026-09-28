@@ -175,6 +175,47 @@ Message your bot directly on Telegram (only authorized for `ADMIN_USER_ID`):
 | `/status` | View today's stats (processed, published, skipped breakdown) | `/status` |
 | `/pending` | Review and approve ambiguous listings | `/pending` |
 | `/preview <id>` | Preview the formatted post before publishing | `/preview 15` |
+| `/headers` | Manage the pool of custom-emoji post headers (add, delete) | `/headers` |
+
+### Post Headers (custom emoji)
+
+Every post is built as:
+
+```
+#12
+WTB
+<blank>
+BYBIT
+<blank>
+<body lines>
+──────────
+🤑 Price  DM
+📞 Contact  : @yourhandle
+```
+
+The **header** is a line of exactly 3 Telegram **custom emoji** (no spaces) that you
+manage yourself — the AI does not write it and there is no built-in default.
+
+* **The one entry point:** `/headers`. It lists every saved header and echoes it with
+  its real emoji so you can check it renders. Tap 🗑 on a row to delete it, or ➕
+  **Add Header** to add another — the ➕ row then asks for the 3 custom emoji spelling
+  `WTB` as your very next message. They must be real *custom* emoji (the kind with a
+  document id), not ordinary ones. Spaces and line breaks between them are fine; any
+  other text (a price, a link, a sentence) is rejected rather than half-saved, and a
+  rejected capture hands you the ➕ row back so you can simply try again.
+
+  There is deliberately **no Headers button** on the Home screen and **no `/addheader`**
+  command — everything happens inside `/headers`, so Home stays a short list of the
+  things that get touched constantly and there is only one thing to remember.
+* **Random, but sticky:** when a listing is first rendered the bot picks one header
+  at random from the pool and pins it to that listing, so the preview you approve is
+  byte-for-byte the post that ships. Editing, retrying, or recovering a claim reuses
+  the same header; it is never re-rolled.
+* **No headers yet:** until you add one, posts go out with **no header line** at all —
+  the `#N` banner and the uppercase platform line still render normally.
+* Deleting a header does not rewrite history: already-published posts keep the emoji
+  they went out with, and a listing still pinned to a deleted header is re-pinned to
+  a remaining one (or to nothing) on its next render.
 
 ### Ambiguous Listing Approval Flow
 

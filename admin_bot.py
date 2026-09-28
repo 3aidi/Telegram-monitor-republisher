@@ -210,6 +210,30 @@ def _format_listing(n: int, l: dict) -> str:
     )
 
 
+async def _header_emoji_for_listing(listing_id: int) -> list:
+    """The listing's custom-emoji header as ``[(alt, document_id), ...]``.
+
+    Delegates to db.resolve_header_for_listing, which draws one at random from
+    the admin's pool the FIRST time a listing is rendered and pins it to the
+    listing. That is what makes a preview trustworthy: /preview, the 👁️ button
+    and the eventual publish all resolve to the same header. Returns [] while no
+    header is configured, which renders the post with no header line.
+
+    A first call performs a DB write (the pin), so it runs through
+    db.run_async like every other write from async code (db.py ASYNC-1).
+    """
+    def _resolve() -> list:
+        header_id = db.resolve_header_for_listing(listing_id)
+        if header_id is None:
+            return []
+        header = db.get_header(header_id)
+        if not header:
+            return []
+        return [(part["alt"], part["doc_id"]) for part in header["emoji"]]
+
+    return await db.run_async(_resolve)
+
+
 async def _build_preview_text(listing: dict) -> str:
     """Render the exact formatted post for a listing (used by /preview and 👁️ Preview button).
 
@@ -219,15 +243,12 @@ async def _build_preview_text(listing: dict) -> str:
     content_text = listing.get("clean_text") or listing.get("raw_text") or ""
     content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
     platform = listing.get("platform_name") or listing.get("game_name")
-    intent = listing.get("intent") or "neutral"
 
     preview_text, _ = parser.build_ai_message(
         content_lines=content_lines,
         platform=platform,
         contact_username=CONTACT_USERNAME,
-        intent=intent,
-        header_word=listing.get("header_word"),
-        listing_seed=listing["id"],
+        header_emoji=await _header_emoji_for_listing(listing["id"]),
         post_number=listing.get("post_number"),
         source_text=listing.get("raw_text"),
     )
@@ -425,6 +446,170 @@ DESTINATIONS_ROUTE_RE = (
     + DESTINATIONS_BTN_LEGACY
     + r")$"
 )
+
+# ---------------------------------------------------------------------------
+# Custom-emoji headers.
+#
+# The post header is a short run of custom emoji the admin supplies from this
+# bot (currently three, spelling WTB). Headers live in a pool: /headers manages
+# it, and each post draws one at random (see db.resolve_header_for_listing,
+# which pins the draw to the listing so the preview always matches what
+# publishes).
+# ---------------------------------------------------------------------------
+# Deliberately NOT on any home keyboard, and there is no /addheader: /headers is
+# the ONLY entry point, and the ➕ row inside that list is what arms the capture.
+# So the Home screen stays the short list of things that get touched constantly,
+# and adding a header never needs a command to be remembered.
+# The label is kept as a constant because the router still accepts it (a tap from
+# an old message, or a keyboard that was cached client-side before the button was
+# removed) and because the wizard menu-tap allowlist references it.
+HEADERS_BTN = "🅰 Headers"
+# Same pattern as Destinations: the label is shared by the router and the
+# allowlist, so a rename on one side can't silently break the other.
+HEADERS_ROUTE_RE = r"^(?:/headers|" + HEADERS_BTN + r")$"
+# Exactly how many custom emoji make up one header. Validated on capture so a
+# mis-sent message can never become a half-header.
+HEADER_EMOJI_COUNT = 3
+
+# The Menu button contents, as (command, description). Module-level so the list
+# is testable — the request below only runs at startup, which never happens in
+# tests, so an entry removed here would otherwise be invisible to them.
+# Keep in sync with the NewMessage handlers: listing a command here that has no
+# handler leaves a dead entry in Telegram's menu.
+BOT_MENU = [
+    ("status", " Today's stats report"),
+    ("pending", "Pending approval listings"),
+    ("skipped", "Recently skipped messages"),
+    ("sources", " Manage monitored sources"),
+    ("published", "Published posts & channel links"),
+    ("headers", " Manage the custom-emoji WTB headers"),
+    ("post", " Look up a post by its number: /post 12"),
+    ("help", " Show buttons and shortcuts"),
+]
+
+
+def _custom_emoji_spans(message) -> List[Dict[str, object]]:
+    """Every custom emoji in a message, in typed order, with its text span.
+
+    Each entry is ``{"alt", "doc_id", "start", "end"}`` where start/end are
+    BYTE offsets into the UTF-16-LE encoding of the message text (i.e. Telegram's
+    own unit x 2), which is the only unit custom-emoji entity offsets/lengths are
+    expressed in.
+
+    Telegram stores a custom emoji two ways in the same message: the glyph sits
+    in the message TEXT at the entity's span, and a MessageEntityCustomEmoji
+    points at the document that replaces it. The glyph is therefore read straight
+    out of the text, which is the same anchor assumption the country flags and the
+    price/contact emoji already rely on.
+
+    The alt cannot be fetched from the API instead: the reply type of
+    messages.getCustomEmojiDocuments is not part of Telethon 1.44's layer-227
+    schema, so a request for it cannot even be deserialized. Reading the text
+    avoids that entirely and needs no extra round trip.
+
+    Encoding to UTF-16-LE before slicing is what keeps a multi-code-unit alt
+    (a regional-indicator flag is 4 units, a flag sequence 14) intact rather than
+    being cut in half. Results are sorted by offset so the parts come back in the
+    order the admin typed them.
+    """
+    text = getattr(message, "text", None) or ""
+    if not text:
+        return []
+    from telethon.tl.types import MessageEntityCustomEmoji
+
+    utf16 = text.encode("utf-16-le")
+    found: List[Dict[str, object]] = []
+    for ent in getattr(message, "entities", None) or []:
+        if not isinstance(ent, MessageEntityCustomEmoji):
+            continue
+        start = int(ent.offset) * 2
+        end = start + int(ent.length) * 2
+        if start < 0 or end > len(utf16) or end <= start:
+            continue
+        try:
+            alt = utf16[start:end].decode("utf-16-le")
+        except UnicodeDecodeError:
+            continue
+        if not alt:
+            continue
+        found.append(
+            {"alt": alt, "doc_id": int(ent.document_id), "start": start, "end": end}
+        )
+    found.sort(key=lambda span: span["start"])
+    return found
+
+
+def _extract_custom_emoji(message) -> List[Dict[str, object]]:
+    """The custom emoji of a message as plain {"alt", "doc_id"} parts, in order."""
+    return [
+        {"alt": span["alt"], "doc_id": span["doc_id"]}
+        for span in _custom_emoji_spans(message)
+    ]
+
+
+def _non_emoji_residue(message, spans: List[Dict[str, object]]) -> str:
+    """Whatever text a message holds OUTSIDE its custom emoji, whitespace stripped.
+
+    Used to reject a header attempt that came with words, prices or links glued
+    to the emoji: the emoji alone is stored, so any other text would be silently
+    thrown away, and the admin would think it was saved. Returns "" when the
+    message is nothing but the custom emoji (spaces/newlines between them are
+    fine), otherwise a short truncated sample for the error message.
+    """
+    text = getattr(message, "text", None) or ""
+    if not text:
+        return ""
+    utf16 = text.encode("utf-16-le")
+    # Blank out each custom-emoji span, then decode what's left. The filler MUST
+    # itself be UTF-16 encoded: b" " is a single 0x20 byte, and two of them
+    # (0x20 0x20) decode as U+2020 rather than as whitespace, which would leave
+    # the emoji as mojibake in the error message. A single space character
+    # encodes to the 0x20 0x00 unit and keeps the stream aligned.
+    space_unit = " ".encode("utf-16-le")
+    buf = bytearray(utf16)
+    for span in spans:
+        width = int(span["end"]) - int(span["start"])
+        buf[span["start"]:span["end"]] = space_unit * (width // 2)
+    try:
+        residue = bytes(buf).decode("utf-16-le", errors="ignore")
+    except UnicodeDecodeError:
+        residue = ""
+    residue = re.sub(r"\s+", " ", residue).strip()
+    return residue[:60]
+
+
+def _headers_menu_text(headers: List[dict]) -> str:
+    """Caption for the header list. Empty state points at the Add row below it."""
+    if not headers:
+        return (
+            "No headers saved yet — posts are going out with **no header line**.\n\n"
+            f"Tap **➕ Add Header** below, then send the {HEADER_EMOJI_COUNT} custom emoji "
+            "of **WTB**. Every header you add joins the pool and posts pick one at random."
+        )
+    return (
+        f"**{len(headers)} header{'s' if len(headers) != 1 else ''} saved** — one is "
+        f"picked at random for each post.\nEach row below echoes the real custom emoji "
+        f"so you can check it renders. 🗑 deletes that header."
+    )
+
+
+def _headers_buttons(headers: List[dict]) -> List[List[object]]:
+    """One 🗑 row per header, then Add, then the standard Home row.
+
+    Also the footer for every capture-failure prompt: the Home keyboard no longer
+    carries a Headers button, so without these rows a rejected capture would
+    strand the admin with no way back to the list or to a retry.
+    """
+    buttons: List[List[object]] = []
+    for h in headers:
+        # Label by the header's own text (the alt glyphs, e.g. "WTB") so the row is
+        # recognisable, with the id for the admin to refer to it by.
+        buttons.append([
+            Button.inline(f"🗑 #{h['id']} — {h.get('text') or '?'}", data=f"delheader:{h['id']}")
+        ])
+    buttons.append([Button.inline("➕ Add Header", data="headeradd")])
+    buttons.extend(_home_button_row())
+    return buttons
 
 
 def _home_keyboard() -> List[List[object]]:
@@ -1241,7 +1426,9 @@ def _help_text() -> str:
         "• ** /post 12** — jump straight to post #12\n"
         "• **⏸ All Stop / ▶ All Start** — pause or resume AUTOMATIC publishing only. "
         "Manual Approve taps still publish immediately.\n\n"
-        "Slash shortcuts still work if you prefer typing them."
+        "Slash shortcuts still work if you prefer typing them. The one feature with\n"
+        "no button is headers: `/headers` opens the list, and the ➕ row in there is\n"
+        "how you add one."
     )
 
 
@@ -1519,6 +1706,17 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 buttons=_sources_buttons(suppliers),
                 parse_mode=None,
             )
+
+    @bot.on(events.NewMessage(pattern=HEADERS_ROUTE_RE))
+    async def handle_headers(event):
+        if not await check_admin(event):
+            return
+        headers = db.list_headers()
+        await event.reply(
+            _headers_menu_text(headers),
+            buttons=_headers_buttons(headers),
+            parse_mode="markdown",
+        )
 
     @bot.on(events.NewMessage(pattern=r"^(?:/pause|/resume|⏸ All Stop|▶ All Start)$"))
     async def handle_pause_toggle(event):
@@ -1839,6 +2037,68 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             text = _destinations_menu_text(destinations)
             await _message_delete_send(
                 event, text, buttons=_destinations_buttons(destinations), parse_mode=None
+            )
+            return
+
+        # ---- Custom-emoji headers -------------------------------------------
+        # "headeradd" is the ➕ row inside the /headers list. "home:headers" has
+        # no button any more, but old messages still carry it and it costs
+        # nothing to keep honouring them.
+        if data_str in ("home:headers", "headeradd"):
+            await event.answer(f"🅰 {HEADERS_BTN}")
+            headers = db.list_headers()
+            if data_str == "headeradd":
+                _wizard_state[ADMIN_USER_ID] = {"step": "addheader"}
+                await _message_delete_send(
+                    event,
+                    f"🅰 **Add a header** — send the {HEADER_EMOJI_COUNT} custom emoji "
+                    "that spell **WTB**, in one message, now.\n\n"
+                    "They must be Telegram **custom emoji**, not ordinary ones — I read "
+                    "their document ids so posts reuse the exact same emoji. Spaces and "
+                    "line breaks are fine; no other text.",
+                    buttons=_home_keyboard(),
+                    parse_mode="markdown",
+                )
+                return
+            await _message_delete_send(
+                event, _headers_menu_text(headers), buttons=_headers_buttons(headers)
+            )
+            # Echo each header as real custom emoji so the admin can see it renders.
+            for header in headers:
+                text, entities = parser.build_header_line(
+                    [(p["alt"], p["doc_id"]) for p in header["emoji"]]
+                )
+                try:
+                    await event.client.send_message(
+                        event.chat_id, text, formatting_entities=entities
+                    )
+                except Exception:
+                    logger.exception("Could not echo header #%s", header["id"])
+            return
+
+        m = re.match(r"^delheader:(\d+)$", data_str)
+        if m:
+            header_id = int(m.group(1))
+            header = db.get_header(header_id)
+            if header is None:
+                await event.answer("That header is already gone.", alert=True)
+            else:
+                await db.run_async(db.delete_header, header_id)
+                logger.info("Deleted header #%s", header_id)
+                await event.answer(f"🗑 Deleted header #{header_id}")
+                await db.run_async(
+                    db.record_audit,
+                    "header_deleted",
+                    None,
+                    actor_id=event.sender_id,
+                    detail=f"header #{header_id}",
+                )
+            headers = db.list_headers()
+            await _message_delete_send(
+                event,
+                f"🗑 Deleted **header #{header_id}**.\n\n" + _headers_menu_text(headers),
+                buttons=_headers_buttons(headers),
+                parse_mode="markdown",
             )
             return
 
@@ -2484,7 +2744,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             content_text = draft or listing.get("clean_text") or listing.get("raw_text") or ""
             content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
             platform_name = listing.get("platform_name") or listing.get("game_name")
-            intent = listing.get("intent") or "neutral"
 
             await event.answer("Processing...")
             # Approve is a deliberate one-at-a-time human decision: it always
@@ -2502,9 +2761,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 content_lines=content_lines,
                 platform=platform_name,
                 contact_username=CONTACT_USERNAME,
-                intent=intent,
-                header_word=listing.get("header_word"),
-                listing_seed=listing_id,
+                header_emoji=await _header_emoji_for_listing(listing_id),
                 post_number=post_number,
                 source_text=listing.get("raw_text"),
             )
@@ -2719,6 +2976,97 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await _advance_review(bot)
 
     @bot.on(events.NewMessage())
+    async def handle_header_capture(event):
+        """Capture the admin's custom emoji as a new header.
+
+        Armed by the ➕ Add Header row in the /headers list (the "addheader" step
+        name is the internal state key, not a command — there is no /addheader).
+
+        Registered ABOVE the generic wizard fallback on purpose: Telethon calls
+        EVERY matching handler in registration order rather than stopping at the
+        first, so this must claim the message before handle_wizard_input can
+        interpret it. Claiming = popping the wizard state, which makes the
+        fallback's `if not state: return` bail out on the very same message.
+
+        On any validation failure the state is ALSO popped: a mis-sent message
+        must not leave the bot silently waiting for the next one, which the admin
+        may have intended as something else entirely. Each rejection still ships
+        the header-list buttons so there is always a way back or a retry.
+        """
+        if not await check_admin(event):
+            return
+        state = _wizard_state.get(ADMIN_USER_ID)
+        if not state or state.get("step") != "addheader":
+            return
+        # Consumed regardless of the outcome — see the docstring.
+        _wizard_state.pop(ADMIN_USER_ID, None)
+
+        message = getattr(event, "message", None)
+        spans = _custom_emoji_spans(message)
+        # Footer for every rejection below: ➕ re-arms the capture, 🏠 gets out.
+        retry_buttons = _headers_buttons(db.list_headers())
+        if not spans:
+            await event.reply(
+                "❌ I found no **custom emoji** in that message.\n\n"
+                "Send the emoji themselves (from Telegram's custom-emoji picker), "
+                "not a forwarded message and not plain text — I need their document "
+                "ids to reuse the exact same emoji in your posts.",
+                buttons=retry_buttons,
+                parse_mode="markdown",
+            )
+            return
+        if len(spans) != HEADER_EMOJI_COUNT:
+            await event.reply(
+                f"❌ That message has **{len(spans)}** custom emoji — a header needs "
+                f"exactly **{HEADER_EMOJI_COUNT}**.\n"
+                f"Send {HEADER_EMOJI_COUNT} of them spelling **WTB**, and nothing else.",
+                buttons=retry_buttons,
+                parse_mode="markdown",
+            )
+            return
+        # Any other text means this wasn't a bare header attempt (a pasted
+        # sentence, a price, a link). Refuse rather than silently dropping it.
+        stray = _non_emoji_residue(message, spans)
+        if stray:
+            await event.reply(
+                f"❌ Your message also contained other text (`{stray}`).\n\n"
+                f"Send **only** the {HEADER_EMOJI_COUNT} custom emoji — spaces and line "
+                "breaks are fine, but no words, prices or links.",
+                buttons=retry_buttons,
+                parse_mode="markdown",
+            )
+            return
+
+        emoji = [{"alt": s["alt"], "doc_id": s["doc_id"]} for s in spans]
+        try:
+            header_id = await db.run_async(db.add_header, emoji)
+        except Exception:
+            logger.exception("Failed to save a custom-emoji header")
+            await event.reply(
+                "❌ Could not save that header. Nothing was changed — try again.",
+                buttons=retry_buttons,
+            )
+            return
+
+        logger.info(
+            "Saved header #%s: %s", header_id, "".join(p["alt"] for p in emoji)
+        )
+        await db.run_async(
+            db.record_audit,
+            "header_added",
+            None,
+            actor_id=ADMIN_USER_ID,
+            detail=f"header #{header_id} ({len(emoji)} emoji)",
+        )
+        saved = db.list_headers()
+        await event.reply(
+            f"✅ Saved as **header #{header_id}** ({len(saved)} in the pool now).\n"
+            "Every new post picks one of them at random.",
+            buttons=_headers_buttons(saved),
+            parse_mode="markdown",
+        )
+
+    @bot.on(events.NewMessage())
     async def handle_wizard_input(event):
         """Fallback: complete the Add Source wizard by plain-text reply
         or by forwarding a message from the channel."""
@@ -2747,10 +3095,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         text = text.strip()
         if text.startswith("/"):
             return
-        # Menu taps must not be swallowed while a wizard is waiting
+        # Menu taps must not be swallowed while a wizard is waiting.
+        # HEADERS_BTN is still listed even though no button carries it any more:
+        # it costs nothing, and if the label is ever re-added to a keyboard the
+        # allowlist must already be covering it.
         if text in ("📊 Status", "⏳ Pending", "📋 Sources", DESTINATIONS_BTN,
                     "⏸ All Stop", "▶ All Start", "❓ Help", "✅ Published",
-                    "💤 I'm Asleep", "☀️ I'm Awake"):
+                    "💤 I'm Asleep", "☀️ I'm Awake", HEADERS_BTN):
             _wizard_state.pop(ADMIN_USER_ID, None)
             return
 
@@ -2862,15 +3213,7 @@ async def create_admin_bot_client() -> TelegramClient:
         await bot(SetBotCommandsRequest(
             scope=BotCommandScopeDefault(),
             lang_code="",
-            commands=[
-                BotCommand(command="status", description=" Today's stats report"),
-                BotCommand(command="pending", description="Pending approval listings"),
-                BotCommand(command="skipped", description="Recently skipped messages"),
-                BotCommand(command="sources", description=" Manage monitored sources"),
-                BotCommand(command="published", description="Published posts & channel links"),
-                BotCommand(command="post", description=" Look up a post by its number: /post 12"),
-                BotCommand(command="help", description=" Show buttons and shortcuts"),
-            ]
+            commands=[BotCommand(command=c, description=d) for c, d in BOT_MENU],
         ))
     except Exception as e:
         logger.warning("Could not set bot commands menu: %s", e)
