@@ -297,6 +297,37 @@ def prepare_body(
     return lines, ok
 
 
+def body_mentions_platform(lines: List[str], platform: Optional[str]) -> bool:
+    """True when any body line already names the platform.
+
+    The post shell no longer prints its own platform line, so the body is the
+    single source of truth for the brand. This guard backs that up: if the body
+    never says the platform, ``build_ai_message`` prints it as its own line so
+    the brand is never lost.
+
+    Matching is case-insensitive and word-boundary anchored on BOTH sides, so
+    "netflix" does not match "netflixing" or "un-netflixed". A bare
+    substring test would be wrong in both directions: it would suppress the
+    platform line for an unrelated brand that merely contains the token, and
+    print a half-duplicate when the body spells the platform with different
+    punctuation ("safe 2 transact").
+    """
+    if not platform:
+        return False
+    token = re.sub(r"[^0-9a-z]+", "", platform.lower())
+    if not token:
+        return False
+    for line in lines:
+        if not line:
+            continue
+        # Collapse the same non-alphanumerics out of the line, then look for the
+        # token only where it is a whole word.
+        squashed = re.sub(r"[^0-9a-z]+", " ", line.lower())
+        if re.search(rf"(?<![0-9a-z]){re.escape(token)}(?![0-9a-z])", squashed):
+            return True
+    return False
+
+
 def _asleep_footer_line() -> Optional[str]:
     """Return the buyer-asleep footer line, or None when the toggle is OFF.
 
@@ -335,8 +366,8 @@ def build_ai_message(
     Build the final formatted post from AI-provided clean content lines.
 
     The AI already produced clean, emoji-free body text; this function only
-    wraps it in the fixed emoji shell (header / platform line / country lines /
-    footer). Emoji are allowed ONLY in the header, the country lines, and the
+    wraps it in the fixed emoji shell (header / country lines / footer).
+    Emoji are allowed ONLY in the header, the country lines, and the
     footer (price/contact lines) — the body is deliberately kept emoji-free.
     When ``post_number`` is given, a small "#N" banner is prepended so each post
     is individually referenceable.
@@ -349,9 +380,13 @@ def build_ai_message(
     formatter: with ``header_emoji`` empty or None NO header line is rendered at
     all, which is what happens until the admin has added one.
 
-    The platform name is the first line of the body, on its own. The footer
-    always carries the static "Price DM" line — prices are never computed,
-    rendered, or used in publishing decisions here.
+    The platform name is owned by the BODY, not by this shell: the AI is told to
+    open the body with the platform name, so no separate platform line is
+    rendered and the brand never appears twice. Only when the body does not
+    mention the platform anywhere (see body_mentions_platform) is the platform
+    printed as its own line above the body, so the brand is never lost. The
+    footer always carries the static "Price DM" line — prices are never
+    computed, rendered, or used in publishing decisions here.
 
     Every country mentioned in the body is flagged on its OWN line where it
     appears: the country's real flag emoji (e.g. 🇵🇱 — the exact
@@ -376,7 +411,13 @@ def build_ai_message(
     if not lines:
         lines = ["Available"]
 
+    # ── The platform is NOT printed as its own line. The AI is told to open the
+    # body with the platform name (see ai_rephraser.ANALYZE_PROMPT), so the body
+    # is the single source of truth and the brand can never appear twice. The
+    # fallback below only fires when the body genuinely does not name the
+    # platform anywhere, so the brand is never lost either.
     platform_display = platform.upper() if platform else "ACCOUNT"
+    show_platform_line = not body_mentions_platform(lines, platform)
 
     parts: List[str] = []
     entities: list = []
@@ -402,15 +443,13 @@ def build_ai_message(
         parts.append("\n")
         cursor += 1
 
-    # ── Platform name: the first line of the body, on its own, so it reads as
-    # part of the post rather than as a generated banner. The AI is told to keep
-    # the platform out of `content`, so this never duplicates a body line.
-    parts.append(f"{platform_display}\n")
-    cursor += _utf16_len(platform_display) + 1
-
-    # ── Empty line separating the platform from the body
-    parts.append("\n")
-    cursor += 1
+    # ── Platform fallback: only when the body never names the platform, so a
+    # listing that already leads with the brand never shows it twice. It sits
+    # directly above the body with no extra blank line, so the post keeps a
+    # single blank line (the one under the header) in every layout.
+    if show_platform_line:
+        parts.append(f"{platform_display}\n")
+        cursor += _utf16_len(platform_display) + 1
 
     # ── Content lines (emoji-free body: emoji allowed only in header/footer).
     # Country flags are attached HERE, after sanitization: a body line that

@@ -113,7 +113,10 @@ class TestMonitorSystem(unittest.TestCase):
                 contact_username="@buyer",
                 source_text=source,
             )
-            self.assertIn("TUYO", msg, f"platform line missing for {source}")
+            # The body already names the platform, so no platform line is added;
+            # the brand is still present exactly once.
+            self.assertEqual(msg.lower().count("tuyo"), 1,
+                             f"platform missing or duplicated for {source}")
             self.assertIn("🤑 Price  DM", msg, f"static price footer missing for {source}")
             leaked = re.findall(r"\$\s?\d|€|\b(?:USD|USDT|EUR)\b", msg)
             self.assertEqual(leaked, [], f"numeric price leaked in output for {source}: {msg!r}")
@@ -2645,7 +2648,7 @@ class TestMonitorSystem(unittest.TestCase):
             header_emoji=[("W", 11), ("T", 12), ("B", 13)],
             post_number=1,
         )
-        self.assertTrue(out.startswith("#1\nWTB\n\nIKUALO\n\n"), out)
+        self.assertTrue(out.startswith("#1\nWTB\n\nIKUALO\n"), out)
         # A body line mentioning a country carries that country's flag on the
         # SAME line — the real alt emoji, anchored post-sanitization.
         self.assertIn("\nSpain region  🇪🇸\n", out)
@@ -2715,7 +2718,7 @@ class TestMonitorSystem(unittest.TestCase):
 
     def test_build_ai_message_renders_configured_custom_emoji_header(self):
         """The admin's header is emitted verbatim, with no spaces and real
-        custom-emoji entities, above the platform line."""
+        custom-emoji entities, above the body."""
         out, entities = parser.build_ai_message(
             content_lines=["Need curve pay"], platform="curve", contact_username="@buyer",
             header_emoji=[("W", 1111), ("T", 2222), ("B", 3333)],
@@ -2729,12 +2732,13 @@ class TestMonitorSystem(unittest.TestCase):
         lines = out.split("\n")
         self.assertEqual(lines[0], "#1", "the post number stays the very first line")
         self.assertEqual(lines[1], "WTB", "header sits on its own line, no spaces")
-        self.assertEqual(lines[3], "CURVE", "platform is the first line of the body")
+        # The body already names the platform, so no platform line is added.
+        self.assertEqual(lines[3], "Need curve pay", "the body leads with the platform")
         self.assertNotIn("FOR SALE", out)
 
     def test_build_ai_message_no_header_when_pool_empty(self):
         """With no configured header there is no header line at all — no
-        placeholder, no default, and the platform still leads the body."""
+        placeholder, no default, and the body still carries the platform."""
         out, _ = parser.build_ai_message(
             content_lines=["Need curve pay"], platform="curve", contact_username="@buyer",
             post_number=1,
@@ -2743,8 +2747,61 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertNotIn("WANTED", out)
         lines = out.split("\n")
         self.assertEqual(lines[0], "#1")
-        self.assertEqual(lines[1], "CURVE")
+        self.assertEqual(lines[1], "Need curve pay")
         self.assertNotIn("WTB", out)
+
+    def test_build_ai_message_platform_line_not_duplicated_in_body(self):
+        """The body owns the platform name. When the body already says the
+        platform — on the first line OR any later line — the shell adds no
+        platform line, so the brand appears exactly once."""
+        cases = [
+            (["Netflix account", "Need 3"], "netflix"),
+            # Platform named only on the THIRD line: still no platform line.
+            (["Need 3", "Delivery today", "Bybit account"], "bybit"),
+        ]
+        for content, platform in cases:
+            out, _ = parser.build_ai_message(
+                content_lines=content, platform=platform,
+                contact_username="@buyer", post_number=1,
+                header_emoji=[("W", 1), ("T", 2), ("B", 3)],
+            )
+            self.assertNotIn(platform.upper() + "\n", out,
+                             f"platform line must not be re-printed for {content!r}")
+            self.assertEqual(out.lower().count(platform), 1,
+                             f"brand must appear exactly once for {content!r}")
+
+    def test_build_ai_message_platform_fallback_when_body_omits_it(self):
+        """When the body never names the platform, the shell prints it so the
+        brand is never lost — with no extra blank line above the body."""
+        out, _ = parser.build_ai_message(
+            content_lines=["Need 3", "Delivery today", "Payment after escrow"],
+            platform="bybit", contact_username="@buyer", post_number=1,
+        )
+        self.assertTrue(out.startswith("#1\nBYBIT\n"), out)
+
+    def test_body_mentions_platform_word_boundaries(self):
+        """The guard is word-anchored and case-insensitive, so a brand that
+        merely CONTAINS the token does not count as a mention."""
+        self.assertTrue(parser.body_mentions_platform(["Safe2transact gmail"], "safe2transact"))
+        self.assertTrue(parser.body_mentions_platform(["SAFE2TRANSACT GMAIL"], "safe2transact"))
+        self.assertFalse(parser.body_mentions_platform(["netflixing subs"], "netflix"))
+        self.assertFalse(parser.body_mentions_platform(["unsafetransact pool"], "safetransact"))
+        self.assertFalse(parser.body_mentions_platform(["any account"], None))
+        self.assertFalse(parser.body_mentions_platform(["any account"], ""))
+
+    def test_build_ai_message_keeps_single_blank_line_layout(self):
+        """Exactly one blank line separates the header from the body, whether or
+        not the platform fallback line is present."""
+        for content, platform in (
+            (["Netflix account", "Need 3"], "netflix"),   # no platform line
+            (["Need 3", "Payment after escrow"], "bybit"),  # platform line
+        ):
+            out, _ = parser.build_ai_message(
+                content_lines=content, platform=platform, contact_username="@buyer",
+                post_number=1, header_emoji=[("W", 1), ("T", 2), ("B", 3)],
+            )
+            self.assertNotIn("\n\n\n", out, f"too many blank lines for {content!r}")
+            self.assertIn("WTB\n\n", out, f"header/body gap missing for {content!r}")
 
     def test_build_ai_message_header_entity_offsets_are_utf16(self):
         """Header entity offsets are UTF-16 code units, so a multi-unit alt
@@ -6016,7 +6073,8 @@ class TestCustomEmojiHeaders(unittest.TestCase):
             content_lines=["Bybit full"], platform=row["platform_name"] or "Bybit",
             contact_username="@buyer", header_emoji=emoji, post_number=1,
         )
-        self.assertTrue(out.startswith("#1\nWTB\n\nBYBIT\n\n"), out)
+        # The body already names the platform, so no platform line is added.
+        self.assertTrue(out.startswith("#1\nWTB\n\nBybit full\n"), out)
         self.assertEqual([e.document_id for e in entities][:3], [800, 801, 802])
 
 

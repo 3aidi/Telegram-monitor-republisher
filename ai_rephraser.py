@@ -106,7 +106,7 @@ Additionally you MUST:
 
 After all analysis, CONDENSE the listing body into its ESSENTIAL FACTS. Do NOT rewrite it
 into creative marketing copy — the system republishes your content lines VERBATIM and always
-adds the platform line, price line, and contact line by itself.
+adds the price line and contact line by itself.
 - Keep the body SIMPLE and as close to the source as possible, using the source's OWN wording.
 - Include ONLY the important body facts, in the order the source posted them: the app/product
   name, country/region, account type, and the conditions/terms (KYC, fresh data, payment or
@@ -116,10 +116,12 @@ adds the platform line, price line, and contact line by itself.
   summarize list items; keep each item one line (or keep the source's own separators).
 - Cut only: emoji, hashtags, repeated banners, price amounts like "PRICE $XX" (the system adds
   the price line), and @usernames / t.me / contact links.
-- The PLATFORM NAME IS NEVER part of "content": the system prints it on its own line above
-  your body from the "platform" field. So do not open a content line with the app name and do
-  not add a line that is only the app name ("Netflix", "NETFLIX") — it would show up twice.
-  Do the same for any standalone banner/hashtag the source used for the app name.
+- The PLATFORM NAME IS THE FIRST LINE OF YOUR BODY. The system no longer prints a platform
+  line of its own, so the body is the only place the brand appears. OPEN the content with the
+  app/service name, then the rest of the facts, exactly as the source worded them: e.g.
+  "Netflix account" as line one, NOT a bare "Netflix" banner line and not a line like
+  "Account needed" with the name missing. Never repeat the app name again further down, and do
+  not restate a standalone banner/hashtag the source used for the app name.
 - HARD INVARIANTS — the system NEVER shows a price or a contact in the body, and it re-checks
   your output line-by-line. Therefore in the "content" lines you MUST NOT emit ANY of these,
   EVER: (a) mention of a price, amount, budget, cost, "$", "€", "USD", "USDT", dollars/euros or

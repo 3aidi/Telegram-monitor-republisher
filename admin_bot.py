@@ -582,9 +582,8 @@ def _headers_menu_text(headers: List[dict]) -> str:
     """Caption for the header list. Empty state points at the Add row below it."""
     if not headers:
         return (
-            "No headers saved yet — posts are going out with **no header line**.\n\n"
-            f"Tap **➕ Add Header** below, then send the {HEADER_EMOJI_COUNT} custom emoji "
-            "of **WTB**. Every header you add joins the pool and posts pick one at random."
+            "No headers saved yet .\n"
+            f"Tap **➕ Add Header \n send the {HEADER_EMOJI_COUNT} custom emoji "
         )
     return (
         f"**{len(headers)} header{'s' if len(headers) != 1 else ''} saved** — one is "
@@ -2051,12 +2050,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 _wizard_state[ADMIN_USER_ID] = {"step": "addheader"}
                 await _message_delete_send(
                     event,
-                    f"🅰 **Add a header** — send the {HEADER_EMOJI_COUNT} custom emoji "
-                    "that spell **WTB**, in one message, now.\n\n"
-                    "They must be Telegram **custom emoji**, not ordinary ones — I read "
-                    "their document ids so posts reuse the exact same emoji. Spaces and "
-                    "line breaks are fine; no other text.",
-                    buttons=_home_keyboard(),
+                    f"Send the {HEADER_EMOJI_COUNT} custom emoji "
+                    "in one message.\n",
                     parse_mode="markdown",
                 )
                 return
@@ -3060,8 +3055,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         )
         saved = db.list_headers()
         await event.reply(
-            f"✅ Saved as **header #{header_id}** ({len(saved)} in the pool now).\n"
-            "Every new post picks one of them at random.",
+            f"✅ Saved as **header #{len(saved)}**.\n"
+            "Press the header to delete",
             buttons=_headers_buttons(saved),
             parse_mode="markdown",
         )
