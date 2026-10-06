@@ -10,6 +10,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
