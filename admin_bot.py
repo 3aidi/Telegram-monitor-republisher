@@ -6,11 +6,10 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
-from telethon.tl.types import PeerChannel, PeerChat
 
 import db
 import parser
@@ -70,12 +69,19 @@ def listing_is_editable(status: str) -> bool:
 
 # Global reference to user_client if running unified under main.py
 user_client_ref: Optional[TelegramClient] = None
+forward_client_ref: Optional[TelegramClient] = None
 
 
 def set_user_client(client: TelegramClient) -> None:
     """Set reference to the Telethon user client for immediate publishing on approval."""
     global user_client_ref
     user_client_ref = client
+
+
+def set_forward_client(client: TelegramClient) -> None:
+    """Set reference to the forward-dedicated Telethon client."""
+    global forward_client_ref
+    forward_client_ref = client
 
 
 async def send_approval_prompt(
@@ -1255,6 +1261,26 @@ async def _edit_destination_menu(event, d: dict) -> None:
     )
 
 
+async def _resolve_destination_peer(target) -> Optional[object]:
+    """Resolve a destination chat entity using forward_client_ref or user_client_ref."""
+    clients = []
+    if forward_client_ref and forward_client_ref.is_connected():
+        clients.append(forward_client_ref)
+    if user_client_ref and user_client_ref.is_connected() and user_client_ref not in clients:
+        clients.append(user_client_ref)
+
+    for cl in clients:
+        try:
+            return await cl.get_entity(target)
+        except Exception:
+            try:
+                await cl.get_dialogs(limit=100)
+                return await cl.get_entity(target)
+            except Exception:
+                pass
+    return None
+
+
 async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
     """Resolve-first, then-persist add flow used by /adddestination and the wizard.
 
@@ -1274,16 +1300,7 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             )
             return
         chat_ref = db.normalize_channel_id(raw_chat_id)
-        entity = None
-        if user_client_ref and user_client_ref.is_connected():
-            try:
-                entity = await user_client_ref.get_entity(chat_ref)
-            except Exception:
-                try:
-                    await user_client_ref.get_dialogs(limit=50)
-                    entity = await user_client_ref.get_entity(chat_ref)
-                except Exception:
-                    entity = None
+        entity = await _resolve_destination_peer(chat_ref)
         display = _entity_display(entity, fallback=f"chat {chat_ref}")
         await db.run_async(db.add_destination, chat_ref, display, True)
         await db.run_async(
@@ -1312,18 +1329,8 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
         )
         return
 
-    entity = None
-    if user_client_ref and user_client_ref.is_connected():
-        reference = int(numeric) if numeric is not None else (username or raw_text)
-        try:
-            entity = await user_client_ref.get_entity(reference)
-        except Exception as exc:
-            logger.warning("Could not resolve destination reference %r: %s", reference, exc)
-            try:
-                await user_client_ref.get_dialogs(limit=50)
-                entity = await user_client_ref.get_entity(reference)
-            except Exception:
-                pass
+    reference = int(numeric) if numeric is not None else (username or raw_text)
+    entity = await _resolve_destination_peer(reference)
 
     if entity is not None:
         entity_id = db.normalize_channel_id(entity)
@@ -1795,6 +1802,36 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             buttons=_destinations_buttons(destinations),
             parse_mode=None,
         )
+
+    @bot.on(events.NewMessage(pattern=r"^/syncdestinations\b"))
+    async def handle_sync_destinations(event):
+        if not await check_admin(event):
+            return
+        cl = forward_client_ref if (forward_client_ref and forward_client_ref.is_connected()) else user_client_ref
+        if not cl or not cl.is_connected():
+            await event.reply(
+                "⚠️ Neither forwarding account nor user client is connected.",
+                buttons=_home_keyboard(),
+            )
+            return
+        status_msg = await event.reply("🔄 Scanning dialogs for new destination groups...")
+        import main as main_mod
+        try:
+            added = await main_mod.sync_destinations_from_forward_client(cl, bot)
+            if added:
+                await status_msg.edit(
+                    f"✅ Auto-synced **{added}** new destination group(s)!\n"
+                    f"All new posts will now be forwarded there.",
+                    buttons=_home_keyboard(),
+                )
+            else:
+                await status_msg.edit(
+                    "✅ All groups the account is in are already registered as destinations.",
+                    buttons=_home_keyboard(),
+                )
+        except Exception as exc:
+            logger.exception("Error running /syncdestinations")
+            await status_msg.edit(f"❌ Failed to sync: {exc}", buttons=_home_keyboard())
 
     @bot.on(events.NewMessage(pattern=r"^/removesupplier(?:\s+(.+))?"))
     async def handle_remove_supplier(event):

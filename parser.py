@@ -5,7 +5,6 @@ extraction and rewriting. This module only formats the final post shell and
 provides a small price parser used by the admin edit/preview flow.
 """
 
-import os
 import re
 import unicodedata
 from typing import List, Optional, Tuple

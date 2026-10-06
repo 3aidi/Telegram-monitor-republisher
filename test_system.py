@@ -6077,6 +6077,102 @@ class TestCustomEmojiHeaders(unittest.TestCase):
         self.assertTrue(out.startswith("#1\nWTB\n\nBybit full\n"), out)
         self.assertEqual([e.document_id for e in entities][:3], [800, 801, 802])
 
+class TestForwardDedicatedAccount(unittest.TestCase):
+    def _fresh_db(self, name: str) -> str:
+        path = os.path.join(tempfile.gettempdir(), name)
+        if os.path.exists(path):
+            os.remove(path)
+        db.init_db(path)
+        return path
+
+    def _sql(self, forwarding_id: int, db_path=None):
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM forwardings WHERE id = ?", (forwarding_id,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def test_forward_queue_uses_forward_client_for_all_destinations_by_default(self):
+        """When forward_client is provided, it forwards to ALL destinations by default."""
+        import main as main_mod
+        db_path = self._fresh_db("test_fwd_client_all.db")
+        db.add_destination("-100999999", "New Group", db_path=db_path)
+        db.queue_forwarding(1, "@mainchan", 555, db_path=db_path)
+
+        calls_main = []
+        calls_fwd = []
+
+        class FakeSender:
+            def __init__(self, name, calls_list):
+                self.name = name
+                self.calls = calls_list
+            async def forward_messages(self, to_entity, messages, from_peer):
+                self.calls.append({"to": to_entity, "msgs": messages})
+                return [_P5FakeMsg(1001)]
+            async def get_dialogs(self, limit=50):
+                return []
+
+        main_sender = FakeSender("main", calls_main)
+        fwd_sender = FakeSender("fwd", calls_fwd)
+
+        old_default = db.DEFAULT_DB_PATH
+        old_restrict = main_mod.FORWARD_SESSION_RESTRICT
+        db.DEFAULT_DB_PATH = db_path
+        main_mod.FORWARD_SESSION_RESTRICT = False
+        try:
+            asyncio.run(main_mod._drain_forward_queue(main_sender, fwd_sender))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+            main_mod.FORWARD_SESSION_RESTRICT = old_restrict
+
+        self.assertEqual(len(calls_fwd), 1, "forward_client must be used for new destination")
+        self.assertEqual(len(calls_main), 0, "main client must not be used when forward_client is available")
+        row = self._sql(1, db_path=db_path)
+        self.assertEqual(row["status"], "forwarded")
+        os.remove(db_path)
+
+    def test_sync_destinations_from_forward_client(self):
+        """sync_destinations_from_forward_client auto-registers groups from dialogs."""
+        import main as main_mod
+        db_path = self._fresh_db("test_fwd_sync.db")
+
+        class FakeEntity:
+            def __init__(self, cid, username=None, title=None, megagroup=True):
+                self.id = cid
+                self.username = username
+                self.title = title
+                self.megagroup = megagroup
+
+        class FakeDialog:
+            def __init__(self, cid, is_group=True, is_channel=False, username=None, title=None):
+                self.id = cid
+                self.is_group = is_group
+                self.is_channel = is_channel
+                self.entity = FakeEntity(cid, username=username, title=title)
+
+        class FakeClient:
+            async def get_dialogs(self, limit=200):
+                return [
+                    FakeDialog(12345, is_group=True, title="Alpha Group"),
+                    FakeDialog(67890, is_channel=True, username="beta_super", title="Beta Channel"),
+                ]
+
+        old_default = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = db_path
+        try:
+            added = asyncio.run(main_mod.sync_destinations_from_forward_client(FakeClient()))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+
+        self.assertEqual(added, 2)
+        dests = db.list_destinations(db_path=db_path)
+        self.assertEqual(len(dests), 2)
+        chat_ids = {d["chat_id"] for d in dests}
+        self.assertIn("-1000000012345", chat_ids)
+        self.assertIn("@beta_super", chat_ids)
+        os.remove(db_path)
+
 
 if __name__ == "__main__":
     unittest.main()

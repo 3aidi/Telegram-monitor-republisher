@@ -8,10 +8,9 @@ import random
 import re
 import sqlite3
 import time
-import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_DB_PATH = os.environ.get("DB_PATH", "monitor.db")
 
@@ -2639,6 +2638,10 @@ def reset_unresolved_forwardings(db_path: Optional[str] = None) -> int:
             SET status = 'pending', retry_count = 0, retry_at = NULL, updated_at = ?
             WHERE error LIKE '%Cannot find any entity%'
                OR error LIKE '%Could not find the input entity%'
+               OR error LIKE '%permission to access%'
+               OR error LIKE '%ChatWriteForbidden%'
+               OR error LIKE '%ChannelPrivate%'
+               OR error LIKE '%throttled%'
             """,
             (now_iso,),
         )

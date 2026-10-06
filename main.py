@@ -6,9 +6,7 @@ keyword blocklist, duplicate detection, and admin approval bot.
 
 import asyncio
 import logging
-from logging.handlers import RotatingFileHandler
 import os
-import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -110,14 +108,18 @@ FORWARD_WORKER_INTERVAL = float(os.environ.get("FORWARD_WORKER_INTERVAL", "3") o
 # safe default and pushing it higher only delays delivery.
 FORWARD_PACING_SECONDS = float(os.environ.get("FORWARD_PACING_SECONDS", "5.0") or 5.0)
 # Optional dedicated forward-only account (DEST-ROUTE): a second Telethon session
-# that forwards ONLY to the destinations listed in FORWARD_SESSION_DESTINATIONS.
-# The main account keeps monitoring + publishing and forwards to everything else.
+# that forwards messages to destinations. By default, when active, it forwards to
+# ALL active destinations so newly joined groups are handled automatically without
+# having to wait for the main account.
 # Empty FORWARD_SESSION_NAME disables the second account entirely.
 FORWARD_SESSION_NAME = os.environ.get("FORWARD_SESSION_NAME", "").strip() or None
 FORWARD_SESSION_DESTINATIONS = {
     chat.strip() for chat in os.environ.get("FORWARD_SESSION_DESTINATIONS", "").split(",")
     if chat.strip()
 }
+FORWARD_SESSION_RESTRICT = os.environ.get("FORWARD_SESSION_RESTRICT", "0").strip().lower() in (
+    "1", "true", "yes"
+)
 
 # Errors that will never succeed on retry: reporting them as the queue's final
 # state (failed) beats grinding retries forever (DEST-1).
@@ -1038,7 +1040,15 @@ async def _drain_forward_queue(
         from_peer = db.to_peer_reference(row["published_chat_id"])
         expected_post_id = int(row["published_message_id"])
 
-        if forward_client is not None and row["destination_chat_id"] in FORWARD_SESSION_DESTINATIONS:
+        if forward_client is not None:
+            if FORWARD_SESSION_RESTRICT and FORWARD_SESSION_DESTINATIONS:
+                use_fwd = row["destination_chat_id"] in FORWARD_SESSION_DESTINATIONS
+            else:
+                use_fwd = True
+        else:
+            use_fwd = False
+
+        if use_fwd:
             sender = forward_client
             sender_tag = "fwd-session"
         else:
@@ -1168,6 +1178,59 @@ async def _drain_forward_queue(
 
         if FORWARD_PACING_SECONDS > 0:
             await asyncio.sleep(FORWARD_PACING_SECONDS)
+
+
+async def sync_destinations_from_forward_client(
+    forward_client: TelegramClient, bot_client: Optional[TelegramClient] = None
+) -> int:
+    """Auto-sync groups/supergroups the forward account has joined into destinations.
+
+    Ensures that when the second account joins groups, they are automatically
+    registered as active destinations so publications are forwarded to them.
+    """
+    newly_added = 0
+    try:
+        dialogs = await forward_client.get_dialogs(limit=200)
+        existing_rows = await db.run_async(db.list_destinations)
+        existing = {str(d["chat_id"]): d for d in existing_rows}
+
+        for d in dialogs:
+            if not (d.is_group or d.is_channel):
+                continue
+            entity = d.entity
+            is_megagroup = getattr(entity, "megagroup", False)
+            if d.is_channel and not is_megagroup:
+                admin_rights = getattr(entity, "admin_rights", None)
+                if not admin_rights or not getattr(admin_rights, "post_messages", False):
+                    continue
+
+            chat_id = db.normalize_channel_id(entity)
+            if not chat_id:
+                continue
+            username = getattr(entity, "username", None)
+            store_ref = f"@{username.lower()}" if username else str(chat_id)
+
+            if store_ref in existing or str(chat_id) in existing:
+                continue
+
+            title = (getattr(entity, "title", None) or username or f"chat {chat_id}")[:100]
+            await db.run_async(db.add_destination, store_ref, title, True)
+            existing[store_ref] = {"chat_id": store_ref}
+            existing[str(chat_id)] = {"chat_id": str(chat_id)}
+            newly_added += 1
+            logger.info("Auto-synced destination from forward account: %s (%s)", title, store_ref)
+
+        if newly_added and bot_client and ADMIN_USER_ID:
+            try:
+                await bot_client.send_message(
+                    ADMIN_USER_ID,
+                    f"🔄 Auto-synced **{newly_added}** destination group(s) from your forwarding account.",
+                )
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Error syncing destinations from forward client dialogs")
+    return newly_added
 
 
 async def forwarding_worker(
@@ -2621,23 +2684,64 @@ async def main() -> None:
     await user_client.start()
 
     # Optional dedicated forward-only account (DEST-ROUTE): a second Telethon
-    # session whose ONLY job is forwarding to FORWARD_SESSION_DESTINATIONS.
-    # It registers no event handlers, so it never monitors or publishes.
+    # session whose job is forwarding posts to destination groups.
     forward_client: Optional[TelegramClient] = None
     if FORWARD_SESSION_NAME:
         try:
             forward_client = TelegramClient(FORWARD_SESSION_NAME, API_ID, API_HASH)
             await forward_client.start()
             try:
-                await forward_client.get_dialogs(limit=50)
+                await forward_client.get_dialogs(limit=200)
             except Exception:
                 logger.debug("Could not pre-warm forward-client dialogs cache.")
             logger.info(
-                "Forward-dedicated client connected (%s); forwarding %d destination(s) "
+                "Forward-dedicated client connected (%s); forwarding destinations "
                 "via the second account.",
                 FORWARD_SESSION_NAME,
-                len(FORWARD_SESSION_DESTINATIONS),
             )
+            admin_bot.set_forward_client(forward_client)
+
+            # Auto-sync destination groups from forward account dialogs on startup
+            try:
+                synced_count = await sync_destinations_from_forward_client(
+                    forward_client, bot_client
+                )
+                if synced_count:
+                    logger.info("Auto-synced %d destination(s) from forward account dialogs.", synced_count)
+            except Exception:
+                logger.exception("Could not auto-sync destinations from forward client dialogs")
+
+            # Listen for when the forwarding account joins or is added to groups in real time
+            @forward_client.on(events.ChatAction)
+            async def on_forward_chat_action(event):
+                try:
+                    if event.user_joined or event.user_added:
+                        me = await forward_client.get_me()
+                        users = getattr(event, "users", None) or []
+                        user_ids = [getattr(u, "id", None) for u in users] if users else []
+                        if event.user_id == me.id or me.id in user_ids:
+                            chat = await event.get_chat()
+                            chat_id = db.normalize_channel_id(chat)
+                            if chat_id:
+                                username = getattr(chat, "username", None)
+                                store_ref = f"@{username.lower()}" if username else str(chat_id)
+                                title = (getattr(chat, "title", None) or username or f"chat {chat_id}")[:100]
+                                await db.run_async(db.add_destination, store_ref, title, True)
+                                logger.info(
+                                    "Auto-registered new destination from forward account join: %s (%s)",
+                                    title, store_ref,
+                                )
+                                if bot_client and ADMIN_USER_ID:
+                                    try:
+                                        await bot_client.send_message(
+                                            ADMIN_USER_ID,
+                                            f"➕ **New destination auto-detected**: {title} (`{store_ref}`)\n"
+                                            f"Joined via second account. Future posts will be forwarded here.",
+                                        )
+                                    except Exception:
+                                        pass
+                except Exception:
+                    logger.exception("Error handling chat action on forward client")
         except Exception:
             logger.exception(
                 "Could not start forward-dedicated client %s; "
