@@ -15,6 +15,7 @@ from telethon.tl.types import PeerChannel, PeerChat
 import db
 import parser
 import publish_guard
+import texts
 
 load_dotenv()
 
@@ -104,45 +105,38 @@ async def send_approval_prompt(
     ai_preview = (listing.get("clean_text") or "")[:400]
     raw_preview = (listing.get("raw_text") or "")[:400]
 
-    reason_label = {
-        "unknown_platform": "Platform Not Identified",
-        "ai_unavailable": "AI Unavailable — Manual Review",
-        "ai_blocked_review": "⚠️ AI Flagged Content — Verify",
-    }.get(review_reason, "Manual Review")
+    reason_label = texts.REASONS.get(review_reason, texts.REASON_DEFAULT)
 
     if queue_pos:
         if as_next:
-            header = f"📬 Next Review · {queue_pos} — Listing #{listing_id}"
+            header = texts.REVIEW_HEADER_NEXT_POS.format(pos=queue_pos, id=listing_id)
         else:
-            header = f"📬 {queue_pos} — {reason_label} — Listing #{listing_id}"
+            header = texts.REVIEW_HEADER_POS.format(pos=queue_pos, reason=reason_label, id=listing_id)
     elif as_next:
-        header = f"📬 Next Review — Listing #{listing_id}"
+        header = texts.REVIEW_HEADER_NEXT.format(id=listing_id)
     else:
-        header = f"📬 {reason_label} — Listing #{listing_id}"
-    price_info = "Price : DM"
+        header = texts.REVIEW_HEADER.format(reason=reason_label, id=listing_id)
+    price_info = texts.REVIEW_PRICE
 
-    platform_display = platform.title() if platform and platform != "Unknown" else "—"
+    platform_display = platform.title() if platform and platform != "Unknown" else texts.REVIEW_PLATFORM_NONE
 
     content_section = ai_preview if ai_preview else raw_preview
 
-    text = (
-        f"{header}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Supplier : {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))}\n"
-        f"Platform : {platform_display}\n"
-        f"{price_info}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{content_section}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Approve → republish  |  Skip → for later"
+    text = texts.REVIEW_CARD.format(
+        header=header,
+        source=_pretty_source(listing.get("supplier_username"), listing.get("supplier_display_name")),
+        platform=platform_display,
+        price=price_info,
+        content=content_section,
+        actions=texts.REVIEW_ACTIONS,
     )
 
     buttons = [
         [
-            Button.inline("👁️ Preview",  data=f"preview:{listing_id}"),
-            Button.inline("✏️ Edit",     data=f"edit:{listing_id}"),
-            Button.inline("✅ Approve", data=f"approve:{listing_id}"),
-            Button.inline("⏭️ Skip",    data=f"skip:{listing_id}"),
+            Button.inline(texts.BTN_PREVIEW, data=f"preview:{listing_id}"),
+            Button.inline(texts.BTN_EDIT,    data=f"edit:{listing_id}"),
+            Button.inline(texts.BTN_APPROVE, data=f"approve:{listing_id}"),
+            Button.inline(texts.BTN_SKIP,    data=f"skip:{listing_id}"),
         ]
     ]
     buttons.extend(_channel_view_buttons(listing))
@@ -165,11 +159,8 @@ async def send_review_notification(
     src = _pretty_source(
         listing.get("supplier_username"), listing.get("supplier_display_name")
     )
-    src_part = f" from {src}\n" if src and src != "?" else ""
-    text = (
-        f"📬 Review needed : Listing #{listing_id} \n {src_part} "
-        f"\n tap /pending to review."
-    )
+    src_part = texts.REVIEW_NOTICE_SOURCE.format(source=src) if src and src != "?" else ""
+    text = texts.REVIEW_NOTICE.format(id=listing_id, source=src_part)
 
     try:
         await bot_client.send_message(admin_id, text, parse_mode=None)
@@ -187,14 +178,13 @@ async def send_published_alert(
     listing_id = listing["id"]
     post_number = listing.get("post_number")
     platform = (listing.get("platform_name") or listing.get("game_name") or "")[:60]
-    post_disp = f"#{post_number}" if post_number is not None else f"Listing #{listing_id}"
+    post_disp = texts.PUBLISHED_POST.format(n=post_number) if post_number is not None else texts.PUBLISHED_LISTING.format(id=listing_id)
+    platform_disp = platform.title() if platform else texts.PLATFORM_UNKNOWN
 
-    text = (
-        f"✅ **Auto-Published — Post {post_disp}**\n"
-        f"━━━━━━━━━━━━━━━━━\n"
-        f"{platform.title() if platform else 'Platform ?'}\n"
-        f"Supplier : {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))}\n"
-        f"━━━━━━━━━━━━━━━━━\n"
+    text = texts.PUBLISHED_ALERT.format(
+        post=post_disp,
+        platform=platform_disp,
+        source=_pretty_source(listing.get("supplier_username"), listing.get("supplier_display_name")),
     )
 
     buttons = _channel_view_buttons(listing)
@@ -210,10 +200,13 @@ def _format_listing(n: int, l: dict) -> str:
     """Single-line listing summary for /pending, /preview lists."""
     platform = l.get("platform_name") or l.get("game_name") or "?"
     created = (l.get("created_at") or "")[:16].replace("T", " ")
-    return (
-        f"{n}. **#{l['id']}** | {platform} | DM | "
-        f"{_pretty_source(l.get('supplier_username'), l.get('supplier_display_name'))}\n"
-        f"   Status: `{l.get('status')}` | {created}"
+    return texts.FORMAT_LISTING.format(
+        n=n,
+        id=l["id"],
+        platform=platform,
+        source=_pretty_source(l.get("supplier_username"), l.get("supplier_display_name")),
+        status=l.get("status"),
+        created=created,
     )
 
 
@@ -271,10 +264,11 @@ def _skip_notification(k: dict) -> Tuple[str, List[List[object]]]:
     """
     src = _pretty_source(k.get("channel_username"), k.get("display_name")) or "?"
     listing_part = f" — Listing #{k['listing_id']}" if k.get("listing_id") else ""
+    reason = k.get("reason", "unknown")
     text = (
-        f"⏳ Skipped From — {src}{listing_part} — "
+        f"⏳ Skipped — {reason} — {src}{listing_part}"
     )
-    buttons = [[Button.inline("🔁 Re-review", data=f"reskip:{k['skip_id']}")]]
+    buttons = [[Button.inline(texts.BTN_REREVIEW, data=f"reskip:{k['skip_id']}")]]
     src_url = _source_url({
         "supplier_username": k.get("channel_username"),
         "supplier_channel_id": None,
@@ -334,19 +328,20 @@ async def send_skipped_alert(
         src = _pretty_source(
             listing.get("supplier_username"), listing.get("supplier_display_name")
         )
-        text = (
-            f"♻️ **Duplicate burst collapsed**\n"
-            f"Kept Listing #{winner_id} from {src}.\n"
-            f"{len(dropped)} identical cop{'y' if len(dropped) == 1 else 'ies'} "
-            f"dropped: {dropped_text}"
+        text = texts.DUP_BURST.format(
+            winner=winner_id,
+            source=src,
+            count=len(dropped),
+            suffix="y" if len(dropped) == 1 else "ies",
+            dropped=dropped_text,
         )
     else:
         label = _SKIP_REASON_LABELS.get(reason, reason)
         src = _pretty_source(
             listing.get("supplier_username"), listing.get("supplier_display_name")
         )
-        src_part = f" from {src}" if src and src != "?" else ""
-        text = f"⏭️ Skipped — {label} — Listing #{listing_id}{src_part}"
+        src_part = texts.SKIP_ALERT_SOURCE.format(source=src) if src and src != "?" else ""
+        text = texts.SKIP_ALERT.format(reason=label, id=listing_id, source=src_part)
 
     try:
         await bot_client.send_message(admin_id, text, parse_mode="markdown")
@@ -426,16 +421,10 @@ def _edit_prompt(listing: dict, existing_draft: Optional[str]) -> str:
         content = (listing.get("raw_text") or "").strip()
     lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
     if not lines:
-        body = "_(no content yet — write the body lines)_"
+        body = texts.EDIT_EMPTY
     else:
         body = "\n".join(f"> {ln}" for ln in lines)
-    return (
-        f"✏️ **Edit Listing #{listing['id']}**\n"
-        f"**Current content** — copy it, tweak it, then send back the FULL body:\n"
-        f">{body}\n\n"
-        f"• Price & contact are added automatically.\n"
-        f"Then I'll show you the new preview before publishing."
-    )
+    return texts.EDIT_PROMPT.format(id=listing["id"], body=body)
 
 
 # Home reply keyboard — persistent 1-tap UI. Labels reflect current state.
@@ -588,15 +577,9 @@ def _non_emoji_residue(message, spans: List[Dict[str, object]]) -> str:
 def _headers_menu_text(headers: List[dict]) -> str:
     """Caption for the header list. Empty state points at the Add row below it."""
     if not headers:
-        return (
-            "No headers saved yet .\n"
-            f"Tap **➕ Add Header \n send the {HEADER_EMOJI_COUNT} custom emoji "
-        )
-    return (
-        f"**{len(headers)} header{'s' if len(headers) != 1 else ''} saved** — one is "
-        f"picked at random for each post.\nEach row below echoes the real custom emoji "
-        f"so you can check it renders. 🗑 deletes that header."
-    )
+        return texts.HEADERS_EMPTY.format(n=HEADER_EMOJI_COUNT)
+    s = "s" if len(headers) != 1 else ""
+    return texts.HEADERS_MENU.format(count=len(headers), s=s)
 
 
 def _headers_buttons(headers: List[dict]) -> List[List[object]]:
@@ -619,7 +602,7 @@ def _headers_buttons(headers: List[dict]) -> List[List[object]]:
 
 
 def _home_keyboard() -> List[List[object]]:
-    pause_label = "▶ All Start" if db.is_paused() else "⏸ All Stop"
+    pause_label = texts.BTN_RESUME if db.is_paused() else texts.BTN_PAUSE
     return [
         [Button.text("⏳ Pending", resize=True), Button.text("📋 Sources", resize=True)],
         [Button.text("✅ Published", resize=True), Button.text(DESTINATIONS_BTN, resize=True)],
@@ -669,10 +652,10 @@ def _channel_view_buttons(listing: dict) -> List[List[object]]:
     row = []
     src_url = _source_url(listing)
     if src_url:
-        row.append(Button.url("View in Buyer channel", src_url))
+        row.append(Button.url(texts.BTN_VIEW_BUYER, src_url))
     dest_url = _destination_url(listing)
     if dest_url:
-        row.append(Button.url("View in my channel", dest_url))
+        row.append(Button.url(texts.BTN_VIEW_DEST, dest_url))
     if not row:
         return []
     return [row]
@@ -680,7 +663,7 @@ def _channel_view_buttons(listing: dict) -> List[List[object]]:
 
 def _asleep_label() -> str:
     """Label for the 'I'm Asleep' toggle button (mirrors the pause label)."""
-    return "☀️ I'm Awake" if db.is_buyer_asleep() else "💤 I'm Asleep"
+    return texts.BTN_AWAKE if db.is_buyer_asleep() else texts.BTN_ASLEEP
 
 
 async def _message_delete_send(
@@ -719,9 +702,9 @@ def _listing_action_buttons(listing: dict) -> List[List[object]]:
     else:
         buttons = [
             [
-                Button.inline("✏️ Edit", data=f"edit:{listing_id}"),
-                Button.inline("✅ Approve", data=f"approve:{listing_id}"),
-                Button.inline("⏭️ Skip", data=f"skip:{listing_id}"),
+                Button.inline(texts.BTN_EDIT, data=f"edit:{listing_id}"),
+                Button.inline(texts.BTN_APPROVE, data=f"approve:{listing_id}"),
+                Button.inline(texts.BTN_SKIP, data=f"skip:{listing_id}"),
             ]
         ]
     buttons.extend(_channel_view_buttons(listing))
@@ -839,24 +822,23 @@ async def _edit_supplier_menu(event, s: dict) -> None:
     sid = s["id"]
     icon = _source_status_icon(s)
     handle = _pretty_source(s.get("channel_username"), s.get("display_name"))
-    toggle_label = "⏸ Pause" if s["active"] else "▶ Resume"
+    toggle_label = texts.BTN_PAUSE_ITEM if s["active"] else texts.BTN_RESUME_ITEM
     if not s.get("channel_id"):
-        status_line = (
-            "⚠️ **Unresolved — NOT monitored yet.** Wrong username or private chat; "
-            "re-add it or forward a message from the channel.\n"
-        )
+        status_line = texts.SOURCE_UNRESOLVED
     else:
-        status_line = f"Status: `{'Active' if s['active'] else 'Paused'}`\n"
+        status_line = texts.SOURCE_STATUS.format(state=texts.STATE_ACTIVE if s["active"] else texts.STATE_PAUSED)
     await _message_delete_send(
         event,
-        f"{icon} **{handle}**\n"
-        f"{status_line}"
-        f"ID: `{s['channel_id'] or 'unresolved'}`\n\n"
-        f"What would you like to do?",
+        texts.SOURCE_DETAIL.format(
+            icon=icon,
+            name=handle,
+            status=status_line,
+            id=s['channel_id'] or texts.ID_UNRESOLVED,
+        ),
         buttons=[
             [Button.inline(toggle_label, data=f"suptoggle:{sid}")],
-            [Button.inline("🗑 Delete Permanently", data=f"supdel:{sid}")],
-            [Button.inline("⬅️ Back", data="menu:sources")],
+            [Button.inline(texts.BTN_DELETE_PERM, data=f"supdel:{sid}")],
+            [Button.inline(texts.BTN_BACK, data="menu:sources")],
         ],
     )
 
@@ -877,9 +859,7 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
         raw_channel_id = _channel_id_from_fwd(fwd)
         if raw_channel_id is None:
             await event.reply(
-                "That forward isn't from a channel/group I can identify. "
-                "Forward a post **made by the channel** (not a message you typed "
-                "yourself), or send a username / numeric ID instead.",
+                texts.SOURCE_BAD_FORWARD,
                 buttons=_home_keyboard(),
             )
             return
@@ -910,14 +890,12 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
         )
         if entity is None:
             await event.reply(
-                f"✅ **Source added by forward** — stored ID `{channel_id}`.\n"
-                f"⚠️ My monitor account can't see this chat yet. Add the monitor "
-                f"account as a member and I'll start listening automatically.",
+                texts.SOURCE_ADDED_BY_FWD_UNRESOLVED.format(id=channel_id),
                 buttons=_home_keyboard(),
             )
         else:
             await event.reply(
-                f"✅ **Source added by forward**: `{display}` (ID `{channel_id}`)",
+                texts.SOURCE_ADDED_BY_FWD.format(display=display, id=channel_id),
                 buttons=_home_keyboard(),
             )
         return
@@ -925,9 +903,7 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
     username, numeric = _supplier_ref_from_text(text)
     if not username:
         await event.reply(
-            "I couldn't read a channel reference from that. Send a channel "
-            "username (e.g. `@kycgroupke`), a numeric ID (e.g. `-1001234567890`), "
-            "or forward a message from the channel.",
+            texts.SOURCE_BAD_REF,
             buttons=_home_keyboard(),
         )
         return
@@ -962,22 +938,17 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
             detail=f"{text} -> {display} (id {entity_id})",
         )
         await event.reply(
-            f"✅ **Source added**: `{display}` (ID `{entity_id}`)",
+            texts.SOURCE_ADDED_RESOLVED.format(display=display, id=entity_id),
             buttons=_home_keyboard(),
         )
         return
 
     _wizard_state[ADMIN_USER_ID] = {"step": "add_confirm_unresolved", "raw": text}
     await event.reply(
-        f"❌ Couldn't resolve that reference (`{text[:60]}`).\n\n"
-        f"• If this is a **private group/channel with no username**, forward me any "
-        f"message **from that channel/group** and I'll grab its exact ID automatically.\n"
-        f"• Or tap **Add anyway** to store it unresolved — I'll retry in the background "
-        f"and message you the moment monitoring actually starts.\n\n"
-        f"Until it resolves, the source will show as ⚠️ unresolved and won't be listened to.",
+        texts.SOURCE_UNRESOLVED_ASK.format(text=text[:60]),
         buttons=[
-            [Button.inline("✅ Add anyway (retry later)", data="supaddunresolved")],
-            [Button.inline("🚫 Cancel", data="wiz:cancel")],
+            [Button.inline(texts.BTN_ADD_ANYWAY, data="supaddunresolved")],
+            [Button.inline(texts.BTN_CANCEL, data="wiz:cancel")],
         ],
         parse_mode=None,
     )
@@ -1029,10 +1000,10 @@ def _page_footer(page: int, page_count: int) -> str:
 
 def _sources_menu_text(suppliers: List[dict], page: int = 0) -> str:
     if not suppliers:
-        return "No sources configured yet."
+        return texts.SOURCES_EMPTY
     _, _, page_count, _, _ = _page_window(len(suppliers), page)
     footer = _page_footer(page, page_count)
-    msg = "Tap a source below to manage it."
+    msg = texts.SOURCES_MENU
     if footer:
         msg += f"\n\n{footer}"
     return msg
@@ -1047,7 +1018,8 @@ def _sources_buttons(suppliers: List[dict], page: int = 0) -> List[List[object]]
         buttons.append([Button.inline(label, data=f"sup:{s['id']}")])
     buttons.extend(_nav_row("sup", page, page_count))
     buttons.append([
-        Button.inline("➕ Add Source", data="supadd"),
+        Button.inline(texts.BTN_ADD_SOURCE, data="supadd"),
+        Button.inline(texts.BTN_BACK, data="menu:home"),
     ])
     return buttons
 
@@ -1128,7 +1100,7 @@ def destination_open_url(chat_ref) -> Optional[str]:
     return f"https://t.me/{handle}" if handle else None
 
 
-def _destination_open_button(chat_ref, label: str = "🔗 Open Chat"):
+def _destination_open_button(chat_ref, label: str = texts.BTN_OPEN_CHAT):
     """A Button.url that opens the destination chat, or None if it is private."""
     url = destination_open_url(chat_ref)
     return Button.url(label, url) if url else None
@@ -1168,13 +1140,10 @@ def _destination_markup(text, link_ref=None) -> str:
 
 def _destinations_menu_text(destinations: List[dict], page: int = 0) -> str:
     if not destinations:
-        return (
-            "No destinations configured — \n\nTap **➕ Add Destination** to start forwarding "
-            "posts there too."
-        )
+        return texts.DESTS_EMPTY
     _, _, page_count, _, _ = _page_window(len(destinations), page)
     footer = _page_footer(page, page_count)
-    msg = "\nTap a destination below to manage it.\n\n"
+    msg = texts.DESTS_MENU
     if footer:
         msg += footer + "\n"
     return msg
@@ -1193,7 +1162,8 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
         buttons.append([Button.inline(label, data=f"dest:{d['id']}")])
     buttons.extend(_nav_row("dest", page, page_count))
     buttons.append([
-        Button.inline("➕ Add Destination", data="destadd"),
+        Button.inline(texts.BTN_ADD_DEST, data="destadd"),
+        Button.inline(texts.BTN_BACK, data="menu:home"),
     ])
     return buttons
 
@@ -1203,7 +1173,7 @@ async def _edit_destination_menu(event, d: dict) -> None:
     did = d["id"]
     icon = _destination_icon(d)
     label = _destination_label(d)
-    toggle_label = "⏸ Pause " if d["active"] else "▶ Resume"
+    toggle_label = texts.BTN_PAUSE_TRAILING if d["active"] else texts.BTN_RESUME_ITEM
     # DEST-HEALTH: show WHY a destination is not receiving, and the last error,
     # so a banned group is diagnosable without reading the journal.
     health_lines = ""
@@ -1211,53 +1181,46 @@ async def _edit_destination_menu(event, d: dict) -> None:
     if d.get("is_throttled"):
         # Rate limiting is the account's problem, not this group's. Say so, so
         # the admin does not disable a destination that will deliver fine.
-        health_lines = (
-            "\nDelivery: ⏳ waiting on Telegram rate limit"
-            f"\nQueued and retrying automatically: {d.get('deferred', 0)}"
-            "\nThis is not a problem with this destination."
-        )
+        health_lines = texts.DEST_HEALTH_THROTTLED.format(deferred=d.get('deferred', 0))
     elif attempts:
         if d.get("is_dead"):
-            verdict = "❌ Not delivering at all — likely banned or private"
+            verdict = texts.DEST_V_DEAD
         elif d.get("is_flapping"):
-            verdict = f"⚠️ Intermittent — {d.get('fail_pct', 0):.0f}% of recent forwards failed"
+            verdict = texts.DEST_V_FLAPPING.format(pct=d.get('fail_pct', 0))
         elif d.get("fail_pct", 0) >= 25:
-            verdict = f"⚠️ {d.get('fail_pct', 0):.0f}% of recent forwards failed"
+            verdict = texts.DEST_V_FAILING.format(pct=d.get('fail_pct', 0))
         else:
-            verdict = "✅ Delivering normally"
-        health_lines = (
-            f"\nDelivery: {verdict}\n"
-            f"Recent: {d.get('successes', 0)}/{attempts} forwarded"
+            verdict = texts.DEST_V_OK
+        health_lines = texts.DEST_HEALTH_ATTEMPTS.format(
+            verdict=verdict,
+            successes=d.get('successes', 0),
+            attempts=attempts,
         )
         if d.get("last_success_at"):
-            health_lines += f"\nLast success: `{d['last_success_at'][:16].replace('T', ' ')}`"
+            health_lines += texts.DEST_HEALTH_LAST_OK.format(when=d['last_success_at'][:16].replace('T', ' '))
     else:
-        health_lines = "\nDelivery: no forwards attempted yet"
+        health_lines = texts.DEST_HEALTH_NO_ATTEMPTS
     if d.get("last_error"):
         reason = str(d["last_error"]).split(" (caused by")[0][:120]
-        health_lines += f"\nLast error: `{reason}`"
-    # 'ID:' is clickable for a public @username and plain text for a private
-    # numeric id; either way it is not a code span, so it never reads as
-    # copyable code. A leading 'Open Chat' row is only added when a real t.me
-    # deep link exists. The pause/resume, delete and back callbacks below are
-    # unchanged, so destination management is untouched.
+        health_lines += texts.DEST_HEALTH_LAST_ERR.format(reason=reason)
     id_line = _destination_id_line(d.get("chat_id"))
     open_chat = _destination_open_button(d.get("chat_id"))
     rows = []
     if open_chat is not None:
         rows.append([open_chat])
     rows.append([Button.inline(toggle_label, data=f"desttoggle:{did}")])
-    rows.append([Button.inline("🗑 Delete Permanently", data=f"destdel:{did}")])
-    rows.append([Button.inline("⬅️ Back", data="menu:destinations")])
-    # health_lines always carries its own leading newline, so the ID line is
-    # appended without one and the layout matches the old screen exactly.
-    header = f"{icon} **{label}**\nStatus: {'Active' if d['active'] else 'Disabled'}"
+    rows.append([Button.inline(texts.BTN_DELETE_PERM, data=f"destdel:{did}")])
+    rows.append([Button.inline(texts.BTN_BACK, data="menu:destinations")])
+    header = texts.DEST_HEADER.format(
+        icon=icon,
+        name=label,
+        state=texts.DEST_STATE_ON if d['active'] else texts.DEST_STATE_OFF,
+    )
     if id_line:
         header += f"\n{id_line}"
     await _message_delete_send(
         event,
-        f"{header}{health_lines}\n\n"
-        f"What would you like to do?",
+        texts.DEST_DETAIL_CARD.format(header=header, health=health_lines),
         buttons=rows,
     )
 
@@ -1294,9 +1257,7 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
         raw_chat_id = _channel_id_from_fwd(fwd)
         if raw_chat_id is None:
             await event.reply(
-                "That forward isn't from a channel/group I can identify. "
-                "Forward a post **made by the group** (not a message you typed "
-                "yourself), or send a username / numeric ID instead.",
+                texts.DEST_BAD_FORWARD,
                 buttons=_home_keyboard(),
             )
             return
@@ -1312,9 +1273,10 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             detail=f"forwarded post -> {display} (id {chat_ref})",
         )
         await event.reply(
-            f"✅ **Destination added by forward**: {_destination_markup(display)} "
-            f"(ID {_destination_markup(chat_ref)})\n"
-            f"Every bot post published from now on will be forwarded here.",
+            texts.DEST_ADD_BY_FWD.format(
+                display=_destination_markup(display),
+                id=_destination_markup(chat_ref),
+            ),
             buttons=_home_keyboard(),
         )
         return
@@ -1323,9 +1285,7 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
     raw_text = (text or "").strip()
     if not username and not raw_text.startswith("http"):
         await event.reply(
-            "I couldn't read a chat reference from that. Send a group username "
-            "(e.g. `@mygroup`), a numeric ID (e.g. `-1001234567890`), or forward "
-            "a message from the group.",
+            texts.DEST_BAD_REF,
             buttons=_home_keyboard(),
         )
         return
@@ -1353,9 +1313,9 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             detail=f"{text} -> {display}",
         )
         await event.reply(
-            f"✅ **Destination added**: "
-            f"{_destination_markup(store_ref if entity_username else display, store_ref)}\n"
-            f"Every bot post published from now on will be forwarded here.",
+            texts.DEST_ADDED.format(
+                display=_destination_markup(store_ref if entity_username else display, store_ref)
+            ),
             buttons=_home_keyboard(),
         )
         return
@@ -1372,39 +1332,35 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             detail=f"{marked_id} (numeric) -> {display}",
         )
         await event.reply(
-            f"✅ **Destination added**: {_destination_markup(display)} "
-            f"(ID {_destination_markup(marked_id)})\n"
-            f"Every bot post published from now on will be forwarded here.",
+            texts.DEST_ADDED.format(
+                display=_destination_markup(display) + f" (ID {_destination_markup(marked_id)})"
+            ),
             buttons=_home_keyboard(),
         )
         return
 
     _wizard_state[ADMIN_USER_ID] = {"step": "adddest_confirm_unresolved", "raw": text}
     await event.reply(
-        f"I couldn't verify {_destination_markup(text)} as a chat I can send to. "
-        f"It may be a private group I'm not a member of.\n\n"
-        f"• **Forward a message FROM the group** and I'll grab its exact ID, or\n"
-        f"• Add it anyway and I'll retry delivery on every post (failures show "
-        f"up in the queue).",
+        texts.DEST_UNVERIFIED_PROMPT.format(name=_destination_markup(text)),
         buttons=[
-            [Button.inline("✅ Add anyway (retry later)", data="destaddunresolved")],
-            [Button.inline("❌ Cancel", data="wiz:cancel")],
+            [Button.inline(texts.BTN_ADD_ANYWAY, data="destaddunresolved")],
+            [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
         ],
     )
 
 
 def _home_button_row() -> List[List[object]]:
     """Inline "back to Home" row used by every section rendered from the Home menu."""
-    return [[Button.inline("🏠 Home", data="menu:home")]]
+    return [[Button.inline(texts.BTN_HOME, data="menu:home")]]
 
 
 def _home_text() -> str:
-    return "🏠 **Home** — tap a button below."
+    return texts.HOME_LANDING
 
 
 def _home_inline_keyboard() -> List[List[object]]:
     """Inline navigation for the Home landing message (mirrors the reply keyboard)."""
-    pause_label = "▶ All Start" if db.is_paused() else "⏸ All Stop"
+    pause_label = texts.BTN_RESUME if db.is_paused() else texts.BTN_PAUSE
     return [
         [
             Button.inline("⏳ Pending", data="home:pending"),
@@ -1422,21 +1378,7 @@ def _home_inline_keyboard() -> List[List[object]]:
 
 
 def _help_text() -> str:
-    return (
-        "🤖 **Telegram Monitor Admin Bot**\n\n"
-        "Everything is one tap — no commands to remember:\n"
-        "• **📊 Status** — today's report\n"
-        "• **⏳ Pending** — approve / preview / edit new listings\n"
-        "• **📋 Sources** — add, manage, remove sources\n"
-        f"• **{DESTINATIONS_BTN}** — add groups to forward copies of every bot post to\n"
-        "• **✅ Published** — every post with its **#Post number** + channel & source links\n"
-        "• ** /post 12** — jump straight to post #12\n"
-        "• **⏸ All Stop / ▶ All Start** — pause or resume AUTOMATIC publishing only. "
-        "Manual Approve taps still publish immediately.\n\n"
-        "Slash shortcuts still work if you prefer typing them. The one feature with\n"
-        "no button is headers: `/headers` opens the list, and the ➕ row in there is\n"
-        "how you add one."
-    )
+    return texts.HELP.format(destinations=DESTINATIONS_BTN)
 
 
 def _status_report_text() -> str:
@@ -1446,30 +1388,36 @@ def _status_report_text() -> str:
     for s in stats["supplier_breakdown"]:
         handle = _pretty_source(s.get("channel_username"), s.get("supplier_display_name"))
         supplier_lines.append(
-            f"• {handle} — processed `{s['processed']}` / "
-            f"published `{s['published']}` / skipped `{s['skipped']}`"
+            texts.STATUS_SUPPLIER_LINE.format(
+                name=handle,
+                processed=s['processed'],
+                published=s['published'],
+                skipped=s['skipped'],
+            )
         )
     if not supplier_lines:
-        supplier_lines = ["• None"]
+        supplier_lines = [texts.STATUS_NONE]
     supplier_text = "\n\n".join(supplier_lines)
 
-    reason_lines = [f"• {r}: `{c}`" for r, c in stats["skip_reasons"].items()]
+    reason_lines = [texts.STATUS_REASON_LINE.format(reason=r, count=c) for r, c in stats["skip_reasons"].items()]
     if not reason_lines:
-        reason_lines = ["• None"]
+        reason_lines = [texts.STATUS_NONE]
     reason_text = "\n\n".join(reason_lines)
 
     msg = (
-        "📊 **Today's Activity Report**\n\n"
-        f"• Active Suppliers: `{stats['active_suppliers']}`\n"
-        f"• Total Processed: `{stats['total_processed']}`\n"
-        f"• Published: `{stats['published']}`\n"
-        f"• Pending Approval: `{stats['pending']}`\n"
-        f"• Total Skipped: `{stats['total_skipped']}`\n\n"
-        f"**By Supplier**\n{supplier_text}\n\n"
-        f"**Skip Breakdown**\n{reason_text}"
+        texts.STATUS_HEADER
+        + texts.STATUS_TOTALS.format(
+            active=stats['active_suppliers'],
+            processed=stats['total_processed'],
+            published=stats['published'],
+            pending=stats['pending'],
+            skipped=stats['total_skipped'],
+        )
+        + texts.STATUS_BY_SUPPLIER.format(suppliers=supplier_text)
+        + texts.STATUS_BY_REASON.format(reasons=reason_text)
     )
     if db.is_paused():
-        msg = "⏸ **PAUSED — automatic publishing is stopped**\n(manual Approve taps still publish)\n\n" + msg
+        msg = texts.STATUS_PAUSED_BANNER + msg
     return msg
 
 
@@ -1520,13 +1468,13 @@ def _skipped_digest(
         if age:
             label += f" -- {age}"
         buttons.append([Button.inline(label, data=f"reskip:{k['skip_id']}")])
-    text = "🚫 **Skipped posts** — tap a button to open a post:\n"
+    text = texts.SKIPPED_TITLE
     if reopenable:
         dropped = len(skips) - len(reopenable)
         if dropped:
-            text += f"\n_({dropped} more recent skip(s) not re-reviewable — no listing linked.)_"
+            text += texts.SKIPPED_DROPPED_INFO.format(dropped=dropped)
     else:
-        text += "\n_None of the recent skips can be re-opened._"
+        text += texts.SKIPPED_NONE_OPEN
     if total is not None:
         total = max(int(total), len(skips))
         _, _, page_count, _, _ = _page_window(total, page)
@@ -1546,7 +1494,7 @@ def _published_digest(
     Button A links the post's #number to the published post in our channel;
     Button B links the source group/channel name to the original source post.
     No text lines: the button labels carry all the meaning."""
-    text = " ✅ **Published posts** — tap a button to open a post:\n"
+    text = texts.PUBLISHED_TITLE
     buttons = []
     for p in rows:
         post_num = p.get("post_number")
@@ -1571,7 +1519,7 @@ def _published_digest(
         if footer:
             text += f"\n\n{footer}"
         buttons.extend(_nav_row("pub", page, page_count))
-    buttons.append([Button.inline("Search Post", data="published:search")])
+    buttons.append([Button.inline(texts.BTN_SEARCH_POST, data="published:search")])
     buttons.extend(_home_button_row())
     return text, buttons
 
@@ -1582,10 +1530,10 @@ def _review_position_label(remaining: int) -> str:
     arrived mid-session, or no /pending session is active)."""
     total = _review_session_total
     if total is None or total < 1:
-        return f"{remaining} remaining"
+        return texts.REVIEW_POS_REMAINING.format(remaining=remaining)
     current = _review_session_done + 1
     if current > total:
-        return f"{remaining} remaining"
+        return texts.REVIEW_POS_REMAINING.format(remaining=remaining)
     return f"{current}/{total}"
 
 
@@ -1612,7 +1560,7 @@ async def _advance_review(bot: TelegramClient) -> None:
         try:
             await bot.send_message(
                 ADMIN_USER_ID,
-                "✅ No pending listings right now.",
+                texts.QUEUE_FINISHED,
             )
         except Exception:
             logger.exception("Failed to send review-queue-finished notice")
@@ -1633,7 +1581,7 @@ async def _send_pending_page(event, bot, page: int = 0) -> None:
     total = db.count_pending_listings()
     pending = db.get_pending_listings(limit=1, offset=0)
     if not pending:
-        await event.reply("✅ No listings pending approval right now.")
+        await event.reply(texts.NO_PENDING_PAGE)
         return
     _review_session_total = total
     _review_session_done = 0
@@ -1656,21 +1604,20 @@ def _post_card(post: dict) -> Tuple[str, List[List[object]]]:
     supplier = _pretty_source(post.get("supplier_username"), post.get("supplier_display_name"))
     if not supplier or supplier == "?":
         supplier = f"channel {post.get('supplier_channel_id')}"
-    lines = [
-        f"**Post #{post_number}**",
-        "━━━━━━━━━",
-        f"Platform : {platform}",
-        f"Supplier : {supplier}",
-    ]
+    lines = texts.POST_CARD.format(
+        n=post_number,
+        platform=platform,
+        source=supplier,
+    )
     buttons = []
     src_url = _source_url(post)
     if src_url:
-        buttons.append([Button.url("View in Buyer channel", src_url)])
+        buttons.append([Button.url(texts.BTN_VIEW_BUYER, src_url)])
     buttons.append([
-        Button.inline("⬅️ Back", data="home:published"),
-        Button.inline("🏠 Home", data="menu:home"),
+        Button.inline(texts.BTN_BACK, data="home:published"),
+        Button.inline(texts.BTN_HOME, data="menu:home"),
     ])
-    return "\n".join(lines), buttons
+    return lines, buttons
 
 
 def setup_admin_handlers(bot: TelegramClient) -> None:
@@ -1684,7 +1631,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 ADMIN_USER_ID,
             )
             await event.reply(
-                f"⚠️ Access Denied. Your Telegram User ID is: {event.sender_id}"
+                texts.ACCESS_DENIED.format(user_id=event.sender_id)
             )
             return False
         return True
@@ -1731,11 +1678,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         paused = db.is_paused()
         await db.run_async(db.set_paused, not paused)
-        state_label = "⏸ **Paused**" if not paused else "▶ **Resumed**"
+        state_label = texts.PAUSE_ON if not paused else texts.PAUSE_OFF
         await event.reply(
-            f"{state_label}. New listings are captured, "
-            f"Automatic publishing is {'stopped' if not paused else 'running'}. "
-            f"**Approve** to publish now.",
+            state_label,
             buttons=_home_keyboard(),
             parse_mode="markdown",
         )
@@ -1746,14 +1691,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         asleep = db.is_buyer_asleep()
         await db.run_async(db.set_buyer_asleep, not asleep)
-        if not asleep:
-            state_label = (
-                "💤 **Asleep** — every new post now carries the footer\n"
-                "`Buyer away, back shortly`\n"
-                "Use the button again to switch it back off."
-            )
-        else:
-            state_label = "☀️ **Awake** — posts go out with their normal footer again."
+        state_label = texts.ASLEEP_ON if not asleep else texts.ASLEEP_OFF
         await event.reply(state_label, buttons=_home_keyboard(), parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/addsupplier(?:\s+(.+))?"))
@@ -1763,12 +1701,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         arg = (event.pattern_match.group(1) or "").strip()
         if not arg:
             await event.reply(
-                "**Add a source** — any of these work:\n"
-                "• Channel username: `@kycgroupke`\n"
-                "• Numeric ID: `-1001234567890`\n"
-                "• **Forward a message FROM the channel/group** — best for private "
-                "chats with no username (I grab its exact ID automatically).\n\n"
-                "Example: `/addsupplier @kycgroupke`",
+                texts.SOURCE_ADD_PROMPT,
                 buttons=_home_keyboard(),
             )
             return
@@ -1781,13 +1714,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         arg = (event.pattern_match.group(1) or "").strip()
         if not arg:
             await event.reply(
-                "**Add a destination** — a group where forwarded copies of every "
-                "bot post should land. Any of these work:\n"
-                "• Group username: `@mygroup`\n"
-                "• Numeric ID: `-1001234567890`\n"
-                "• **Forward a message FROM the group** — best for private groups "
-                "with no username (I grab its exact ID automatically).\n\n"
-                "Example: `/adddestination @mygroup`",
+                texts.DEST_ADD_USAGE,
                 buttons=_home_keyboard(),
             )
             return
@@ -1811,28 +1738,27 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         cl = forward_client_ref if (forward_client_ref and forward_client_ref.is_connected()) else user_client_ref
         if not cl or not cl.is_connected():
             await event.reply(
-                "⚠️ Neither forwarding account nor user client is connected.",
+                texts.SYNC_NO_CLIENT,
                 buttons=_home_keyboard(),
             )
             return
-        status_msg = await event.reply("🔄 Scanning dialogs for new destination groups...")
+        status_msg = await event.reply(texts.SYNC_SCANNING)
         import main as main_mod
         try:
             added = await main_mod.sync_destinations_from_forward_client(cl, bot)
             if added:
                 await status_msg.edit(
-                    f"✅ Auto-synced **{added}** new destination group(s)!\n"
-                    f"All new posts will now be forwarded there.",
+                    texts.SYNC_ADDED.format(n=added),
                     buttons=_home_keyboard(),
                 )
             else:
                 await status_msg.edit(
-                    "✅ All groups the account is in are already registered as destinations.",
+                    texts.SYNC_NONE,
                     buttons=_home_keyboard(),
                 )
         except Exception as exc:
             logger.exception("Error running /syncdestinations")
-            await status_msg.edit(f"❌ Failed to sync: {exc}", buttons=_home_keyboard())
+            await status_msg.edit(texts.SYNC_FAIL.format(error=exc), buttons=_home_keyboard())
 
     @bot.on(events.NewMessage(pattern=r"^/removesupplier(?:\s+(.+))?"))
     async def handle_remove_supplier(event):
@@ -1841,17 +1767,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         arg = (event.pattern_match.group(1) or "").strip()
         if not arg:
             await event.reply(
-                "Usage: `/removesupplier <channel_username>`\n"
-                "Example: `/removesupplier @kycgroupke`\n"
-                "This **permanently deletes** the source (history is kept). For a "
-                "temporary stop use the Sources menu → Pause.",
+                texts.SOURCE_REMOVE_USAGE,
                 buttons=_home_keyboard(),
             )
             return
 
         s = db.get_supplier_by_chat(username=arg.lstrip("@"))
         if not s:
-            await event.reply(f"❌ Supplier **@{arg.lstrip('@')}** not found.", buttons=_home_keyboard())
+            await event.reply(texts.SOURCE_REMOVE_MISSING.format(name=arg.lstrip('@')), buttons=_home_keyboard())
             return
         await db.run_async(db.delete_supplier, s["id"])
         await db.run_async(
@@ -1861,7 +1784,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             actor_id=event.sender_id,
             detail=f"@{arg.lstrip('@')}",
         )
-        await event.reply(f"🗑 Supplier **@{arg.lstrip('@')}** permanently deleted.", buttons=_home_keyboard())
+        await event.reply(texts.SOURCE_REMOVED.format(name=arg.lstrip('@')), buttons=_home_keyboard())
 
     @bot.on(events.NewMessage(pattern=r"^/dedupe_suppliers$"))
     async def handle_dedupe_suppliers(event):
@@ -1871,16 +1794,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         merges = summary.get("merges", [])
         if not merges:
             await event.reply(
-                "🧹 No duplicate suppliers found — the table is already clean.",
+                texts.DEDUPE_NONE,
                 buttons=_home_keyboard(),
             )
             return
-        lines = [f"🧹 **Merged {summary['rows_removed']} duplicate supplier row(s):**"]
+        lines = [texts.DEDUPE_TITLE.format(n=summary['rows_removed'])]
         for m in merges:
-            lines.append(
-                f"• row `#{m['removed']}` (stored `{m.get('duplicate_username') or '?'}`) "
-                f"merged into row `#{m['merged_into']}` (channel `{m['channel_id']}`)"
-            )
+            lines.append(texts.DEDUPE_LINE.format(removed=m['removed'], into=m['merged_into']))
         for m in merges:
             await db.run_async(
                 db.record_audit,
@@ -1904,17 +1824,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         raw = os.environ.get("SOURCE_CHANNELS", "")
         channels = [ch.strip() for ch in raw.split(",") if ch.strip()]
-        preview = ", ".join(f"`{c}`" for c in channels) if channels else "*(none listed in .env)*"
+        preview = ", ".join(f"`{c}`" for c in channels) if channels else texts.RESEED_NONE
         await event.reply(
-            "⚠️ **Re-import SOURCE_CHANNELS from .env?**\n\n"
-            f"Currently in .env: {preview}\n\n"
-            "This is the deliberate escape hatch only:\n"
-            "• Adds/refreshes every channel listed in .env.\n"
-            "• Does **NOT** delete anything — channels removed from .env are not removed here.\n"
-            "• After this, .env is ignored again on future restarts.",
+            texts.RESEED_ASK.format(preview=preview),
             buttons=[
-                [Button.inline("✅ Yes, Re-import", data="reseed:yes")],
-                [Button.inline("❌ Cancel", data="wiz:cancel")],
+                [Button.inline(texts.BTN_RESEED_YES, data="reseed:yes")],
+                [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
             ],
         )
 
@@ -1936,7 +1851,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         skips = db.get_skipped_listings(limit=_PAGE_SIZE, offset=0)
         if not skips:
-            await event.reply("✅ No skipped messages logged.", buttons=_home_keyboard())
+            await event.reply(texts.SKIPPED_EMPTY, buttons=_home_keyboard())
             return
 
         text, buttons = _skipped_digest(skips, 0, db.count_skipped_listings())
@@ -1948,7 +1863,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         rows = db.get_published_listings(limit=_PAGE_SIZE, offset=0)
         if not rows:
-            await event.reply("📜 No published posts yet.", buttons=_home_keyboard())
+            await event.reply(texts.PUBLISHED_EMPTY, buttons=_home_keyboard())
             return
 
         text, buttons = _published_digest(rows, 0, db.count_published_listings())
@@ -1961,16 +1876,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         arg = event.pattern_match.group(1)
         if not arg:
             await event.reply(
-                "Usage: `/post <number>`\n"
-                "Shows the published post with that **Post number** (e.g. `/post 12`) "
-                "and its source-channel link.",
+                texts.POST_USAGE,
                 buttons=_home_keyboard(),
             )
             return
         post = db.get_post_by_number(int(arg))
         if not post:
             await event.reply(
-                f"❌ No published post with number `#{arg}`.",
+                texts.POST_NOT_FOUND.format(text=arg),
                 buttons=_home_keyboard(),
             )
             return
@@ -1984,29 +1897,26 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         arg = (event.pattern_match.group(1) or "").strip()
         if not arg:
             await event.reply(
-                "Usage: `/preview <listing_id>`\nShows the exact formatted post before publishing.",
+                texts.PREVIEW_USAGE,
                 buttons=_home_keyboard(),
             )
             return
 
         listing = db.get_listing_by_id(int(arg))
         if not listing:
-            await event.reply(f"❌ Listing **#{arg}** not found.", buttons=_home_keyboard())
+            await event.reply(texts.NOT_FOUND_LISTING, buttons=_home_keyboard())
             return
 
         try:
             preview_text = await _build_preview_text(listing)
             await event.reply(
-                f"📄 **Preview of Listing #{arg}**\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"{preview_text}",
+                texts.PREVIEW.format(id=arg, text=preview_text),
                 buttons=_listing_action_buttons(listing),
             )
         except Exception as exc:
             logger.warning("Preview too long to send for listing #%s: %s", arg, exc)
             await event.reply(
-                f"⚠️ Preview for **#{arg}** is too long to display inline. "
-                f"Use `/pending` to find it.",
+                texts.PREVIEW_TOO_LONG.format(id=arg),
                 buttons=_home_keyboard(),
             )
 
@@ -2019,7 +1929,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         )
         # Validate admin via sender_id (callback queries can't use event.reply)
         if event.sender_id != ADMIN_USER_ID:
-            await event.answer("⛔ Unauthorized", alert=True)
+            await event.answer(texts.UNAUTHORIZED, alert=True)
             return
 
         data_str = event.data.decode("utf-8")
@@ -2029,11 +1939,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             try:
                 skip_id = int(data_str.split(":", 1)[1])
             except ValueError:
-                await event.answer("Invalid skip id", alert=True)
+                await event.answer(texts.SKIP_INVALID, alert=True)
                 return
             reopened = await db.run_async(db.reopen_skipped, skip_id)
             if not reopened:
-                await event.answer("Skip not found or already processed.", alert=True)
+                await event.answer(texts.SKIP_NOT_FOUND, alert=True)
                 return
             await db.run_async(
                 db.record_audit,
@@ -2057,7 +1967,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         # ---- Pure navigation -----------------------------------------------
         if data_str == "menu:home":
-            await event.answer("🏠 Home")
+            await event.answer(texts.BTN_HOME)
             await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
             return
 
@@ -2065,7 +1975,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             suppliers = db.list_suppliers(active_only=False)
             text = _sources_menu_text(suppliers)
             if not suppliers:
-                text += "\nTap **➕ Add Source** to configure your first one."
+                text += texts.SOURCE_ADD_PROMPT_PLAIN
             await _message_delete_send(event, text, buttons=_sources_buttons(suppliers), parse_mode=None)
             return
 
@@ -2088,8 +1998,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 _wizard_state[ADMIN_USER_ID] = {"step": "addheader"}
                 await _message_delete_send(
                     event,
-                    f"Send the {HEADER_EMOJI_COUNT} custom emoji "
-                    "in one message.\n",
+                    texts.HEADER_ADD_PROMPT.format(n=HEADER_EMOJI_COUNT),
                     parse_mode="markdown",
                 )
                 return
@@ -2114,11 +2023,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             header_id = int(m.group(1))
             header = db.get_header(header_id)
             if header is None:
-                await event.answer("That header is already gone.", alert=True)
+                await event.answer(texts.HEADER_GONE, alert=True)
             else:
                 await db.run_async(db.delete_header, header_id)
                 logger.info("Deleted header #%s", header_id)
-                await event.answer(f"🗑 Deleted header #{header_id}")
+                await event.answer(texts.HEADER_DELETED_ANSWER.format(id=header_id))
                 await db.run_async(
                     db.record_audit,
                     "header_deleted",
@@ -2129,7 +2038,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             headers = db.list_headers()
             await _message_delete_send(
                 event,
-                f"🗑 Deleted **header #{header_id}**.\n\n" + _headers_menu_text(headers),
+                texts.HEADER_DELETED.format(id=header_id) + _headers_menu_text(headers),
                 buttons=_headers_buttons(headers),
                 parse_mode="markdown",
             )
@@ -2150,7 +2059,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 paused = db.is_paused()
                 await db.run_async(db.set_paused, not paused)
                 await event.answer(
-                    "⏸ Automatic publishing paused" if not paused else "▶ Automatic publishing resumed"
+                    texts.PAUSE_ANSWER_ON if not paused else texts.PAUSE_ANSWER_OFF
                 )
                 await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
                 return
@@ -2158,8 +2067,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 asleep = db.is_buyer_asleep()
                 await db.run_async(db.set_buyer_asleep, not asleep)
                 await event.answer(
-                    "💤 Asleep — footer added to new posts" if not asleep
-                    else "☀️ Awake — footer removed"
+                    texts.ASLEEP_ANSWER_ON if not asleep else texts.ASLEEP_ANSWER_OFF
                 )
                 await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
                 return
@@ -2168,7 +2076,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 if not skips:
                     await _message_delete_send(
                         event,
-                        "✅ No skipped messages logged.",
+                        texts.SKIPPED_EMPTY,
                         buttons=_home_button_row(),
                     )
                     return
@@ -2180,7 +2088,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 if not rows:
                     await _message_delete_send(
                         event,
-                        "📜 No published posts yet.",
+                        texts.PUBLISHED_EMPTY,
                         buttons=_home_button_row(),
                     )
                     return
@@ -2194,9 +2102,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             try:
                 sent = await event.client.send_message(
                     ADMIN_USER_ID,
-                    "Search a published post — send the **post number** "
-                    "(the `#N` on each published card), e.g. `12`.",
-                    buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
+                    texts.SEARCH_PROMPT,
+                    buttons=[Button.inline(texts.BTN_CANCEL, data="wiz:cancel")],
                     parse_mode="markdown",
                 )
                 prompt_id = getattr(sent, "id", None)
@@ -2218,7 +2125,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             edit_cancelled = bool(wiz and wiz.get("step") == "edit" and wiz.get("listing_id"))
             if edit_cancelled:
                 _drafts.pop(wiz["listing_id"], None)
-            await event.answer("Cancelled")
+            await event.answer(texts.CANCELLED)
             try:
                 await event.delete()
             except Exception:
@@ -2227,7 +2134,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 try:
                     await event.client.send_message(
                         ADMIN_USER_ID,
-                        "✏️ Edit cancelled.",
+                        texts.EDIT_CANCELLED,
                         parse_mode="markdown",
                     )
                 except Exception:
@@ -2336,18 +2243,15 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             sid = int(supdel_match.group(1))
             s = db.get_supplier_by_id(sid)
             if not s:
-                await event.answer("Source not found.", alert=True)
+                await event.answer(texts.SOURCE_NOT_FOUND, alert=True)
                 return
             handle = _pretty_source(s.get("channel_username"), s.get("display_name"))
             await _message_delete_send(
                 event,
-                f"🗑 **Delete {handle} permanently?**\n"
-                f"This removes the source completely and stops monitoring it.\n"
-                f"Existing listings & history stay (their source link becomes '—').\n"
-                f"This cannot be undone.",
+                texts.SOURCE_DELETE_ASK.format(name=handle),
                 buttons=[
-                    [Button.inline("✅ Yes, Delete Forever", data=f"del:yes:{sid}")],
-                    [Button.inline("❌ Cancel", data="wiz:cancel")],
+                    [Button.inline(texts.BTN_DELETE_YES, data=f"del:yes:{sid}")],
+                    [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
                 ],
             )
             return
@@ -2357,7 +2261,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             sid = int(del_match.group(1))
             s = db.get_supplier_by_id(sid)
             if not s:
-                await event.answer("Source not found.", alert=True)
+                await event.answer(texts.SOURCE_NOT_FOUND, alert=True)
                 return
             await db.run_async(db.delete_supplier, sid)
             await db.run_async(
@@ -2374,9 +2278,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             try:
                 await event.client.send_message(
                     ADMIN_USER_ID,
-                    f"🗑 **Source permanently deleted.**\n"
-                    f"{_pretty_source(s.get('channel_username'), s.get('display_name'))} "
-                    f"is gone from the list. History is kept.",
+                    texts.SOURCE_DELETED.format(name=_pretty_source(s.get('channel_username'), s.get('display_name'))),
                     parse_mode="markdown",
                 )
             except Exception:
@@ -2396,7 +2298,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             did = int(dest_match.group(1))
             d = db.get_destination_by_id(did, with_health=True)
             if not d:
-                await event.answer("Destination not found.", alert=True)
+                await event.answer(texts.DEST_NOT_FOUND, alert=True)
                 return
             await _edit_destination_menu(event, d)
             return
@@ -2406,7 +2308,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             did = int(desttoggle_match.group(1))
             d = db.get_destination_by_id(did)
             if not d:
-                await event.answer("Destination not found.", alert=True)
+                await event.answer(texts.DEST_NOT_FOUND, alert=True)
                 return
             await db.run_async(db.set_destination_active, did, not d["active"])
             await db.run_async(
@@ -2426,18 +2328,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             did = int(destdel_match.group(1))
             d = db.get_destination_by_id(did)
             if not d:
-                await event.answer("Destination not found.", alert=True)
+                await event.answer(texts.DEST_NOT_FOUND, alert=True)
                 return
             await _message_delete_send(
                 event,
-                f"🗑 **Delete {_destination_markup(_destination_label(d), d.get('chat_id'))} "
-                f"permanently?**\n"
-                f"This removes the destination and stops forwarding posts to it.\n"
-                f"Existing forward history stays.\n"
-                f"This cannot be undone.",
+                texts.DEST_DELETE_ASK.format(name=_destination_markup(_destination_label(d), d.get('chat_id'))),
                 buttons=[
-                    [Button.inline("✅ Yes, Delete Forever", data=f"destdelyes:{did}")],
-                    [Button.inline("❌ Cancel", data="wiz:cancel")],
+                    [Button.inline(texts.BTN_DELETE_YES, data=f"destdelyes:{did}")],
+                    [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
                 ],
             )
             return
@@ -2447,7 +2345,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             did = int(destdelyes_match.group(1))
             d = db.get_destination_by_id(did)
             if not d:
-                await event.answer("Destination not found.", alert=True)
+                await event.answer(texts.DEST_NOT_FOUND, alert=True)
                 return
             await db.run_async(db.delete_destination, did)
             await db.run_async(
@@ -2464,9 +2362,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             try:
                 await event.client.send_message(
                     ADMIN_USER_ID,
-                    f"🗑 **Destination permanently deleted.**\n"
-                    f"{_destination_markup(_destination_label(d), d.get('chat_id'))} "
-                    f"is gone. History is kept.",
+                    texts.DEST_DELETE_PERM.format(name=_destination_markup(_destination_label(d), d.get('chat_id'))),
                     parse_mode="markdown",
                 )
             except Exception:
@@ -2485,16 +2381,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             raw = (state.get("raw") or "").strip()
             _wizard_state.pop(ADMIN_USER_ID, None)
             if not raw:
-                await event.answer("Nothing to add.", alert=True)
+                await event.answer(texts.DEST_NOTHING, alert=True)
                 return
             try:
                 did = await db.run_async(db.add_destination, raw, raw, True)
             except ValueError as exc:
                 await _message_delete_send(
                     event,
-                    f"⚠️ **Could not add destination**: {exc}\n"
-                    f"Use a group username (`@mygroup`) or numeric ID "
-                    f"(`-1001234567890`).",
+                    texts.DEST_ADD_ERROR.format(error=exc),
                     buttons=_home_keyboard(),
                 )
                 return
@@ -2507,10 +2401,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             await _message_delete_send(
                 event,
-                f"⚠️ **Destination added (unverified)**: {_destination_markup(raw)}\n"
-                f"I couldn't confirm I can send to it yet — delivery will be "
-                f"retried on every post until it succeeds, and failures show up "
-                f"in the queue. Make sure the bot account is a member.",
+                texts.DEST_ADDED_UNVERIFIED.format(name=_destination_markup(raw)),
                 buttons=_home_keyboard(),
             )
             return
@@ -2536,9 +2427,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 try:
                     await event.client.send_message(
                         ADMIN_USER_ID,
-                        f"✅ Re-imported {n} channel(s) from SOURCE_CHANNELS.\n"
-                        "The one-time seed marker is set again — .env won't be consulted "
-                        "on future restarts.",
+                        texts.RESEED_DONE.format(n=n),
                         buttons=_home_keyboard(),
                         parse_mode="markdown",
                     )
@@ -2546,19 +2435,19 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     pass
             except Exception:
                 logger.exception("reseed_from_env failed")
-                await event.answer("Re-seed failed — check the logs.", alert=True)
+                await event.answer(texts.RESEED_FAIL, alert=True)
             return
 
         if data_str == "supaddunresolved":
             state = _wizard_state.get(ADMIN_USER_ID) or {}
             raw = state.get("raw") if state.get("step") == "add_confirm_unresolved" else None
             if not raw:
-                await event.answer("That request has expired — press ➕ Add Source to start again.", alert=True)
+                await event.answer(texts.SOURCE_EXPIRED, alert=True)
                 return
             _wizard_state.pop(ADMIN_USER_ID, None)
             username, _ = _supplier_ref_from_text(raw)
             if not username:
-                await event.answer("Invalid reference.", alert=True)
+                await event.answer(texts.INVALID_REF, alert=True)
                 return
             sid = await db.run_async(
                 db.add_supplier,
@@ -2579,10 +2468,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             try:
                 await event.client.send_message(
                     ADMIN_USER_ID,
-                    f"✅ Source **@{username}** stored as **unresolved**.\n"
-                    f"I'll retry resolving it in the background and ping you the moment "
-                    f"monitoring actually starts for it.\n\n"
-                    f"Faster: forward any message **from that channel** and I'll add it instantly.",
+                    texts.SOURCE_STORED_UNRESOLVED.format(name=username),
                     buttons=_home_keyboard(),
                     parse_mode="markdown",
                 )
@@ -2594,13 +2480,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             _wizard_state[ADMIN_USER_ID] = {"step": "add"}
             await _message_delete_send(
                 event,
-                "✏️ **Add a source** — any of these work:\n"
-                "• Channel username: `@kycgroupke`\n"
-                "• Numeric ID: `-1001234567890`\n"
-                "• **Forward a message FROM the channel/group** — best for private "
-                "chats with no username (I'll grab its exact ID automatically).\n\n"
-                "Send any of the above now.",
-                buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
+                texts.SOURCE_ADD_PROMPT,
+                buttons=[Button.inline(texts.BTN_CANCEL, data="wiz:cancel")],
                 parse_mode="markdown",
             )
             return
@@ -2609,14 +2490,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             _wizard_state[ADMIN_USER_ID] = {"step": "adddest"}
             await _message_delete_send(
                 event,
-                "✏️ **Add a destination** — a group where forwarded copies of every "
-                "bot post should land. Any of these work:\n"
-                "• Group username: `@mygroup`\n"
-                "• Numeric ID: `-1001234567890`\n"
-                "• **Forward a message FROM the group** — best for private groups "
-                "with no username (I'll grab its exact ID automatically).\n\n"
-                "Send any of the above now.",
-                buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
+                texts.DEST_ADD_PROMPT,
+                buttons=[Button.inline(texts.BTN_CANCEL, data="wiz:cancel")],
                 parse_mode="markdown",
             )
             return
@@ -2626,33 +2501,35 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if preview_match:
             listing = db.get_listing_by_id(int(preview_match.group(1)))
             if not listing:
-                await event.answer("Listing not found in database.", alert=True)
+                await event.answer(texts.NOT_FOUND_LISTING, alert=True)
                 return
             listing_id = listing["id"]
             # Answer the button IMMEDIATELY so Telegram doesn't consider the
             # callback expired (which made the button appear dead).
-            await event.answer(f"📍 Building preview of Listing #{listing_id}")
+            await event.answer(texts.PREVIEW_BUILDING.format(id=listing_id))
             try:
                 preview_text = await _build_preview_text(listing)
             except Exception:
                 logger.exception("Failed to build preview for listing #%s", listing_id)
-                await event.answer("Could not build preview for this listing.", alert=True)
+                await event.answer(texts.PREVIEW_FAIL, alert=True)
                 return
             # Send the replacement preview FIRST so the original prompt card is
             # never removed without a confirmed replacement in its place.
             try:
                 await event.client.send_message(
                     ADMIN_USER_ID,
-                    f"📄 **Preview of Listing #{listing_id}**\n"
-                    f"Source: {_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name'))} · Status: `{listing['status']}`\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"{preview_text}",
+                    texts.PREVIEW_FULL.format(
+                        id=listing_id,
+                        source=_pretty_source(listing.get('supplier_username'), listing.get('supplier_display_name')),
+                        status=listing['status'],
+                        text=preview_text,
+                    ),
                     buttons=_listing_action_buttons(listing),
                     parse_mode="markdown",
                 )
             except Exception:
                 logger.exception("Failed to send preview message for listing #%s", listing_id)
-                await event.answer("Could not send the preview.", alert=True)
+                await event.answer(texts.PREVIEW_SEND_FAIL, alert=True)
                 return
             # Only now is the tapped card removed.
             try:
@@ -2665,10 +2542,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if edit_match:
             listing = db.get_listing_by_id(int(edit_match.group(1)))
             if not listing:
-                await event.answer("Listing not found in database.", alert=True)
+                await event.answer(texts.NOT_FOUND_LISTING, alert=True)
                 return
             if not listing_is_editable(listing["status"]):
-                await event.answer(f"Cannot edit — status is {listing['status']}", alert=True)
+                await event.answer(texts.EDIT_CANT.format(status=listing['status']), alert=True)
                 return
             listing_id = listing["id"]
             _wizard_state[ADMIN_USER_ID] = {"step": "edit", "listing_id": listing_id}
@@ -2681,7 +2558,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 sent = await event.client.send_message(
                     ADMIN_USER_ID,
                     _edit_prompt(listing, _drafts.get(listing_id)),
-                    buttons=[Button.inline("🚫 Cancel", data="wiz:cancel")],
+                    buttons=[Button.inline(texts.BTN_CANCEL, data="wiz:cancel")],
                     parse_mode="markdown",
                 )
                 prompt_id = getattr(sent, "id", None)
@@ -2693,7 +2570,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         match = re.match(r"^(approve|skip):(\d+)$", data_str)
         if not match:
-            await event.answer("Unknown action", alert=True)
+            await event.answer(texts.UNKNOWN_ACTION, alert=True)
             return
 
         action, listing_id_str = match.groups()
@@ -2701,14 +2578,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         listing = db.get_listing_by_id(listing_id)
 
         if not listing:
-            await event.answer("Listing not found in database.", alert=True)
+            await event.answer(texts.NOT_FOUND_LISTING, alert=True)
             return
 
         # Approve / Skip only valid on pending listings (never on already-approved,
         # preventing double-publish races on re-taps).
         if not listing_is_editable(listing["status"]):
             await event.answer(
-                f"Already processed (status: {listing['status']})", alert=True
+                texts.ALREADY_DONE.format(status=listing['status']), alert=True
             )
             # The listing was already handled by another action, a second tap, or
             # the worker — move the inbox to the next pending listing.
@@ -2731,7 +2608,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 "admin_skip",
                 listing.get("raw_text") or listing.get("clean_text") or "",
             )
-            await event.answer("⏭️ Skipped")
+            await event.answer(texts.SKIPPED_ANSWER)
             try:
                 await event.delete()
             except Exception:
@@ -2739,7 +2616,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             try:
                 await event.client.send_message(
                     ADMIN_USER_ID,
-                    f"Listing #{listing_id} skipped for now.",
+                    texts.SKIPPED_MSG.format(id=listing_id),
                     parse_mode="markdown",
                 )
             except Exception:
@@ -2757,16 +2634,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if fresh is not None and not listing_is_editable(fresh["status"]):
                 _drafts.pop(listing_id, None)
                 await event.answer(
-                    f"⚠️ Listing #{listing_id} is no longer editable "
-                    f"(status: {fresh['status']}). Draft discarded — nothing was published.",
+                    texts.APPROVE_STALE_ALERT.format(id=listing_id, status=fresh['status']),
                     alert=True,
                 )
                 await _message_delete_send(
                     event,
-                    f"⚠️ **Listing #{listing_id} was NOT published.**\n"
-                    f"Status is now `{fresh['status']}`, so the draft you were "
-                    f"editing was discarded.\n"
-                    f"Check the Pending list for its current state.",
+                    texts.APPROVE_STALE.format(id=listing_id, status=fresh['status']),
                     buttons=_home_keyboard(),
                 )
                 await _advance_review(bot)
@@ -2778,7 +2651,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             content_lines = [ln.strip() for ln in content_text.split("\n") if ln.strip()]
             platform_name = listing.get("platform_name") or listing.get("game_name")
 
-            await event.answer("Processing...")
+            await event.answer(texts.APPROVE_PROCESSING)  # Processing...
             # Approve is a deliberate one-at-a-time human decision: it always
             # publishes immediately, even while "All Stop" is on. Pausing only
             # gates AUTOMATIC publishing (auto-publish paths in main.py).
@@ -2821,9 +2694,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     )
                     await event.client.send_message(
                         ADMIN_USER_ID,
-                        f"♻️ **Listing #{listing_id} NOT published** — it is "
-                        f"identical to #{twin_id}, which is already published.\n"
-                        f"Marked as a duplicate instead of posting a second copy.",
+                        texts.APPROVE_DUP.format(id=listing_id, twin=twin_id),
                         parse_mode="markdown",
                         buttons=_home_keyboard(),
                     )
@@ -2863,10 +2734,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         try:
                             await event.client.send_message(
                                 ADMIN_USER_ID,
-                                f"♻️ **Listing #{listing_id} NOT published** — "
-                                f"an identical copy (#{race_twin}) reached the "
-                                f"channel first.\nMarked as a duplicate; "
-                                f"nothing duplicate was sent.",
+                                texts.APPROVE_RACE.format(id=listing_id, twin=race_twin),
                                 parse_mode="markdown",
                                 buttons=_home_keyboard(),
                             )
@@ -2876,7 +2744,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         try:
                             await event.client.send_message(
                                 ADMIN_USER_ID,
-                                f"⚠️ Listing #{listing_id} already being published elsewhere — nothing duplicate sent.",
+                                texts.APPROVE_BUSY.format(id=listing_id),
                                 parse_mode="markdown",
                             )
                         except Exception:
@@ -2928,8 +2796,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         try:
                             await event.client.send_message(
                                 ADMIN_USER_ID,
-                                f"⚠️ Listing #{listing_id} approved but send failed.\n"
-                                f"Queued for retry. Error: {e}",
+                                texts.APPROVE_SEND_FAIL.format(id=listing_id, error=e),
                                 buttons=_home_keyboard(),
                                 parse_mode="markdown",
                             )
@@ -2976,7 +2843,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         logger.exception("Could not record published state for listing #%s", listing_id)
 
                 try:
-                    confirmation = f"✅ Listing #{listing_id} Published! · Post #{post_number}"
+                    confirmation = texts.APPROVE_DONE.format(id=listing_id, post=post_number)
                     approved_view = dict(listing)
                     approved_view["published_message_id"] = published_msg_id
                     await event.client.send_message(
@@ -3001,7 +2868,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 try:
                     await event.client.send_message(
                         ADMIN_USER_ID,
-                        f"✅ Listing #{listing_id} queued for republish.",
+                        texts.APPROVE_QUEUED.format(id=listing_id),
                         parse_mode="markdown",
                     )
                 except Exception:
@@ -3040,19 +2907,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         retry_buttons = _headers_buttons(db.list_headers())
         if not spans:
             await event.reply(
-                "❌ I found no **custom emoji** in that message.\n\n"
-                "Send the emoji themselves (from Telegram's custom-emoji picker), "
-                "not a forwarded message and not plain text — I need their document "
-                "ids to reuse the exact same emoji in your posts.",
+                texts.HEADER_NO_EMOJI,
                 buttons=retry_buttons,
                 parse_mode="markdown",
             )
             return
         if len(spans) != HEADER_EMOJI_COUNT:
             await event.reply(
-                f"❌ That message has **{len(spans)}** custom emoji — a header needs "
-                f"exactly **{HEADER_EMOJI_COUNT}**.\n"
-                f"Send {HEADER_EMOJI_COUNT} of them spelling **WTB**, and nothing else.",
+                texts.HEADER_WRONG_COUNT.format(got=len(spans), need=HEADER_EMOJI_COUNT),
                 buttons=retry_buttons,
                 parse_mode="markdown",
             )
@@ -3062,9 +2924,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         stray = _non_emoji_residue(message, spans)
         if stray:
             await event.reply(
-                f"❌ Your message also contained other text (`{stray}`).\n\n"
-                f"Send **only** the {HEADER_EMOJI_COUNT} custom emoji — spaces and line "
-                "breaks are fine, but no words, prices or links.",
+                texts.HEADER_STRAY.format(stray=stray, need=HEADER_EMOJI_COUNT),
                 buttons=retry_buttons,
                 parse_mode="markdown",
             )
@@ -3076,7 +2936,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         except Exception:
             logger.exception("Failed to save a custom-emoji header")
             await event.reply(
-                "❌ Could not save that header. Nothing was changed — try again.",
+                texts.HEADER_SAVE_FAIL,
                 buttons=retry_buttons,
             )
             return
@@ -3093,8 +2953,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         )
         saved = db.list_headers()
         await event.reply(
-            f"✅ Saved as **header #{len(saved)}**.\n"
-            "Press the header to delete",
+            texts.HEADER_SAVED.format(n=len(saved)),
             buttons=_headers_buttons(saved),
             parse_mode="markdown",
         )
@@ -3155,14 +3014,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             listing_id = state.get("listing_id")
             listing = db.get_listing_by_id(listing_id)
             if not listing:
-                await event.reply("❌ Listing not found.", buttons=_home_keyboard())
+                await event.reply(texts.NOT_FOUND_LISTING, buttons=_home_keyboard())
                 return
             if not listing_is_editable(listing["status"]):
                 _drafts.pop(listing_id, None)
                 await event.reply(
-                    f"⚠️ Cannot edit Listing #{listing_id}: its status is now "
-                    f"`{listing['status']}`, so it is no longer editable. "
-                    f"Nothing was saved.",
+                    texts.EDIT_LOCKED.format(id=listing_id, status=listing['status']),
                     buttons=_home_keyboard(),
                 )
                 return
@@ -3173,7 +3030,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             except Exception:
                 logger.exception("Could not build draft preview for listing #%s", listing_id)
                 await event.reply(
-                    "⚠️ Could not build a preview from that text. Try again.",
+                    texts.EDIT_PREVIEW_FAIL,
                     buttons=_home_keyboard(),
                 )
                 return
@@ -3185,10 +3042,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 except Exception:
                     pass
             await event.reply(
-                f"✏️ **Draft for Listing #{listing_id}** — review below, "
-                f"then Approve or Edit again.\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"{preview_text}",
+                texts.DRAFT.format(id=listing_id, price_note="", text=preview_text),
                 buttons=_listing_action_buttons(listing),
                 parse_mode="markdown",
             )
@@ -3197,8 +3051,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if state["step"] == "post_search":
             if not text.isdigit():
                 await event.reply(
-                    f"`{text}` isn't a post number — send a number like `12` "
-                    f"(or `/post 12`).",
+                    texts.POST_NOT_NUMBER.format(text=text),
                     buttons=_home_keyboard(),
                     parse_mode="markdown",
                 )
@@ -3206,7 +3059,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             post = db.get_post_by_number(int(text))
             if not post:
                 await event.reply(
-                    f"❌ No published post with number `#{text}`.",
+                    texts.POST_NOT_FOUND.format(text=text),
                     buttons=_home_keyboard(),
                     parse_mode="markdown",
                 )

@@ -34,6 +34,7 @@ import db
 import filters
 import parser
 import publish_guard
+import texts
 
 load_dotenv()
 
@@ -587,12 +588,7 @@ def zero_resolved_suppliers_alert_text(active_total: int, resolved_ok: int) -> O
     configured but nothing resolved (0 configured is a valid calm state).
     """
     if active_total > 0 and resolved_ok == 0:
-        return (
-            f"🚨 **0 of {active_total} suppliers resolved — the bot is running but "
-            f"MONITORING NOTHING.** Check that the account is still in the source "
-            f"channels (kicked? deleted? logged out?) or fix the sources in the "
-            f"admin bot's Sources menu."
-        )
+        return texts.ZERO_RESOLVED_ALERT.format(active_total=active_total)
     return None
 
 
@@ -937,12 +933,7 @@ async def _alert_admin_duplicate_at_publish(
         if not listing_dict:
             return
         listing_dict["supplier_username"] = listing_dict.get("supplier_username")
-        text = (
-            f"♻️ **Not published — duplicate**\n"
-            f"━━━━━━━━━━━━━━━━━\n"
-            f"Listing #{listing_id} is identical to #{twin_id}, which is already "
-            f"published. Marked as a duplicate instead of posting a second copy."
-        )
+        text = texts.APPROVE_DUP.format(id=listing_id, twin=twin_id)
         await bot_client.send_message(ADMIN_USER_ID, text, parse_mode="markdown")
     except Exception:
         logger.exception(
@@ -1226,7 +1217,7 @@ async def sync_destinations_from_forward_client(
             try:
                 await bot_client.send_message(
                     ADMIN_USER_ID,
-                    f"🔄 Auto-synced **{newly_added}** destination group(s) from your forwarding account.",
+                    texts.SYNC_AUTO.format(n=newly_added),
                 )
             except Exception:
                 pass
@@ -2737,8 +2728,7 @@ async def main() -> None:
                                     try:
                                         await bot_client.send_message(
                                             ADMIN_USER_ID,
-                                            f"➕ **New destination auto-detected**: {title} (`{store_ref}`)\n"
-                                            f"Joined via second account. Future posts will be forwarded here.",
+                                            texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref),
                                         )
                                     except Exception:
                                         pass
@@ -2774,8 +2764,7 @@ async def main() -> None:
             try:
                 await bot_client.send_message(
                     ADMIN_USER_ID,
-                    "🛠 **Manual mode online.** Ingestion and auto-publish are OFF. "
-                    "Approvals publish immediately; /skipped is available.",
+                    texts.MANUAL_MODE_ONLINE,
                 )
             except Exception:
                 logger.exception("Could not send manual-mode notice")
@@ -2794,9 +2783,10 @@ async def main() -> None:
                 try:
                     await bot_client.send_message(
                         ADMIN_USER_ID,
-                        f"🧹 Merged {len(dedupe_result['merges'])} duplicate supplier row(s) "
-                        f"({dedupe_result['rows_removed']} removed). No action needed — "
-                        f"listings were preserved on the surviving row.",
+                        texts.STARTUP_DEDUPE.format(
+                            merges=len(dedupe_result['merges']),
+                            removed=dedupe_result['rows_removed'],
+                        ),
                     )
                 except Exception:
                     logger.exception("Could not DM admin about supplier dedupe")
@@ -2815,7 +2805,7 @@ async def main() -> None:
             try:
                 await bot_client.send_message(
                     ADMIN_USER_ID,
-                    "✅ Bot is online and monitoring suppliers.",
+                    texts.BOT_ONLINE,
                 )
                 logger.info("Sent online notice to admin %s", ADMIN_USER_ID)
             except Exception:
