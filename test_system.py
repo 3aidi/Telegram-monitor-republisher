@@ -2042,30 +2042,27 @@ class TestMonitorSystem(unittest.TestCase):
                          "No sources configured yet.")
 
     def test_destinations_buttons_pagination(self):
-        """13 destinations → 6/6/1 across pages with dest:page:N nav."""
+        """20 destinations → 15/5 across pages with dest:page:N nav."""
         import admin_bot
 
         dests = [
             {"id": i, "title": f"Group {i}", "chat_id": -100000000 - i, "active": True}
-            for i in range(1, 14)
+            for i in range(1, 21)
         ]
         b0 = admin_bot._destinations_buttons(dests, 0)
-        self.assertEqual(len(b0), 8)
-        self.assertEqual([x.text for x in b0[6]], ["⬅️ Back", "➡️ Next"])
-        self.assertEqual([x.data.decode() for x in b0[6]], ["menu:home", "dest:page:1"])
-        self.assertEqual(b0[7][0].data.decode(), "destadd")
+        self.assertEqual(len(b0), 17, "15 destinations + Back/Next row + Add row")
+        self.assertEqual([x.text for x in b0[15]], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([x.data.decode() for x in b0[15]], ["menu:home", "dest:page:1"])
+        self.assertEqual(b0[16][0].data.decode(), "destadd")
 
         b1 = admin_bot._destinations_buttons(dests, 1)
-        self.assertEqual([x.text for x in b1[6]], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual(len(b1), 7, "5 destinations + Back row + Add row")
+        self.assertEqual([x.text for x in b1[5]], ["⬅️ Back"])
 
-        b2 = admin_bot._destinations_buttons(dests, 2)
-        self.assertEqual(len(b2), 3)
-        self.assertEqual([x.text for x in b2[1]], ["⬅️ Back"])
-
-        small = admin_bot._destinations_buttons(dests[:3], 0)
-        self.assertEqual(len(small), 5, "3 rows + Back row + Add row")
-        self.assertEqual(small[3][0].text, "⬅️ Back")
-        self.assertEqual(small[4][0].data.decode(), "destadd")
+        small = admin_bot._destinations_buttons(dests[:5], 0)
+        self.assertEqual(len(small), 7, "5 rows + Back row + Add row")
+        self.assertEqual(small[5][0].text, "⬅️ Back")
+        self.assertEqual(small[6][0].data.decode(), "destadd")
 
     def test_skipped_digest_pagination(self):
         """skipped digest gets skip:page:N nav + footer when total is given."""
@@ -2945,6 +2942,71 @@ class TestMonitorSystem(unittest.TestCase):
         pruned = db.prune_ai_cache(max_age_hours=48, db_path=TEST_DB)
         self.assertGreaterEqual(pruned, 1)
         self.assertIsNone(db.get_ai_cache(old_fp, max_age_hours=999, db_path=TEST_DB))
+
+    def test_purge_expired_data(self):
+        """purge_expired_data deletes listings older than max_age_hours (including pending,
+        published, skipped) along with related records, while preserving suppliers,
+        settings, and recording backfill high-water marks."""
+        # 1. Setup a test supplier
+        sup_id = db.add_supplier("@purge_test_sup", None, db_path=TEST_DB)
+
+        # 2. Add an old listing (8.5 hours old) and a recent listing (1 hour old)
+        now = datetime.now(timezone.utc)
+        old_time = (now - timedelta(hours=9)).isoformat()
+        recent_time = (now - timedelta(hours=1)).isoformat()
+
+        # Insert old pending listing
+        old_listing_id = db.insert_listing(
+            sup_id, 5001, None, None, "pending_review",
+            "old pending ad", "old pending ad",
+            db_path=TEST_DB,
+        )
+        # Insert old published listing
+        old_pub_id = db.insert_listing(
+            sup_id, 5002, None, None, "published",
+            "old published ad", "old published ad",
+            published_message_id=8888,
+            db_path=TEST_DB,
+        )
+        # Insert recent pending listing
+        recent_listing_id = db.insert_listing(
+            sup_id, 5003, None, None, "pending_review",
+            "recent pending ad", "recent pending ad",
+            db_path=TEST_DB,
+        )
+
+        # Manually backdate old listings
+        with db.get_db_connection(TEST_DB) as conn:
+            conn.execute(
+                "UPDATE listings SET created_at = ? WHERE id IN (?, ?)",
+                (old_time, old_listing_id, old_pub_id),
+            )
+            # Add an old skip entry
+            conn.execute(
+                "INSERT INTO skips (supplier_id, message_id, reason, raw_text, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (sup_id, 4999, "chatter", "hello", old_time),
+            )
+            # Add a recent skip entry
+            conn.execute(
+                "INSERT INTO skips (supplier_id, message_id, reason, raw_text, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (sup_id, 5004, "chatter", "recent hello", recent_time),
+            )
+            conn.commit()
+
+        # Execute purge with 8.0 hours retention
+        counts = db.purge_expired_data(max_age_hours=8.0, db_path=TEST_DB)
+        self.assertGreaterEqual(counts["listings"], 2)
+        self.assertGreaterEqual(counts["skips"], 1)
+
+        # Old listings must be deleted
+        self.assertIsNone(db.get_listing_by_id(old_listing_id, db_path=TEST_DB))
+        self.assertIsNone(db.get_listing_by_id(old_pub_id, db_path=TEST_DB))
+        # Recent listing must remain
+        self.assertIsNotNone(db.get_listing_by_id(recent_listing_id, db_path=TEST_DB))
+
+        # Check backfill high-water mark was preserved
+        last_id = db.get_last_source_message_id(sup_id, db_path=TEST_DB)
+        self.assertGreaterEqual(last_id, 5002, "High-water mark must remember purged max source_message_id")
 
     def test_ai_rephraser_cache_fingerprint_matches_dedup_key(self):
         """The AI cache key is the SAME key the dedup fingerprint uses."""

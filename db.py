@@ -1410,7 +1410,11 @@ def get_post_by_number(
 def get_last_source_message_id(
     supplier_id: Optional[int], db_path: Optional[str] = None
 ) -> int:
-    """Highest source message id already recorded for a supplier (for backfill)."""
+    """Highest source message id already recorded for a supplier (for backfill).
+
+    Also consults the high-water mark saved by purge_expired_data(): once old
+    listings are deleted, MAX(source_message_id) alone would fall back to 0 and
+    the backfill sweep would re-ingest (and re-publish) old history."""
     if supplier_id is None:
         return 0
     with db_session(db_path) as conn:
@@ -1418,7 +1422,15 @@ def get_last_source_message_id(
             "SELECT COALESCE(MAX(source_message_id), 0) FROM listings WHERE supplier_id = ?",
             (supplier_id,),
         ).fetchone()
-        return int(row[0])
+        hwm_row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (f"{_SOURCE_HWM_PREFIX}{supplier_id}",),
+        ).fetchone()
+        try:
+            hwm = int(hwm_row["value"]) if hwm_row else 0
+        except (TypeError, ValueError):
+            hwm = 0
+        return max(int(row[0]), hwm)
 
 
 def record_blocklist_hit(
@@ -3081,3 +3093,98 @@ def reset_stale_forward_claims(
             (now_iso, cutoff),
         )
         return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# RETENTION: rolling time window. Everything message-related older than the
+# window is deleted — published, skipped, pending review, rejected, failed —
+# so every admin list (Published / Skipped / Pending) only ever shows the last
+# N hours. Configuration is NEVER touched: suppliers, destinations, headers and
+# app_settings (incl. the post_seq counter, so #numbers keep counting up).
+#
+# Only rows that are physically mid-send are spared ('claimed'/'publishing'
+# listings, 'forwarding' forwards): deleting those under a running worker could
+# lose the bookkeeping of a message that is landing right now. They are swept on
+# the next pass once they settle.
+#
+# Dedup compares against listings.created_at within DEDUP_HOURS, so as long as
+# the retention window is >= DEDUP_HOURS (main.py enforces this) the purge can
+# never delete a row the duplicate check still needs.
+# ---------------------------------------------------------------------------
+_RETENTION_INFLIGHT_LISTING_STATUSES = ("claimed", "publishing")
+# app_settings key prefix for the per-supplier backfill high-water mark.
+_SOURCE_HWM_PREFIX = "src_hwm:"
+
+
+def purge_expired_data(
+    max_age_hours: float, db_path: Optional[str] = None
+) -> Dict[str, int]:
+    """Delete all message data older than ``max_age_hours``.
+
+    Returns a per-table count of deleted rows. Runs as ONE transaction so a
+    crash mid-purge leaves the database either untouched or fully purged.
+    """
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    ).isoformat()
+    inflight = ",".join("?" for _ in _RETENTION_INFLIGHT_LISTING_STATUSES)
+    expired_listings_sql = (
+        f"SELECT id FROM listings WHERE created_at < ? "
+        f"AND status NOT IN ({inflight})"
+    )
+    expired_params = (cutoff, *_RETENTION_INFLIGHT_LISTING_STATUSES)
+    counts: Dict[str, int] = {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        # Save each supplier's highest seen source message id BEFORE deleting,
+        # so the backfill sweep keeps resuming after it (see
+        # get_last_source_message_id). Only ever moves forward.
+        for hw in conn.execute(
+            """
+            SELECT supplier_id, MAX(source_message_id) AS mx FROM listings
+            WHERE supplier_id IS NOT NULL GROUP BY supplier_id
+            """
+        ).fetchall():
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = CASE WHEN CAST(excluded.value AS INTEGER)
+                                      > CAST(app_settings.value AS INTEGER)
+                                 THEN excluded.value ELSE app_settings.value END,
+                    updated_at = excluded.updated_at
+                """,
+                (f"{_SOURCE_HWM_PREFIX}{hw['supplier_id']}", str(int(hw["mx"])), now_iso),
+            )
+        # Children first: blocklist_hits has a real FOREIGN KEY to listings and
+        # foreign_keys=ON, so the parent delete would fail while they exist.
+        counts["blocklist_hits"] = conn.execute(
+            f"DELETE FROM blocklist_hits WHERE listing_id IN ({expired_listings_sql})",
+            expired_params,
+        ).rowcount
+        counts["forwardings"] = conn.execute(
+            f"""
+            DELETE FROM forwardings
+            WHERE status != 'forwarding'
+              AND (created_at < ? OR listing_id IN ({expired_listings_sql}))
+            """,
+            (cutoff, *expired_params),
+        ).rowcount
+        counts["audit_log"] = conn.execute(
+            f"""
+            DELETE FROM audit_log
+            WHERE created_at < ? OR listing_id IN ({expired_listings_sql})
+            """,
+            (cutoff, *expired_params),
+        ).rowcount
+        counts["listings"] = conn.execute(
+            f"DELETE FROM listings WHERE id IN ({expired_listings_sql})",
+            expired_params,
+        ).rowcount
+        counts["skips"] = conn.execute(
+            "DELETE FROM skips WHERE timestamp < ?", (cutoff,)
+        ).rowcount
+        counts["ai_cache"] = conn.execute(
+            "DELETE FROM ai_cache WHERE created_at < ?", (cutoff,)
+        ).rowcount
+    return counts

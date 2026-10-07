@@ -66,6 +66,17 @@ AI_CACHE_TTL_HOURS = float(os.environ.get("AI_CACHE_TTL_HOURS", "48") or 48)
 # How long identical content stays blocked as a duplicate: a re-post of the
 # same listing within DEDUP_HOURS is skipped (content fingerprint + price).
 DEDUP_HOURS = int(os.environ.get("DEDUP_HOURS", "8") or 8)
+# RETENTION: rolling window. Every listing (published, skipped, pending review,
+# rejected, ...), skip entry, audit row, forward record and AI cache row older
+# than this is deleted, so the DB and every admin list only hold the last N
+# hours. Clamped to DEDUP_HOURS so the purge can never delete a row the
+# duplicate check still compares against.
+RETENTION_HOURS = max(
+    float(os.environ.get("RETENTION_HOURS", "8") or 8), float(DEDUP_HOURS)
+)
+RETENTION_SWEEP_MINUTES = max(
+    1.0, float(os.environ.get("RETENTION_SWEEP_MINUTES", "10") or 10)
+)
 # REJECT-MEM: how long an admin REJECTION keeps blocking the same content.
 # Rejecting a post used to erase it from dedup memory entirely, so the very next
 # identical copy (the "two buyers, same minute, both published" case) walked
@@ -2450,6 +2461,38 @@ async def health_check_worker(
             pass
 
 
+async def retention_worker(stop_event: asyncio.Event) -> None:
+    """Delete all message data older than RETENTION_HOURS, every few minutes.
+
+    First pass runs immediately at startup so a bot that was offline for a
+    while does not show stale lists until the first interval elapses."""
+    logger.info(
+        "Retention enabled: keeping the last %.1fh of messages (sweep every %.0f min).",
+        RETENTION_HOURS,
+        RETENTION_SWEEP_MINUTES,
+    )
+    while not stop_event.is_set():
+        try:
+            counts = await db.run_async(db.purge_expired_data, RETENTION_HOURS)
+            _mark_worker_heartbeat("retention")
+            if any(counts.values()):
+                logger.info(
+                    "Retention purge (>%.1fh): %s",
+                    RETENTION_HOURS,
+                    ", ".join(f"{k}={v}" for k, v in counts.items() if v),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error in retention worker")
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=RETENTION_SWEEP_MINUTES * 60
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run_backfill(client: TelegramClient, bot_client: Optional[TelegramClient]) -> None:
     """
     Optional catch-up sweep. When BACKFILL_ON_START=1, iterate supplier channels
@@ -2821,6 +2864,7 @@ async def main() -> None:
     forward_task = asyncio.create_task(
         forwarding_worker(user_client, stop_event, forward_client=forward_client)
     )
+    retention_task = asyncio.create_task(retention_worker(stop_event))
     health_task = None
     resolve_task = None
     rephrase_task = None
@@ -2856,6 +2900,7 @@ async def main() -> None:
         held_task.cancel()
         worker_task.cancel()
         forward_task.cancel()
+        retention_task.cancel()
         for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 task.cancel()
@@ -2863,7 +2908,7 @@ async def main() -> None:
             backfill_task.cancel()
         # SHUT-1: actually await the cancelled tasks so their finally-blocks and
         # DB connection check-ins complete instead of leaking as orphans.
-        pending_tasks = [held_task, worker_task, forward_task]
+        pending_tasks = [held_task, worker_task, forward_task, retention_task]
         for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 pending_tasks.append(task)

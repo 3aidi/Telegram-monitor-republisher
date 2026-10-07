@@ -955,23 +955,27 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
 
 
 _PAGE_SIZE = 6
+_DEST_PAGE_SIZE = 15
 
 
-def _page_window(total: int, page: int) -> Tuple[int, int, int, bool, bool]:
+def _page_window(
+    total: int, page: int, page_size: Optional[int] = None
+) -> Tuple[int, int, int, bool, bool]:
     """Compute pagination indices for a zero-based ``page``.
 
     Returns ``(start, end, page_count, has_prev, has_next)``. Negative pages
     clamp to 0; pages past the final page clamp to the last valid page;
     ``total=0`` yields an empty first page so callers render the normal empty
-    result instead of crashing. The returned ``start`` is always ``page * _PAGE_SIZE``
+    result instead of crashing. The returned ``start`` is always ``page * size``
     for the clamped page.
     """
+    size = page_size or _PAGE_SIZE
     if total <= 0:
         return 0, 0, 1, False, False
-    page_count = (total + _PAGE_SIZE - 1) // _PAGE_SIZE
+    page_count = (total + size - 1) // size
     page = max(0, min(int(page), page_count - 1))
-    start = page * _PAGE_SIZE
-    end = min(start + _PAGE_SIZE, total)
+    start = page * size
+    end = min(start + size, total)
     return start, end, page_count, page > 0, end < total
 
 
@@ -1141,7 +1145,7 @@ def _destination_markup(text, link_ref=None) -> str:
 def _destinations_menu_text(destinations: List[dict], page: int = 0) -> str:
     if not destinations:
         return texts.DESTS_EMPTY
-    _, _, page_count, _, _ = _page_window(len(destinations), page)
+    _, _, page_count, _, _ = _page_window(len(destinations), page, page_size=_DEST_PAGE_SIZE)
     footer = _page_footer(page, page_count)
     msg = texts.DESTS_MENU
     if footer:
@@ -1150,7 +1154,7 @@ def _destinations_menu_text(destinations: List[dict], page: int = 0) -> str:
 
 
 def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[object]]:
-    start, end, page_count, _, _ = _page_window(len(destinations), page)
+    start, end, page_count, _, _ = _page_window(len(destinations), page, page_size=_DEST_PAGE_SIZE)
     buttons = []
     for d in destinations[start:end]:
         icon = _destination_icon(d)
@@ -2157,8 +2161,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if destpage_match:
             raw_page = int(destpage_match.group(1))
             destinations = db.get_destination_health()
-            start, _, _, _, _ = _page_window(len(destinations), raw_page)
-            page = start // _PAGE_SIZE
+            start, _, _, _, _ = _page_window(len(destinations), raw_page, page_size=_DEST_PAGE_SIZE)
+            page = start // _DEST_PAGE_SIZE
             await _message_delete_send(
                 event,
                 _destinations_menu_text(destinations, page),
