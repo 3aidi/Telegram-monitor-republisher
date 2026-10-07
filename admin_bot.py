@@ -6,10 +6,11 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
+from telethon.tl.types import PeerChannel, PeerChat
 
 import db
 import parser

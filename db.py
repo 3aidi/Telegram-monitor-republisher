@@ -11,7 +11,7 @@ import time
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 DEFAULT_DB_PATH = os.environ.get("DB_PATH", "monitor.db")
 
