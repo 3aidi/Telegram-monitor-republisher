@@ -975,20 +975,23 @@ def _page_window(total: int, page: int) -> Tuple[int, int, int, bool, bool]:
     return start, end, page_count, page > 0, end < total
 
 
-def _nav_row(kind: str, page: int, page_count: int) -> List[List[object]]:
-    """Pagination row: [⬅️ Prev] [2/4] [➡️ Next]; empty when single-page.
+def _nav_row(
+    kind: str, page: int, page_count: int, back_data: Optional[str] = None
+) -> List[List[object]]:
+    """Navigation row: [⬅️ Back] [➡️ Next] (no page indicator button).
 
-    The center indicator is a self-referencing inline button so it renders as a
-    static label while still satisfying Telegram's inline-button requirement."""
-    if page_count <= 1:
-        return []
+    Back steps to the previous page; on the first page it falls back to
+    ``back_data`` (the parent menu) when given, otherwise it is omitted. Next
+    appears only when a further page exists. Returns [] when the row would be
+    empty, so callers can always ``extend`` with the result."""
     row = []
     if page > 0:
-        row.append(Button.inline("⬅️ Prev", data=f"{kind}:page:{page - 1}"))
-    row.append(Button.inline(f"{page + 1}/{page_count}", data=f"{kind}:page:{page}"))
+        row.append(Button.inline(texts.BTN_BACK, data=f"{kind}:page:{page - 1}"))
+    elif back_data:
+        row.append(Button.inline(texts.BTN_BACK, data=back_data))
     if page + 1 < page_count:
-        row.append(Button.inline("➡️ Next", data=f"{kind}:page:{page + 1}"))
-    return [row]
+        row.append(Button.inline(texts.BTN_NEXT, data=f"{kind}:page:{page + 1}"))
+    return [row] if row else []
 
 
 def _page_footer(page: int, page_count: int) -> str:
@@ -1016,11 +1019,8 @@ def _sources_buttons(suppliers: List[dict], page: int = 0) -> List[List[object]]
         icon = _source_status_icon(s)
         label = f"{icon} {_pretty_source(s.get('channel_username'), s.get('display_name'))}"
         buttons.append([Button.inline(label, data=f"sup:{s['id']}")])
-    buttons.extend(_nav_row("sup", page, page_count))
-    buttons.append([
-        Button.inline(texts.BTN_ADD_SOURCE, data="supadd"),
-        Button.inline(texts.BTN_BACK, data="menu:home"),
-    ])
+    buttons.extend(_nav_row("sup", page, page_count, back_data="menu:home"))
+    buttons.append([Button.inline(texts.BTN_ADD_SOURCE, data="supadd")])
     return buttons
 
 
@@ -1160,11 +1160,8 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
         # screen (_edit_destination_menu), not here, so this list keeps one
         # predictable tap target per destination.
         buttons.append([Button.inline(label, data=f"dest:{d['id']}")])
-    buttons.extend(_nav_row("dest", page, page_count))
-    buttons.append([
-        Button.inline(texts.BTN_ADD_DEST, data="destadd"),
-        Button.inline(texts.BTN_BACK, data="menu:home"),
-    ])
+    buttons.extend(_nav_row("dest", page, page_count, back_data="menu:home"))
+    buttons.append([Button.inline(texts.BTN_ADD_DEST, data="destadd")])
     return buttons
 
 

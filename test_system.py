@@ -1944,13 +1944,14 @@ class TestMonitorSystem(unittest.TestCase):
             {"id": 3, "channel_username": "-1004567890", "display_name": None, "channel_id": -1004567890, "active": False},
         ]
         buttons = admin_bot._sources_buttons(suppliers)
-        self.assertEqual(len(buttons), len(suppliers) + 1, "one row per supplier + Add/Back row")
+        self.assertEqual(len(buttons), len(suppliers) + 2, "one row per supplier + Back row + Add row")
         self.assertIn("kycgroupke", buttons[0][0].text)
         self.assertIn("@kycgroupke", buttons[0][0].text)
         self.assertIn("Unresolved Chan", buttons[1][0].text)
         self.assertIn("-1004567890", buttons[2][0].text)  # numeric-id supplier label IS the id
-        self.assertIn("➕ Add Source", buttons[3][0].text)
-        self.assertIn("⬅️ Back", buttons[3][1].text)
+        self.assertEqual([b.text for b in buttons[3]], ["⬅️ Back"])
+        self.assertEqual(buttons[3][0].data.decode(), "menu:home")
+        self.assertEqual([b.text for b in buttons[4]], ["➕ Add Source"])
 
     def test_page_window_boundaries(self):
         """_page_window clamps pages and reports nav state correctly."""
@@ -1971,25 +1972,31 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(admin_bot._page_window(13, 999999), (12, 13, 3, True, False))
 
     def test_nav_row_and_footer(self):
-        """Nav row shows Prev/Next only when they exist; single page = no row."""
+        """Nav row is [Back | Next] with no page indicator button."""
         import admin_bot
 
         self.assertEqual(admin_bot._nav_row("sup", 0, 1), [], "no nav row on a single page")
+        row = admin_bot._nav_row("sup", 0, 1, back_data="menu:home")[0]
+        self.assertEqual([b.text for b in row], ["⬅️ Back"])
+        self.assertEqual([b.data.decode() for b in row], ["menu:home"])
         self.assertEqual(admin_bot._page_footer(0, 1), "")
         self.assertEqual(admin_bot._page_footer(1, 3), "Page 2 of 3")
 
         row = admin_bot._nav_row("sup", 0, 3)[0]
-        self.assertEqual([b.text for b in row], ["1/3", "➡️ Next"])
-        self.assertEqual([b.data.decode() for b in row], ["sup:page:0", "sup:page:1"])
+        self.assertEqual([b.text for b in row], ["➡️ Next"])
+        self.assertEqual([b.data.decode() for b in row], ["sup:page:1"])
+        row = admin_bot._nav_row("sup", 0, 3, back_data="menu:home")[0]
+        self.assertEqual([b.text for b in row], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([b.data.decode() for b in row], ["menu:home", "sup:page:1"])
         row = admin_bot._nav_row("sup", 1, 3)[0]
-        self.assertEqual([b.text for b in row], ["⬅️ Prev", "2/3", "➡️ Next"])
-        self.assertEqual([b.data.decode() for b in row], ["sup:page:0", "sup:page:1", "sup:page:2"])
+        self.assertEqual([b.text for b in row], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([b.data.decode() for b in row], ["sup:page:0", "sup:page:2"])
         row = admin_bot._nav_row("dest", 2, 3)[0]
-        self.assertEqual([b.text for b in row], ["⬅️ Prev", "3/3"])
-        self.assertEqual([b.data.decode() for b in row], ["dest:page:1", "dest:page:2"])
+        self.assertEqual([b.text for b in row], ["⬅️ Back"])
+        self.assertEqual([b.data.decode() for b in row], ["dest:page:1"])
 
     def test_sources_buttons_pagination(self):
-        """13 sources → 6/6/1 across pages, nav only where needed."""
+        """13 sources → 6/6/1 across pages; [Back|Next] row, then Add Source row."""
         import admin_bot
 
         suppliers = [
@@ -1999,25 +2006,26 @@ class TestMonitorSystem(unittest.TestCase):
         ]
 
         b0 = admin_bot._sources_buttons(suppliers, 0)
-        self.assertEqual(len(b0), 8, "6 supplier rows + Next nav + Add/Back")
-        self.assertEqual([x.text for x in b0[6]], ["1/3", "➡️ Next"])
-        self.assertEqual(b0[6][1].data.decode(), "sup:page:1")
+        self.assertEqual(len(b0), 8, "6 supplier rows + Back/Next nav + Add")
+        self.assertEqual([x.text for x in b0[6]], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([x.data.decode() for x in b0[6]], ["menu:home", "sup:page:1"])
+        self.assertEqual([x.text for x in b0[7]], ["➕ Add Source"])
 
         b1 = admin_bot._sources_buttons(suppliers, 1)
         self.assertEqual(len(b1), 8)
-        self.assertEqual([x.text for x in b1[6]], ["⬅️ Prev", "2/3", "➡️ Next"])
-        self.assertEqual([x.data.decode() for x in b1[6]],
-                         ["sup:page:0", "sup:page:1", "sup:page:2"])
+        self.assertEqual([x.text for x in b1[6]], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([x.data.decode() for x in b1[6]], ["sup:page:0", "sup:page:2"])
 
         b2 = admin_bot._sources_buttons(suppliers, 2)
-        self.assertEqual(len(b2), 3, "1 supplier row + Prev nav + Add/Back")
+        self.assertEqual(len(b2), 3, "1 supplier row + Back nav + Add")
         self.assertEqual(b2[0][0].data.decode(), "sup:13")
-        self.assertEqual([x.text for x in b2[1]], ["⬅️ Prev", "3/3"])
+        self.assertEqual([x.text for x in b2[1]], ["⬅️ Back"])
         self.assertEqual(b2[1][0].data.decode(), "sup:page:1")
 
         small = admin_bot._sources_buttons(suppliers[:3], 0)
-        self.assertEqual(len(small), 4, "single page keeps the exact old layout")
-        self.assertEqual(small[3][0].text, "➕ Add Source")
+        self.assertEqual(len(small), 5, "3 rows + Back row + Add row")
+        self.assertEqual(small[3][0].data.decode(), "menu:home")
+        self.assertEqual(small[4][0].text, "➕ Add Source")
 
     def test_sources_menu_text_pagination(self):
         """Menu text gains 'Page X of Y' only for multi-page lists."""
@@ -2043,19 +2051,21 @@ class TestMonitorSystem(unittest.TestCase):
         ]
         b0 = admin_bot._destinations_buttons(dests, 0)
         self.assertEqual(len(b0), 8)
-        self.assertEqual([x.text for x in b0[6]], ["1/3", "➡️ Next"])
-        self.assertEqual([x.data.decode() for x in b0[6]], ["dest:page:0", "dest:page:1"])
+        self.assertEqual([x.text for x in b0[6]], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([x.data.decode() for x in b0[6]], ["menu:home", "dest:page:1"])
+        self.assertEqual(b0[7][0].data.decode(), "destadd")
 
         b1 = admin_bot._destinations_buttons(dests, 1)
-        self.assertEqual([x.text for x in b1[6]], ["⬅️ Prev", "2/3", "➡️ Next"])
+        self.assertEqual([x.text for x in b1[6]], ["⬅️ Back", "➡️ Next"])
 
         b2 = admin_bot._destinations_buttons(dests, 2)
         self.assertEqual(len(b2), 3)
-        self.assertEqual([x.text for x in b2[1]], ["⬅️ Prev", "3/3"])
+        self.assertEqual([x.text for x in b2[1]], ["⬅️ Back"])
 
         small = admin_bot._destinations_buttons(dests[:3], 0)
-        self.assertEqual(len(small), 4, "single page keeps the exact old layout")
-        self.assertEqual(small[3][1].text, "⬅️ Back")
+        self.assertEqual(len(small), 5, "3 rows + Back row + Add row")
+        self.assertEqual(small[3][0].text, "⬅️ Back")
+        self.assertEqual(small[4][0].data.decode(), "destadd")
 
     def test_skipped_digest_pagination(self):
         """skipped digest gets skip:page:N nav + footer when total is given."""
@@ -2074,13 +2084,13 @@ class TestMonitorSystem(unittest.TestCase):
 
         text, buttons = admin_bot._skipped_digest(skips, 0, total=13)
         self.assertIn("Page 1 of 3", text)
-        self.assertEqual([x.text for x in buttons[-2]], ["1/3", "➡️ Next"])
-        self.assertEqual([x.data.decode() for x in buttons[-2]], ["skip:page:0", "skip:page:1"])
+        self.assertEqual([x.text for x in buttons[-2]], ["➡️ Next"])
+        self.assertEqual([x.data.decode() for x in buttons[-2]], ["skip:page:1"])
         self.assertEqual(buttons[-1][0].data.decode(), "menu:home")
 
         text, buttons = admin_bot._skipped_digest(skips, 2, total=13)
         self.assertIn("Page 3 of 3", text)
-        self.assertEqual([x.text for x in buttons[-2]], ["⬅️ Prev", "3/3"])
+        self.assertEqual([x.text for x in buttons[-2]], ["⬅️ Back"])
 
     def test_published_digest_pagination(self):
         """published nav row sits BEFORE the Search Post row, uses pub:page:N."""
@@ -2129,7 +2139,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(page, 1)
         buttons = admin_bot._sources_buttons(shrunk, page)
         self.assertEqual(len(buttons[0]), 1)
-        self.assertEqual([x.text for x in buttons[6]], ["⬅️ Prev", "2/2"])
+        self.assertEqual([x.text for x in buttons[6]], ["⬅️ Back"])
         # total=0 is safe (empty queue after last page tapped)
         self.assertEqual(admin_bot._page_window(0, 42), (0, 0, 1, False, False))
 
