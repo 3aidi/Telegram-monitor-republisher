@@ -5,7 +5,7 @@ Placeholders formatted as {name} are dynamically populated at runtime.
 """
 
 # ═══════════════════════════ COMMON ═══════════════════════════
-LINE = "━━━━━━━━━━━━━━━━━━━━"
+LINE = "━━━━━━━━━━━━━━"
 ACCESS_DENIED = "⚠️ Access denied. (ID: {user_id})"
 UNAUTHORIZED = "⛔ Unauthorized"
 UNKNOWN_ACTION = "Unknown action"
@@ -33,6 +33,7 @@ HELP = (
     "• /skipped · Dropped logs\n"
     "• /headers · Custom emoji headers\n\n"
     "⚙️ Commands:\n"
+    "• /desthealth · Check destination health & clean dead\n"
     "• /setchannel @target\n"
     "• /post 12\n"
     "• /headers (tap ➕ to add)\n\n"

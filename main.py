@@ -14,7 +14,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 from telethon.errors import (
     ChannelInvalidError,
     ChannelPrivateError,
@@ -335,7 +335,9 @@ def _format_destination_health_report(rows: list) -> str:
     ]
     if dead:
         lines.append(f"<b>❌ Not delivering at all ({len(dead)})</b>")
-        for r in sorted(dead, key=lambda x: -x["failures"]):
+        sorted_dead = sorted(dead, key=lambda x: -x["failures"])
+        shown_dead = sorted_dead[:15]
+        for r in shown_dead:
             handle = _destination_health_handle(r["chat_id"])
             last = (r["last_error"] or "unknown error").split(" (caused by")[0][:90]
             lines.append(
@@ -343,15 +345,24 @@ def _format_destination_health_report(rows: list) -> str:
                 f"   {r['failures']}/{r['attempts']} failed · {r['fail_pct']:.0f}%\n"
                 f"   {last}"
             )
+        if len(sorted_dead) > 15:
+            lines.append(
+                f"<i>...and {len(sorted_dead) - 15} more failing destination(s). "
+                f"Use the delete button below to remove all {len(dead)} dead channels.</i>"
+            )
         lines.append("")
     if flapping:
         lines.append(f"<b>⚠️ Intermittent ({len(flapping)})</b>")
-        for r in sorted(flapping, key=lambda x: -x["consecutive_failures"]):
+        sorted_flapping = sorted(flapping, key=lambda x: -x["consecutive_failures"])
+        shown_flapping = sorted_flapping[:15]
+        for r in shown_flapping:
             handle = _destination_health_handle(r["chat_id"])
             lines.append(
                 f"• {handle} — {r['fail_pct']:.0f}% fail, "
                 f"{r['consecutive_failures']} in a row (still succeeds sometimes)"
             )
+        if len(sorted_flapping) > 15:
+            lines.append(f"<i>...and {len(sorted_flapping) - 15} more intermittent destination(s).</i>")
         lines.append("")
     if throttled:
         lines.append(f"<b>⏳ Waiting on Telegram rate limit ({len(throttled)})</b>")
@@ -365,8 +376,8 @@ def _format_destination_health_report(rows: list) -> str:
 
     if dead or flapping:
         lines.append(
-            "Banned or private groups can never be delivered to. Disable them in "
-            "Destinations so they stop being retried."
+            "Banned or private groups can never be delivered to. Disable or delete "
+            "them in Destinations so they stop being retried."
         )
     if throttled:
         lines.append(
@@ -400,8 +411,13 @@ async def _report_destination_health(bot_client: Optional[TelegramClient]) -> No
     if not text:
         return
     _LAST_DEST_HEALTH_REPORT = now
+    dead = [r for r in rows if r.get("is_dead")]
+    buttons = []
+    if dead:
+        buttons.append([Button.inline(f"🗑 Delete All Dead ({len(dead)})", data="destdel:all_dead")])
+    buttons.append([Button.inline(admin_bot.DESTINATIONS_BTN, data="menu:destinations")])
     try:
-        await bot_client.send_message(admin, text, parse_mode="html")
+        await bot_client.send_message(admin, text, buttons=buttons, parse_mode="html")
     except Exception:
         logger.exception("Could not send destination health report")
 

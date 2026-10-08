@@ -568,6 +568,7 @@ BOT_MENU = [
     ("published", "Published posts & channel links"),
     ("headers", " Manage the custom-emoji WTB headers"),
     ("setchannel", "Change or view main destination channel"),
+    ("desthealth", "Destination channels health check & clean"),
     ("post", " Look up a post by its number: /post 12"),
     ("help", " Show buttons and shortcuts"),
 ]
@@ -1260,6 +1261,7 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
     buttons.append([
         Button.inline(texts.BTN_ADD_DEST, data="destadd"),
         Button.inline(texts.BTN_MAIN_CHANNEL, data="mainchan:view"),
+        Button.inline("📊 Health", data="desthealth:view"),
     ])
     return buttons
 
@@ -2264,6 +2266,33 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         )
         await event.reply(report, buttons=_home_keyboard(), parse_mode="markdown")
 
+    @bot.on(events.NewMessage(pattern=r"^(?:/desthealth|/dest_health|/dhealth)$"))
+    async def handle_dest_health_check(event):
+        if not await check_admin(event):
+            return
+        import main as main_mod
+        rows = await db.run_async(db.get_destination_health)
+        text = main_mod._format_destination_health_report(rows)
+        dead = [r for r in rows if r.get("is_dead")]
+        if not text:
+            total_active = len([r for r in rows if r.get("active")])
+            await event.reply(
+                f"📊 <b>Destination Health Check</b>\n\n"
+                f"✅ <b>All destinations are healthy!</b>\n"
+                f"• Total configured: {len(rows)}\n"
+                f"• Active: {total_active}\n"
+                f"• Delivering without persistent errors.",
+                buttons=[[Button.inline(DESTINATIONS_BTN, data="menu:destinations")]],
+                parse_mode="html",
+            )
+            return
+
+        buttons = []
+        if dead:
+            buttons.append([Button.inline(f"🗑 Delete All Dead ({len(dead)})", data="destdel:all_dead")])
+        buttons.append([Button.inline(DESTINATIONS_BTN, data="menu:destinations")])
+        await event.reply(text, buttons=buttons, parse_mode="html")
+
     @bot.on(events.NewMessage(pattern=r"^/preview(?:[ \t]+(\d+))?"))
     async def handle_preview(event):
         if not await check_admin(event):
@@ -2748,6 +2777,81 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 buttons=_destinations_buttons(destinations),
                 parse_mode=None,
             )
+            return
+
+        if data_str == "destdel:all_dead":
+            rows = await db.run_async(db.get_destination_health)
+            dead = [r for r in rows if r.get("is_dead")]
+            if not dead:
+                await event.answer("No dead destinations found.", alert=True)
+                return
+            count = len(dead)
+            text = (
+                f"🗑 <b>Delete {count} Dead Destination(s)?</b>\n\n"
+                f"This will permanently delete all {count} channels/groups that are not delivering (100% fail rate, banned or private).\n\n"
+                f"They will be completely removed from destinations."
+            )
+            buttons = [
+                [Button.inline(f"✅ Yes, Delete {count} Dead", data="destdel:confirm_dead")],
+                [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
+            ]
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="html")
+            return
+
+        if data_str == "destdel:confirm_dead":
+            rows = await db.run_async(db.get_destination_health)
+            dead = [r for r in rows if r.get("is_dead")]
+            deleted_count = 0
+            for d in dead:
+                await db.run_async(db.delete_destination, d["id"])
+                await db.run_async(
+                    db.record_audit,
+                    "destination_deleted",
+                    None,
+                    actor_id=ADMIN_USER_ID,
+                    detail=f"bulk_dead_delete id={d['id']} chat={d.get('chat_id')}",
+                )
+                deleted_count += 1
+            await event.answer(f"🗑 Deleted {deleted_count} dead destination(s).")
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            destinations = db.get_destination_health()
+            await event.client.send_message(
+                ADMIN_USER_ID,
+                f"🗑 <b>Deleted {deleted_count} dead destination(s).</b>",
+                buttons=[
+                    [Button.inline("📊 Check Health Again", data="desthealth:view")],
+                    [Button.inline(DESTINATIONS_BTN, data="menu:destinations")],
+                ],
+                parse_mode="html",
+            )
+            return
+
+        if data_str == "desthealth:view":
+            import main as main_mod
+            rows = await db.run_async(db.get_destination_health)
+            text = main_mod._format_destination_health_report(rows)
+            dead = [r for r in rows if r.get("is_dead")]
+            if not text:
+                total_active = len([r for r in rows if r.get("active")])
+                await _message_delete_send(
+                    event,
+                    f"📊 <b>Destination Health Check</b>\n\n"
+                    f"✅ <b>All destinations are healthy!</b>\n"
+                    f"• Total configured: {len(rows)}\n"
+                    f"• Active: {total_active}\n"
+                    f"• Delivering without persistent errors.",
+                    buttons=[[Button.inline(DESTINATIONS_BTN, data="menu:destinations")]],
+                    parse_mode="html",
+                )
+                return
+            buttons = []
+            if dead:
+                buttons.append([Button.inline(f"🗑 Delete All Dead ({len(dead)})", data="destdel:all_dead")])
+            buttons.append([Button.inline(DESTINATIONS_BTN, data="menu:destinations")])
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="html")
             return
 
         if data_str == "destaddunresolved":

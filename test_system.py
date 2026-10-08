@@ -3650,6 +3650,33 @@ class TestDestinationsForwarding(unittest.TestCase):
         self.assertIn("id -1003885053436", text)
         self.assertNotIn("<code>", text, "identifiers must not be code spans")
 
+    def test_destination_health_report_caps_large_dead_lists(self):
+        """When 100 failed channels are reported, output is safely capped under 4000 chars."""
+        import main as main_mod
+
+        rows = [
+            {
+                "id": i,
+                "chat_id": f"@failed_channel_{i}",
+                "title": f"Failed {i}",
+                "active": 1,
+                "attempts": 20,
+                "successes": 0,
+                "failures": 20,
+                "fail_pct": 100.0,
+                "consecutive_failures": 20,
+                "last_success_at": None,
+                "last_error": "ChatAdminRequiredError: You need admin rights to post messages",
+                "is_dead": True,
+                "is_flapping": False,
+            }
+            for i in range(1, 101)
+        ]
+        text = main_mod._format_destination_health_report(rows)
+        self.assertIn("Not delivering at all (100)", text)
+        self.assertIn("85 more failing destination(s)", text)
+        self.assertLess(len(text), 4000, "Must be under Telegram 4096 character limit")
+
     def test_destination_health_dm_is_throttled_to_once_a_day(self):
         """A permanently banned group must not DM the admin every hour."""
         import asyncio
