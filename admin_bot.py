@@ -765,10 +765,12 @@ def _listing_action_buttons(listing: dict) -> List[List[object]]:
     return buttons
 
 
+from services.fsm import PersistentDict
+
 # Wizard state: sender_id -> {"step": "add" | "edit", ...}
-_wizard_state: Dict[int, dict] = {}
+_wizard_state: Dict[int, dict] = PersistentDict(prefix="wiz:")
 # Listing drafts: listing_id -> content lines typed by the admin via ✏️ Edit.
-_drafts: Dict[int, str] = {}
+_drafts: Dict[int, str] = PersistentDict(prefix="draft:")
 
 
 def _pretty_source(username: Optional[str], display_name: Optional[str] = None) -> str:
