@@ -2292,6 +2292,34 @@ def get_buyer_asleep_footer(db_path: Optional[str] = None) -> str:
     return "Buyer away, back shortly"
 
 
+def get_dest_channel(default: Optional[str] = None, db_path: Optional[str] = None) -> str:
+    """Retrieve the main destination channel from app_settings, falling back to default or env."""
+    val = get_setting("dest_channel", None, db_path=db_path)
+    if val and val.strip():
+        return val.strip()
+    return (default or os.environ.get("DEST_CHANNEL", "") or "").strip()
+
+
+def set_dest_channel(channel: str, db_path: Optional[str] = None) -> str:
+    """Persist the main destination channel in app_settings.
+
+    Accepts @usernames, numeric IDs (-100...), or bare strings.
+    Normalizes numeric IDs and strips leading/trailing whitespace.
+    """
+    clean = (channel or "").strip()
+    if not clean:
+        raise ValueError("Destination channel cannot be empty")
+    if is_numeric_identifier(clean):
+        clean = str(normalize_channel_id(int(clean)))
+    elif clean.startswith("https://t.me/") or clean.startswith("t.me/"):
+        part = clean.rstrip("/").split("/")[-1]
+        if part and not part.startswith("+"):
+            clean = f"@{part.lstrip('@')}"
+
+    set_setting("dest_channel", clean, db_path=db_path)
+    return clean
+
+
 # ---------------------------------------------------------------------------
 # Custom-emoji headers (admin-managed pool, schema v12).
 #

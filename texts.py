@@ -33,6 +33,7 @@ HELP = (
     "🚫 Skipped — Dropped/filtered messages\n"
     "⏸ All Stop / ▶ All Start — Pause or resume AUTOMATIC publishing only. "
     "Manual Approve taps still publish immediately.\n\n"
+    "/setchannel @channel — Change main destination channel\n"
     "/post 12 — Jump to post #12\n"
     "/headers — Manage custom emoji headers (tap ➕ to add)"
 )
@@ -330,6 +331,42 @@ SYNC_ADDED = "✅ Synced {n} new destination group(s)."
 SYNC_NONE = "✅ Destination groups already up to date."
 SYNC_FAIL = "❌ Sync failed: {error}"
 SYNC_AUTO = "🔄 Auto-synced **{n}** destination group(s) from forwarding account."
+
+# ═══════════════════════════ MAIN CHANNEL CONFIG ═══════════════════════════
+MAIN_CHANNEL_CARD = (
+    "📢 **Main Destination Channel**\n\n"
+    "• Current: `{current}`\n\n"
+    "This is the primary channel where listings are published before forwarding.\n\n"
+    "To change it, send a channel username (`@channel`), numeric ID (`-100...`), "
+    "or forward any message from your new channel here.\n\n"
+    "Or use: `/setchannel @new_channel`"
+)
+MAIN_CHANNEL_PROMPT = (
+    "📢 **Change Main Destination Channel**\n\n"
+    "Send the new channel:\n"
+    "• Username: `@channel`\n"
+    "• Numeric ID: `-1001234567890`\n"
+    "• **Or forward any post from the new channel**\n\n"
+    "Example: `/setchannel @mychannel`"
+)
+MAIN_CHANNEL_UPDATED = (
+    "✅ **Main Channel Updated!**\n\n"
+    "• New channel: {display}\n"
+    "• Previous: `{previous}`\n\n"
+    "All new approved and auto-published listings will be posted here."
+)
+MAIN_CHANNEL_UPDATED_UNVERIFIED = (
+    "⚠️ **Main Channel Updated (Unverified)**\n\n"
+    "• New channel: `{channel}`\n"
+    "• Previous: `{previous}`\n\n"
+    "Could not verify channel access right now. Ensure your user client or bot account is an administrator with **Post Messages** permission in that channel."
+)
+MAIN_CHANNEL_BAD_REF = (
+    "❌ **Invalid channel reference.**\n\n"
+    "Provide a channel username (`@channel`), numeric ID (`-100...`), "
+    "or forward a message directly from the channel."
+)
+BTN_MAIN_CHANNEL = "📢 Main Channel"
 
 # ═══════════════════════════ CUSTOM EMOJI HEADERS ═══════════════════════════
 HEADERS_EMPTY = "No headers saved yet (posts have no header line).\nTap ➕ Add Header to add {n} custom emoji."

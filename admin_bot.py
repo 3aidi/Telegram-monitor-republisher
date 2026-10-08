@@ -25,8 +25,62 @@ API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0") or 0)
-DEST_CHANNEL = os.environ.get("DEST_CHANNEL", "")
+DEST_CHANNEL = db.get_dest_channel() or os.environ.get("DEST_CHANNEL", "")
 CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "")
+
+
+def sync_dest_channel_to_env(channel: str, env_path: Optional[str] = None) -> bool:
+    """Update or append DEST_CHANNEL in .env file if it exists."""
+    if env_path is None:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        if not os.path.isfile(env_path):
+            return False
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        found = False
+        new_lines = []
+        for line in lines:
+            if re.match(r"^\s*DEST_CHANNEL\s*=", line):
+                new_lines.append(f"DEST_CHANNEL={channel}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"\nDEST_CHANNEL={channel}\n")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        return True
+    except Exception as exc:
+        logger.warning("Could not sync DEST_CHANNEL to %s: %s", env_path, exc)
+        return False
+
+
+def get_dest_channel() -> str:
+    """Return the currently configured main destination channel."""
+    global DEST_CHANNEL
+    return DEST_CHANNEL or db.get_dest_channel() or os.environ.get("DEST_CHANNEL", "")
+
+
+def set_dest_channel(channel: str, update_db: bool = True) -> str:
+    """Update main destination channel in-memory, in db, and in .env."""
+    global DEST_CHANNEL
+    clean = str(channel).strip()
+    DEST_CHANNEL = clean
+    os.environ["DEST_CHANNEL"] = clean
+    if update_db:
+        try:
+            db.set_dest_channel(clean)
+        except Exception as e:
+            logger.warning("Could not persist destination channel to db: %s", e)
+    try:
+        import main as main_mod
+        if getattr(main_mod, "DEST_CHANNEL", None) != clean:
+            main_mod.DEST_CHANNEL = clean
+    except Exception:
+        pass
+    sync_dest_channel_to_env(clean)
+    return clean
 
 # Statuses in which a listing may still be edited / approved / skipped. Once a
 # listing leaves this set (published, failed, skipped...) any in-flight admin
@@ -155,7 +209,6 @@ async def send_review_notification(
 ) -> None:
 
     listing_id = listing["id"]
-    review_reason = listing.get("_review_reason") or ""
     src = _pretty_source(
         listing.get("supplier_username"), listing.get("supplier_display_name")
     )
@@ -479,6 +532,7 @@ BOT_MENU = [
     ("sources", " Manage monitored sources"),
     ("published", "Published posts & channel links"),
     ("headers", " Manage the custom-emoji WTB headers"),
+    ("setchannel", "Change or view main destination channel"),
     ("post", " Look up a post by its number: /post 12"),
     ("help", " Show buttons and shortcuts"),
 ]
@@ -1165,7 +1219,10 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
         # predictable tap target per destination.
         buttons.append([Button.inline(label, data=f"dest:{d['id']}")])
     buttons.extend(_nav_row("dest", page, page_count, back_data="menu:home"))
-    buttons.append([Button.inline(texts.BTN_ADD_DEST, data="destadd")])
+    buttons.append([
+        Button.inline(texts.BTN_ADD_DEST, data="destadd"),
+        Button.inline(texts.BTN_MAIN_CHANNEL, data="mainchan:view"),
+    ])
     return buttons
 
 
@@ -1350,6 +1407,90 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
     )
 
 
+async def _run_set_main_channel_flow(event, text: Optional[str] = None, fwd=None) -> None:
+    """Validate, resolve, and persist the new main destination channel."""
+    if fwd is not None:
+        raw_chat_id = _channel_id_from_fwd(fwd)
+        if raw_chat_id is None:
+            await event.reply(
+                texts.MAIN_CHANNEL_BAD_REF,
+                buttons=_home_keyboard(),
+                parse_mode="markdown",
+            )
+            return
+        chat_ref = str(db.normalize_channel_id(raw_chat_id))
+        entity = await _resolve_destination_peer(db.to_peer_reference(chat_ref))
+        display = _entity_display(entity, fallback=f"channel {chat_ref}")
+        old_channel = get_dest_channel()
+        set_dest_channel(chat_ref)
+        await db.run_async(
+            db.record_audit,
+            "main_channel_changed",
+            None,
+            actor_id=ADMIN_USER_ID,
+            detail=f"{old_channel} -> {chat_ref} ({display})",
+        )
+        await event.reply(
+            texts.MAIN_CHANNEL_UPDATED.format(
+                display=f"{display} (`{chat_ref}`)",
+                previous=old_channel or "None",
+            ),
+            buttons=_home_keyboard(),
+            parse_mode="markdown",
+        )
+        return
+
+    raw_text = (text or "").strip()
+    username, numeric = _supplier_ref_from_text(raw_text)
+    if not username and numeric is None and not (raw_text.startswith("-100") and raw_text[1:].isdigit()):
+        await event.reply(
+            texts.MAIN_CHANNEL_BAD_REF,
+            buttons=_home_keyboard(),
+            parse_mode="markdown",
+        )
+        return
+
+    if numeric is not None:
+        target_ref = str(db.normalize_channel_id(numeric))
+    elif raw_text.startswith("-100") and raw_text[1:].isdigit():
+        target_ref = raw_text
+    elif username:
+        target_ref = f"@{username.lstrip('@')}"
+    else:
+        target_ref = raw_text
+
+    entity = await _resolve_destination_peer(db.to_peer_reference(target_ref))
+    old_channel = get_dest_channel()
+    set_dest_channel(target_ref)
+    await db.run_async(
+        db.record_audit,
+        "main_channel_changed",
+        None,
+        actor_id=ADMIN_USER_ID,
+        detail=f"{old_channel} -> {target_ref}",
+    )
+
+    if entity is not None:
+        display = _entity_display(entity, fallback=target_ref)
+        await event.reply(
+            texts.MAIN_CHANNEL_UPDATED.format(
+                display=f"{display} (`{target_ref}`)",
+                previous=old_channel or "None",
+            ),
+            buttons=_home_keyboard(),
+            parse_mode="markdown",
+        )
+    else:
+        await event.reply(
+            texts.MAIN_CHANNEL_UPDATED_UNVERIFIED.format(
+                channel=target_ref,
+                previous=old_channel or "None",
+            ),
+            buttons=_home_keyboard(),
+            parse_mode="markdown",
+        )
+
+
 def _home_button_row() -> List[List[object]]:
     """Inline "back to Home" row used by every section rendered from the Home menu."""
     return [[Button.inline(texts.BTN_HOME, data="menu:home")]]
@@ -1405,8 +1546,12 @@ def _status_report_text() -> str:
         reason_lines = [texts.STATUS_NONE]
     reason_text = "\n\n".join(reason_lines)
 
+    curr_dest = get_dest_channel()
+    main_channel_info = f"• Main Channel: `{curr_dest}`\n" if curr_dest else ""
+
     msg = (
         texts.STATUS_HEADER
+        + main_channel_info
         + texts.STATUS_TOTALS.format(
             active=stats['active_suppliers'],
             processed=stats['total_processed'],
@@ -1720,6 +1865,22 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
         await _run_add_destination_flow(event, arg)
+
+    @bot.on(events.NewMessage(pattern=r"^(?:/setchannel|/setmainchannel|/mainchannel)(?:\s+(.+))?"))
+    async def handle_set_main_channel(event):
+        if not await check_admin(event):
+            return
+        arg = (event.pattern_match.group(1) or "").strip()
+        if not arg:
+            _wizard_state[ADMIN_USER_ID] = {"step": "set_main_channel"}
+            current = get_dest_channel()
+            await event.reply(
+                texts.MAIN_CHANNEL_CARD.format(current=current or "(None)"),
+                buttons=[[Button.inline(texts.BTN_CANCEL, data="wiz:cancel")]],
+                parse_mode="markdown",
+            )
+            return
+        await _run_set_main_channel_flow(event, arg)
 
     @bot.on(events.NewMessage(pattern=DESTINATIONS_ROUTE_RE))
     async def handle_destinations(event):
@@ -2497,6 +2658,23 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
 
+        if data_str == "mainchan:view":
+            current = get_dest_channel()
+            text = texts.MAIN_CHANNEL_CARD.format(current=current or "(None)")
+            buttons = [
+                [Button.inline("✏️ Change Main Channel", data="mainchan:edit")],
+                [Button.inline(texts.BTN_BACK, data="menu:destinations")],
+            ]
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
+            return
+
+        if data_str == "mainchan:edit":
+            _wizard_state[ADMIN_USER_ID] = {"step": "set_main_channel"}
+            text = texts.MAIN_CHANNEL_PROMPT
+            buttons = [[Button.inline(texts.BTN_CANCEL, data="wiz:cancel")]]
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
+            return
+
         # ---- Previews / listing actions ------------------------------------
         preview_match = re.match(r"^preview:(\d+)$", data_str)
         if preview_match:
@@ -2982,6 +3160,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await _run_add_destination_flow(event, None, fwd=fwd)
             return
 
+        if state and state.get("step") == "set_main_channel" and fwd is not None:
+            _wizard_state.pop(ADMIN_USER_ID, None)
+            await _run_set_main_channel_flow(event, None, fwd=fwd)
+            return
+
         text = event.text
         if not text:
             return
@@ -3009,6 +3192,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         if state["step"] == "adddest":
             await _run_add_destination_flow(event, text)
+            return
+
+        if state["step"] == "set_main_channel":
+            await _run_set_main_channel_flow(event, text)
             return
 
         if state["step"] == "edit":

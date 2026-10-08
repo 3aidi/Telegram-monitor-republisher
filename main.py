@@ -43,8 +43,39 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
-DEST_CHANNEL = os.environ.get("DEST_CHANNEL", "")
+DEST_CHANNEL = db.get_dest_channel() or os.environ.get("DEST_CHANNEL", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+
+
+def get_dest_channel() -> str:
+    """Return the currently configured main destination channel."""
+    global DEST_CHANNEL
+    return DEST_CHANNEL or db.get_dest_channel() or os.environ.get("DEST_CHANNEL", "")
+
+
+def set_dest_channel(channel: str, update_db: bool = True) -> str:
+    """Update main destination channel in-memory, in db, and in .env."""
+    global DEST_CHANNEL
+    clean = str(channel).strip()
+    DEST_CHANNEL = clean
+    os.environ["DEST_CHANNEL"] = clean
+    if update_db:
+        try:
+            db.set_dest_channel(clean)
+        except Exception as e:
+            logger.warning("Could not persist destination channel to db: %s", e)
+    try:
+        import admin_bot as _ab
+        if getattr(_ab, "DEST_CHANNEL", None) != clean:
+            _ab.DEST_CHANNEL = clean
+    except Exception:
+        pass
+    try:
+        admin_bot.sync_dest_channel_to_env(clean)
+    except Exception:
+        pass
+    return clean
+
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0") or 0)
 CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "")
 PUBLISH_INTERVAL = float(os.environ.get("PUBLISH_INTERVAL", "1.5"))
@@ -506,7 +537,7 @@ def _validate_config() -> None:
         errors.append("API_ID is missing/0 (get it from https://my.telegram.org)")
     if not API_HASH:
         errors.append("API_HASH is missing in .env")
-    if not DEST_CHANNEL:
+    if not (DEST_CHANNEL or db.get_dest_channel()):
         errors.append("DEST_CHANNEL is missing in .env")
     # PRIC-1: no price multiplier exists anymore; nothing to validate.
     if errors:

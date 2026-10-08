@@ -176,6 +176,7 @@ Message your bot directly on Telegram (only authorized for `ADMIN_USER_ID`):
 | `/pending` | Review and approve ambiguous listings | `/pending` |
 | `/preview <id>` | Preview the formatted post before publishing | `/preview 15` |
 | `/headers` | Manage the pool of custom-emoji post headers (add, delete) | `/headers` |
+| `/setchannel <channel>` | Change main destination channel dynamically without restart | `/setchannel @mychannel` or forward a post |
 
 ### Post Headers (custom emoji)
 

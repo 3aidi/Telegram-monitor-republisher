@@ -6246,5 +6246,108 @@ class TestForwardDedicatedAccount(unittest.TestCase):
         os.remove(db_path)
 
 
+class MainChannelConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._test_db = f"test_main_chan_{int(time.time() * 1000)}.db"
+        db.init_db(self._test_db)
+        self._old_db = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = self._test_db
+        import admin_bot
+        import main as main_mod
+        self.admin_bot = admin_bot
+        self.main_mod = main_mod
+        self._orig_admin_dest = admin_bot.DEST_CHANNEL
+        self._orig_main_dest = main_mod.DEST_CHANNEL
+        self._orig_env_dest = os.environ.get("DEST_CHANNEL", "")
+
+    def tearDown(self):
+        db.DEFAULT_DB_PATH = self._old_db
+        self.admin_bot.DEST_CHANNEL = self._orig_admin_dest
+        self.main_mod.DEST_CHANNEL = self._orig_main_dest
+        os.environ["DEST_CHANNEL"] = self._orig_env_dest
+        if os.path.exists(self._test_db):
+            try:
+                os.remove(self._test_db)
+            except Exception:
+                pass
+
+    def test_db_get_set_dest_channel(self):
+        """db.set_dest_channel stores normalized values and get_dest_channel retrieves them."""
+        # Username
+        saved = db.set_dest_channel("@new_test_channel", db_path=self._test_db)
+        self.assertEqual(saved, "@new_test_channel")
+        self.assertEqual(db.get_dest_channel(db_path=self._test_db), "@new_test_channel")
+
+        # Positive numeric bare ID -> normalized to -100
+        saved_num = db.set_dest_channel("1234567890", db_path=self._test_db)
+        self.assertEqual(saved_num, "-1001234567890")
+        self.assertEqual(db.get_dest_channel(db_path=self._test_db), "-1001234567890")
+
+        # t.me link
+        saved_link = db.set_dest_channel("https://t.me/channel_link", db_path=self._test_db)
+        self.assertEqual(saved_link, "@channel_link")
+        self.assertEqual(db.get_dest_channel(db_path=self._test_db), "@channel_link")
+
+        # Empty raises ValueError
+        with self.assertRaises(ValueError):
+            db.set_dest_channel("", db_path=self._test_db)
+
+    def test_sync_dest_channel_across_modules(self):
+        """set_dest_channel updates admin_bot, main, os.environ, and database."""
+        self.admin_bot.set_dest_channel("@dynamically_set")
+        self.assertEqual(self.admin_bot.DEST_CHANNEL, "@dynamically_set")
+        self.assertEqual(self.main_mod.DEST_CHANNEL, "@dynamically_set")
+        self.assertEqual(os.environ.get("DEST_CHANNEL"), "@dynamically_set")
+        self.assertEqual(db.get_dest_channel(db_path=self._test_db), "@dynamically_set")
+
+    def test_bot_menu_contains_setchannel(self):
+        """BOT_MENU includes the setchannel command for Telegram client menu."""
+        commands = [c for c, _ in self.admin_bot.BOT_MENU]
+        self.assertIn("setchannel", commands)
+
+    def test_destinations_buttons_has_main_channel_button(self):
+        """_destinations_buttons contains the Main Channel button."""
+        buttons = self.admin_bot._destinations_buttons([])
+        flat = [b for row in buttons for b in row]
+        main_btns = [b for b in flat if getattr(b, "data", None) in (b"mainchan:view", "mainchan:view")]
+        self.assertTrue(len(main_btns) > 0, "Main Channel button must exist in destinations view")
+
+    def test_run_set_main_channel_flow_with_username(self):
+        """_run_set_main_channel_flow sets channel and replies with confirmation."""
+        class FakeEvent:
+            def __init__(self, admin_id):
+                self.replies = []
+                self.sender_id = admin_id
+            async def reply(self, text, buttons=None, parse_mode=None):
+                self.replies.append({"text": text, "buttons": buttons})
+
+        ev = FakeEvent(self.admin_bot.ADMIN_USER_ID)
+        asyncio.run(self.admin_bot._run_set_main_channel_flow(ev, "@fresh_signals"))
+        self.assertEqual(self.admin_bot.DEST_CHANNEL, "@fresh_signals")
+        self.assertEqual(len(ev.replies), 1)
+        self.assertIn("Main Channel Updated", ev.replies[0]["text"])
+        self.assertIn("@fresh_signals", ev.replies[0]["text"])
+
+    def test_run_set_main_channel_flow_with_forward(self):
+        """_run_set_main_channel_flow handles forwarded messages to detect channel ID."""
+        from telethon.tl.types import PeerChannel
+
+        class FakeFwd:
+            from_id = PeerChannel(channel_id=987654321)
+
+        class FakeEvent:
+            def __init__(self, admin_id):
+                self.replies = []
+                self.sender_id = admin_id
+            async def reply(self, text, buttons=None, parse_mode=None):
+                self.replies.append({"text": text, "buttons": buttons})
+
+        ev = FakeEvent(self.admin_bot.ADMIN_USER_ID)
+        asyncio.run(self.admin_bot._run_set_main_channel_flow(ev, fwd=FakeFwd()))
+        self.assertEqual(self.admin_bot.DEST_CHANNEL, "-1000987654321")
+        self.assertEqual(len(ev.replies), 1)
+        self.assertIn("Main Channel Updated", ev.replies[0]["text"])
+
+
 if __name__ == "__main__":
     unittest.main()
