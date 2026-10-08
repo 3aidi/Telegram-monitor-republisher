@@ -41,10 +41,10 @@ HELP = (
 )
 BTN_PAUSE = "⏸ All Stop"
 BTN_RESUME = "▶ All Start"
-PAUSE_ON = "⏸ **Paused** — auto-publishing stopped. (Manual approvals still publish)"
-PAUSE_OFF = "▶ **Resumed** — auto-publishing active."
-PAUSE_ANSWER_ON = "⏸ Auto-publishing paused"
-PAUSE_ANSWER_OFF = "▶ Auto-publishing resumed"
+PAUSE_ON = "⏸ **System Paused** — Auto-publishing stopped."
+PAUSE_OFF = "▶ **System Resumed** — Auto-publishing active."
+PAUSE_ANSWER_ON = "⏸ System paused"
+PAUSE_ANSWER_OFF = "▶ System resumed"
 BTN_ASLEEP = "💤 I'm Asleep"
 BTN_AWAKE = "☀️ I'm Awake"
 ASLEEP_ON = "💤 **Asleep** — away footer enabled."
@@ -66,7 +66,7 @@ STATUS_BY_REASON = "**Skip Breakdown**\n{reasons}"
 STATUS_SUPPLIER_LINE = "• {name} — `{processed}` in / `{published}` pub / `{skipped}` skip"
 STATUS_REASON_LINE = "• {reason}: `{count}`"
 STATUS_NONE = "• None"
-STATUS_PAUSED_BANNER = "⏸ **PAUSED** — auto-publishing stopped\n\n"
+STATUS_PAUSED_BANNER = "⏸ **System Paused** — Auto-publishing stopped\n\n"
 
 # ═══════════════════════════ REVIEW CARD (PENDING) ═══════════════════════════
 REASONS = {
@@ -117,8 +117,7 @@ PREVIEW_USAGE = "Usage: `/preview 12`"
 EDIT_PROMPT = (
     "✏️ **Edit Listing #{id}**\n\n"
     "{body}\n\n"
-    "• Price & contact details are attached automatically.\n"
-    "/cancel to abort."
+    "• Price & contact details are attached automatically."
 )
 EDIT_EMPTY = "_(no content yet — write the body lines)_"
 EDIT_CANCELLED = "✏️ Edit cancelled."
@@ -182,8 +181,18 @@ POST_NOT_FOUND = "❌ No published post found: `#{text}`."
 POST_NOT_NUMBER = "⚠️ Invalid post number `#{text}`. Send a number like `12`."
 POST_CARD = "**Post #{n}**\n" + LINE + "\nPlatform: {platform}\nSupplier: {source}"
 BTN_SOLD = "🔴 Sold"
-SOLD_REPLY = "🔴 **SOLD OUT**\n" + LINE + "\nThis listing has been sold."
-SOLD_DONE = "🔴 Post #{post} marked as SOLD.\n• Replied with SOLD OUT in main channel\n• Deleted from {deleted} destination chat(s)."
+SOLD_REPLY = "STOP post #{post} Already Got"
+SOLD_REPLY_PLATFORM = "STOP {platform} (post #{post}) Already Got"
+
+
+def format_sold_reply(post: object, platform: Optional[str] = None) -> str:
+    plat = str(platform or "").strip()
+    if plat and plat != "?":
+        return SOLD_REPLY_PLATFORM.format(platform=plat, post=post)
+    return SOLD_REPLY.format(post=post)
+
+
+SOLD_DONE = "🔴 Post #{post} marked as SOLD.\n• Replied in main channel\n• Deleted from {deleted} destination chat(s)."
 SOLD_ALREADY = "⚠️ Post #{post} is already marked as sold."
 SOLD_NOT_FOUND = "❌ Post #{post} not found."
 SOLD_NOT_PUBLISHED = "⚠️ Post #{post} is not published yet."

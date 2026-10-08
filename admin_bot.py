@@ -1839,8 +1839,10 @@ async def _execute_sold(
                 send_kwargs = {}
                 if "reply_to" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
                     send_kwargs["reply_to"] = published_msg_id
-                await sender.send_message(dest_peer, texts.SOLD_REPLY, **send_kwargs)
-                logger.info("Replied SOLD OUT to post #%s (msg %s) in %s", post_num, published_msg_id, dest_channel)
+                platform_val = listing.get("platform_name") or listing.get("game_name")
+                reply_text = texts.format_sold_reply(post_num, platform_val)
+                await sender.send_message(dest_peer, reply_text, **send_kwargs)
+                logger.info("Replied SOLD to post #%s (msg %s) in %s: %s", post_num, published_msg_id, dest_channel, reply_text)
             except Exception as exc:
                 logger.warning("Could not send SOLD reply to %s msg %s: %s", dest_channel, published_msg_id, exc)
 

@@ -6367,7 +6367,7 @@ class MainChannelConfigTests(unittest.TestCase):
         sid = db.add_supplier("@sold_src", channel_id=-100911, db_path=self._test_db)
         post_num = db.next_post_number(db_path=self._test_db)
         lid = db.insert_listing(
-            sid, 1001, None, None, "published",
+            sid, 1001, "Game Account", None, "published",
             "Game Account", "Game Account", published_message_id=500,
             db_path=self._test_db,
         )
@@ -6416,7 +6416,7 @@ class MainChannelConfigTests(unittest.TestCase):
             asyncio.run(admin_bot._execute_sold(ev, post_number=post_num))
             # 1. Main channel reply
             self.assertEqual(len(mock_user.sent), 1)
-            self.assertIn("SOLD OUT", mock_user.sent[0]["text"])
+            self.assertEqual(mock_user.sent[0]["text"], f"STOP Game Account (post #{post_num}) Already Got")
             self.assertEqual(mock_user.sent[0]["kw"].get("reply_to"), 500)
 
             # 2. Forwarded message deleted from destination
@@ -6429,6 +6429,12 @@ class MainChannelConfigTests(unittest.TestCase):
 
             # 4. Confirmation sent
             self.assertTrue(any("marked as SOLD" in r for r in ev.replies))
+
+            import texts
+            self.assertEqual(texts.format_sold_reply(100, "Binance"), "STOP Binance (post #100) Already Got")
+            self.assertEqual(texts.format_sold_reply(100, None), "STOP post #100 Already Got")
+            self.assertEqual(texts.format_sold_reply(100, ""), "STOP post #100 Already Got")
+            self.assertEqual(texts.format_sold_reply(100, "?"), "STOP post #100 Already Got")
         finally:
             admin_bot.DEST_CHANNEL = old_dest
             admin_bot.set_user_client(None)
