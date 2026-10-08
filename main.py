@@ -1106,7 +1106,7 @@ async def _drain_forward_queue(
                 sender, to_peer, expected_post_id
             )
             if already_there is not None:
-                await db.run_async(db.mark_forwarded, fwd_id)
+                await db.run_async(db.mark_forwarded, fwd_id, already_there)
                 logger.warning(
                     "Forward row #%s (msg %s) was already forwarded before restart "
                     "(msg id %s) — recorded, not re-sent.",
@@ -1141,8 +1141,9 @@ async def _drain_forward_queue(
                     from_peer=from_peer,
                 )
 
+        sent_forward = None
         try:
-            await publish_guard.run_with_floodwait_retry(
+            sent_forward = await publish_guard.run_with_floodwait_retry(
                 _forward_call,
                 f"forward listing #{row['listing_id']} "
                 f"msg {expected_post_id} to {row['destination_chat_id']}",
@@ -1183,7 +1184,7 @@ async def _drain_forward_queue(
                 sender, to_peer, expected_post_id
             )
             if already_there is not None:
-                await db.run_async(db.mark_forwarded, fwd_id)
+                await db.run_async(db.mark_forwarded, fwd_id, already_there)
                 logger.warning(
                     "Forward to %s reported %r but the message is already there "
                     "(msg id %s) — recorded, not re-sent.",
@@ -1202,7 +1203,13 @@ async def _drain_forward_queue(
                 exc,
             )
             continue
-        await db.run_async(db.mark_forwarded, fwd_id)
+
+        dest_msg_id = None
+        if isinstance(sent_forward, list) and sent_forward:
+            dest_msg_id = getattr(sent_forward[0], "id", None)
+        elif sent_forward is not None:
+            dest_msg_id = getattr(sent_forward, "id", None)
+        await db.run_async(db.mark_forwarded, fwd_id, dest_msg_id)
         logger.info(
             "Forwarded bot post #%s (msg %s) to destination %s [%s]",
             row["listing_id"],
@@ -2444,6 +2451,9 @@ async def health_check_worker(
         try:
             stats = await db.run_async(db.get_today_stats)
             _mark_worker_heartbeat("health_check")
+            await db.run_async(
+                db.set_setting, "last_heartbeat_at", datetime.now(timezone.utc).isoformat()
+            )
             logger.info(
                 "Periodic Health Check: Active Suppliers=%s | Today Processed=%s | "
                 "Published=%s | Pending=%s | Skipped=%s | Errors=%s%s",
@@ -2710,6 +2720,10 @@ async def main() -> None:
         @user_client.on(events.NewMessage)
         async def on_new_message(event):
             try:
+                await db.run_async(
+                    db.set_setting, "last_inbound_at", datetime.now(timezone.utc).isoformat()
+                )
+
                 async def _handle_new():
                     supplier = await resolve_supplier_for_event(event)
                     if supplier:

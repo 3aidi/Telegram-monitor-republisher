@@ -6348,6 +6348,128 @@ class MainChannelConfigTests(unittest.TestCase):
         self.assertEqual(len(ev.replies), 1)
         self.assertIn("Main Channel Updated", ev.replies[0]["text"])
 
+    def test_edit_prompt_copyable_code_block(self):
+        """✏️ Edit prompt includes an unquoted monospace code block for 1-tap mobile copying."""
+        import admin_bot
+
+        listing = {
+            "id": 99,
+            "clean_text": "ACCOUNT DETAILS LINE 1\nREGION EU",
+        }
+        prompt = admin_bot._edit_prompt(listing, None)
+        self.assertIn("Tap below to copy", prompt)
+        self.assertIn("```ACCOUNT DETAILS LINE 1\nREGION EU```", prompt)
+
+    def test_sold_workflow_replies_main_and_deletes_forwards(self):
+        """Marking a post sold replies SOLD OUT to main channel and deletes forwarded copies."""
+        import admin_bot
+        import db
+
+        sid = db.add_supplier("@sold_src", channel_id=-100911, db_path=self._test_db)
+        post_num = db.next_post_number(db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 1001, None, None, "published",
+            "Game Account", "Game Account", published_message_id=500,
+            db_path=self._test_db,
+        )
+        db.update_listing_status(
+            listing_id=lid, status="published",
+            published_message_id=500, post_number=post_num, db_path=self._test_db,
+        )
+        did = db.add_destination("-10099901", "Dest Group 1", active=True, db_path=self._test_db)
+        db.queue_forwarding(lid, "@main_dest", 500, db_path=self._test_db)
+        fwds = db.get_forwardings_for_listing(lid, db_path=self._test_db)
+        self.assertEqual(len(fwds), 1)
+        fwd_id = fwds[0]["id"]
+        db.mark_forwarded(fwd_id, destination_message_id=777, db_path=self._test_db)
+
+        class MockSender:
+            def __init__(self):
+                self.sent = []
+                self.deleted = []
+                self._connected = True
+            def is_connected(self):
+                return self._connected
+            async def send_message(self, peer, text, **kw):
+                self.sent.append({"peer": peer, "text": text, "kw": kw})
+            async def delete_messages(self, peer, ids):
+                self.deleted.append({"peer": peer, "ids": list(ids)})
+
+        mock_user = MockSender()
+        mock_fwd = MockSender()
+        admin_bot.set_user_client(mock_user)
+        admin_bot.set_forward_client(mock_fwd)
+        old_dest = admin_bot.DEST_CHANNEL
+        admin_bot.DEST_CHANNEL = "@main_dest"
+
+        class MockEvent:
+            def __init__(self):
+                self.sender_id = admin_bot.ADMIN_USER_ID
+                self.replies = []
+                self.answered = False
+            async def answer(self, text=None, alert=False):
+                self.answered = True
+            async def reply(self, text, parse_mode=None):
+                self.replies.append(text)
+
+        ev = MockEvent()
+        try:
+            asyncio.run(admin_bot._execute_sold(ev, post_number=post_num))
+            # 1. Main channel reply
+            self.assertEqual(len(mock_user.sent), 1)
+            self.assertIn("SOLD OUT", mock_user.sent[0]["text"])
+            self.assertEqual(mock_user.sent[0]["kw"].get("reply_to"), 500)
+
+            # 2. Forwarded message deleted from destination
+            self.assertEqual(len(mock_fwd.deleted), 1)
+            self.assertEqual(mock_fwd.deleted[0]["ids"], [777])
+
+            # 3. Status in DB is sold
+            updated_listing = db.get_listing_by_id(lid, db_path=self._test_db)
+            self.assertEqual(updated_listing["status"], "sold")
+
+            # 4. Confirmation sent
+            self.assertTrue(any("marked as SOLD" in r for r in ev.replies))
+        finally:
+            admin_bot.DEST_CHANNEL = old_dest
+            admin_bot.set_user_client(None)
+            admin_bot.set_forward_client(None)
+
+    def test_health_command(self):
+        """/health reports system status, connected clients, and source counts."""
+        import admin_bot
+
+        class FakeBot:
+            def __init__(self):
+                self.handlers = []
+            def on(self, filt):
+                def deco(fn):
+                    self.handlers.append((filt, fn))
+                    return fn
+                return deco
+            def is_connected(self):
+                return True
+
+        fake_bot = FakeBot()
+        admin_bot.setup_admin_handlers(fake_bot)
+
+        health_handler = next(
+            (fn for _, fn in fake_bot.handlers if getattr(fn, "__name__", "") == "handle_health"),
+            None,
+        )
+
+        self.assertIsNotNone(health_handler)
+        replies = []
+        class MockEvent:
+            sender_id = admin_bot.ADMIN_USER_ID
+            async def reply(self, text, **kw):
+                replies.append(text)
+
+        asyncio.run(health_handler(MockEvent()))
+        self.assertEqual(len(replies), 1)
+        self.assertIn("System Health & Heartbeat", replies[0])
+        self.assertIn("Admin Bot:", replies[0])
+
 
 if __name__ == "__main__":
     unittest.main()

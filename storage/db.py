@@ -265,6 +265,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 forwarded_at TEXT,
+                destination_message_id INTEGER,
                 UNIQUE(published_chat_id, published_message_id, destination_id)
             );
             """
@@ -274,6 +275,9 @@ def init_db(db_path: Optional[str] = None) -> None:
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_forwardings_dest ON forwardings(destination_id);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forwardings_listing ON forwardings(listing_id);"
         )
 
         # Safe indexes on columns present in both v0 and v1 schemas
@@ -578,6 +582,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         _header_cols = {r["name"] for r in _header_table_info}
         if "header_id" not in _header_cols:
             cursor.execute("ALTER TABLE listings ADD COLUMN header_id INTEGER")
+    _fwd_table_info = cursor.execute("PRAGMA table_info(forwardings)").fetchall()
+    if _fwd_table_info:
+        _fwd_cols = {r["name"] for r in _fwd_table_info}
+        if "destination_message_id" not in _fwd_cols:
+            cursor.execute("ALTER TABLE forwardings ADD COLUMN destination_message_id INTEGER")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forwardings_listing ON forwardings(listing_id);"
+        )
     if version < 12:
         cursor.execute("PRAGMA user_version = 12")
 
@@ -1393,14 +1405,14 @@ def get_listing_by_id(
 def get_post_by_number(
     post_number: int, db_path: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
-    """Fetch a published post by its sequential post number, joined with its supplier."""
+    """Fetch a published or sold post by its sequential post number, joined with its supplier."""
     query = """
         SELECT l.*, s.channel_username as supplier_username,
                s.channel_id as supplier_channel_id,
                s.display_name as supplier_display_name
         FROM listings l
         LEFT JOIN suppliers s ON l.supplier_id = s.id
-        WHERE l.status = 'published'
+        WHERE l.status IN ('published', 'sold')
           AND l.published_message_id IS NOT NULL
           AND l.post_number = ?
     """
@@ -3041,19 +3053,41 @@ def get_pending_forwardings(
         return [dict(row) for row in rows]
 
 
-def mark_forwarded(forwarding_id: int, db_path: Optional[str] = None) -> None:
-    """Record a successfully forwarded message."""
+def mark_forwarded(
+    forwarding_id: int,
+    destination_message_id: Any = None,
+    db_path: Optional[str] = None,
+) -> None:
+    """Record a successfully forwarded message, storing destination_message_id if provided."""
+    dest_msg_id = None
+    real_db_path = db_path
+    if isinstance(destination_message_id, int):
+        dest_msg_id = destination_message_id
+    elif isinstance(destination_message_id, str) and real_db_path is None:
+        real_db_path = destination_message_id
+
     now_iso = datetime.now(timezone.utc).isoformat()
-    with db_session(db_path) as conn:
-        conn.execute(
-            """
-            UPDATE forwardings
-            SET status = 'forwarded', error = NULL, retry_at = NULL,
-                forwarded_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (now_iso, now_iso, forwarding_id),
-        )
+    with db_session(real_db_path) as conn:
+        if dest_msg_id is not None:
+            conn.execute(
+                """
+                UPDATE forwardings
+                SET status = 'forwarded', error = NULL, retry_at = NULL,
+                    destination_message_id = ?, forwarded_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (int(dest_msg_id), now_iso, now_iso, forwarding_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE forwardings
+                SET status = 'forwarded', error = NULL, retry_at = NULL,
+                    forwarded_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now_iso, now_iso, forwarding_id),
+            )
 
 
 def mark_forward_failed(
@@ -3269,3 +3303,53 @@ def purge_expired_data(
             "DELETE FROM ai_cache WHERE created_at < ?", (cutoff,)
         ).rowcount
     return counts
+
+
+def get_forwardings_for_listing(
+    listing_id: int, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Return all forwardings (and destination chat_id) for a listing."""
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT f.*, d.chat_id AS destination_chat_id, d.title AS destination_title
+            FROM forwardings f
+            JOIN destinations d ON d.id = f.destination_id
+            WHERE f.listing_id = ?
+            ORDER BY f.id ASC
+            """,
+            (listing_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def cancel_pending_forwardings_for_listing(
+    listing_id: int, db_path: Optional[str] = None
+) -> int:
+    """Cancel any pending forwardings when a listing is marked as sold."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        cur = conn.execute(
+            """
+            UPDATE forwardings
+            SET status = 'cancelled', updated_at = ?
+            WHERE listing_id = ? AND status = 'pending'
+            """,
+            (now_iso, listing_id),
+        )
+        return cur.rowcount
+
+
+def mark_listing_sold(listing_id: int, db_path: Optional[str] = None) -> bool:
+    """Mark a listing as sold."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        cur = conn.execute(
+            """
+            UPDATE listings
+            SET status = 'sold', updated_at = ?
+            WHERE id = ?
+            """,
+            (now_iso, listing_id),
+        )
+        return cur.rowcount > 0

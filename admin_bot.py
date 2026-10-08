@@ -464,9 +464,8 @@ def _edit_prompt(listing: dict, existing_draft: Optional[str]) -> str:
     admin can copy-tweak-resend the body instead of retyping it from scratch.
 
     The current body comes from the last draft (if any), else the listing's
-    clean_text, else its raw_text — rendered as a blockquote box that copies
-    cleanly (Telegram blockquotes are formatting, the ``>`` markers are not
-    part of the copied text)."""
+    clean_text, else its raw_text — rendered with both a blockquote preview
+    and a monospace code block for 1-tap copying on mobile."""
     content = (existing_draft or "").strip()
     if not content:
         content = (listing.get("clean_text") or "").strip()
@@ -475,9 +474,13 @@ def _edit_prompt(listing: dict, existing_draft: Optional[str]) -> str:
     lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
     if not lines:
         body = texts.EDIT_EMPTY
+        code_block = ""
     else:
         body = "\n".join(f"> {ln}" for ln in lines)
-    return texts.EDIT_PROMPT.format(id=listing["id"], body=body)
+        raw_clean = "\n".join(lines).replace("```", "'''")
+        code_block = f"\n\n📋 **Tap below to copy:**\n```{raw_clean}```"
+    base = texts.EDIT_PROMPT.format(id=listing["id"], body=body)
+    return f"{base}{code_block}"
 
 
 # Home reply keyboard — persistent 1-tap UI. Labels reflect current state.
@@ -710,9 +713,10 @@ def _channel_view_buttons(listing: dict) -> List[List[object]]:
     dest_url = _destination_url(listing)
     if dest_url:
         row.append(Button.url(texts.BTN_VIEW_DEST, dest_url))
-    if not row:
-        return []
-    return [row]
+    buttons = [row] if row else []
+    if listing.get("published_message_id") and listing.get("status") != "sold":
+        buttons.append([Button.inline(texts.BTN_SOLD, data=f"sold:{listing['id']}")])
+    return buttons
 
 
 def _asleep_label() -> str:
@@ -1658,6 +1662,8 @@ def _published_digest(
             row.append(Button.url(num_disp, dest_url))
         if src_url:
             row.append(Button.url(src_disp, src_url))
+        if p.get("published_message_id") and p.get("status") != "sold":
+            row.append(Button.inline(texts.BTN_SOLD, data=f"sold:{p['id']}"))
         if row:
             buttons.append(row)
     if total is not None:
@@ -1758,14 +1764,146 @@ def _post_card(post: dict) -> Tuple[str, List[List[object]]]:
         source=supplier,
     )
     buttons = []
+    link_row = []
     src_url = _source_url(post)
     if src_url:
-        buttons.append([Button.url(texts.BTN_VIEW_BUYER, src_url)])
+        link_row.append(Button.url(texts.BTN_VIEW_BUYER, src_url))
+    dest_url = _destination_url(post)
+    if dest_url:
+        link_row.append(Button.url(texts.BTN_VIEW_DEST, dest_url))
+    if link_row:
+        buttons.append(link_row)
+    if post.get("published_message_id") and post.get("status") != "sold":
+        buttons.append([Button.inline(texts.BTN_SOLD, data=f"sold:{post['id']}")])
     buttons.append([
         Button.inline(texts.BTN_BACK, data="home:published"),
         Button.inline(texts.BTN_HOME, data="menu:home"),
     ])
     return lines, buttons
+
+
+async def _execute_sold(
+    event,
+    listing_id: Optional[int] = None,
+    post_number: Optional[int] = None,
+) -> None:
+    """Mark a listing as sold:
+    1. Replies to the published message in DEST_CHANNEL with SOLD OUT.
+    2. Deletes the forwarded message from all destination groups/channels.
+    3. Cancels any pending forwardings.
+    4. Updates listing status to 'sold' in DB and writes audit log.
+    5. Confirms action to the admin.
+    """
+    listing = None
+    if listing_id is not None:
+        listing = db.get_listing_by_id(listing_id)
+    elif post_number is not None:
+        listing = db.get_post_by_number(post_number)
+        if not listing:
+            listing = db.get_listing_by_id(post_number)
+
+    if not listing:
+        ref_label = str(post_number if post_number is not None else listing_id)
+        msg = texts.SOLD_NOT_FOUND.format(post=ref_label)
+        if hasattr(event, "answer"):
+            await event.answer("Listing not found", alert=True)
+        await event.reply(msg)
+        return
+
+    actual_id = listing["id"]
+    post_num = listing.get("post_number") or actual_id
+
+    if listing.get("status") == "sold":
+        msg = texts.SOLD_ALREADY.format(post=post_num)
+        if hasattr(event, "answer"):
+            await event.answer("Already marked as SOLD", alert=True)
+        await event.reply(msg)
+        return
+
+    published_msg_id = listing.get("published_message_id")
+    if not published_msg_id:
+        msg = texts.SOLD_NOT_PUBLISHED.format(post=post_num)
+        if hasattr(event, "answer"):
+            await event.answer("Post not published yet", alert=True)
+        await event.reply(msg)
+        return
+
+    # 1. Reply to published post in main channel (DEST_CHANNEL)
+    dest_channel = get_dest_channel()
+    if dest_channel:
+        dest_peer = db.to_peer_reference(dest_channel)
+        sender = user_client_ref if (user_client_ref and user_client_ref.is_connected()) else (
+            event.client if hasattr(event, "client") else None
+        )
+        if sender:
+            try:
+                import inspect
+                sig = inspect.signature(sender.send_message)
+                send_kwargs = {}
+                if "reply_to" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                    send_kwargs["reply_to"] = published_msg_id
+                await sender.send_message(dest_peer, texts.SOLD_REPLY, **send_kwargs)
+                logger.info("Replied SOLD OUT to post #%s (msg %s) in %s", post_num, published_msg_id, dest_channel)
+            except Exception as exc:
+                logger.warning("Could not send SOLD reply to %s msg %s: %s", dest_channel, published_msg_id, exc)
+
+    # 2. Cancel pending forwardings
+    await db.run_async(db.cancel_pending_forwardings_for_listing, actual_id)
+
+    # 3. Delete forwarded messages from destination groups
+    fwds = await db.run_async(db.get_forwardings_for_listing, actual_id)
+    del_sender = forward_client_ref if (forward_client_ref and forward_client_ref.is_connected()) else (
+        user_client_ref if (user_client_ref and user_client_ref.is_connected()) else (
+            event.client if hasattr(event, "client") else None
+        )
+    )
+    deleted_count = 0
+    if del_sender:
+        for f in fwds:
+            if f.get("status") == "forwarded":
+                dest_chat = f.get("destination_chat_id")
+                dest_msg_id = f.get("destination_message_id")
+                if dest_chat:
+                    to_peer = db.to_peer_reference(dest_chat)
+                    if not dest_msg_id and hasattr(del_sender, "get_messages"):
+                        try:
+                            msgs = await del_sender.get_messages(to_peer, limit=25)
+                            for m in msgs:
+                                fwd_header = getattr(m, "fwd_from", None)
+                                if fwd_header and getattr(fwd_header, "channel_post", None) == published_msg_id:
+                                    dest_msg_id = getattr(m, "id", None)
+                                    break
+                        except Exception:
+                            pass
+                    if dest_msg_id and hasattr(del_sender, "delete_messages"):
+                        try:
+                            await del_sender.delete_messages(to_peer, [dest_msg_id])
+                            deleted_count += 1
+                            logger.info("Deleted forwarded msg %s from %s for sold post #%s", dest_msg_id, dest_chat, post_num)
+                        except Exception as del_err:
+                            logger.warning("Could not delete forwarded msg %s from %s: %s", dest_msg_id, dest_chat, del_err)
+
+    # 4. Mark listing as sold in DB & audit log
+    await db.run_async(db.mark_listing_sold, actual_id)
+    await db.run_async(
+        db.record_audit,
+        "sold",
+        actual_id,
+        actor_id=event.sender_id,
+        detail=f"post #{post_num} marked sold (deleted from {deleted_count} destinations)",
+    )
+
+    # 5. Admin confirmation
+    done_text = texts.SOLD_DONE.format(post=post_num, deleted=deleted_count)
+    if hasattr(event, "answer"):
+        try:
+            await event.answer("🔴 Marked as SOLD", alert=False)
+        except Exception:
+            pass
+    try:
+        await event.reply(done_text, parse_mode="markdown")
+    except Exception:
+        await event.client.send_message(ADMIN_USER_ID, done_text, parse_mode="markdown")
 
 
 def setup_admin_handlers(bot: TelegramClient) -> None:
@@ -2053,6 +2191,44 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         text, buttons = _post_card(post)
         await event.reply(text, buttons=buttons, parse_mode="markdown")
+
+    @bot.on(events.NewMessage(pattern=r"^/sold(?:[ \t]+(\d+))?"))
+    async def handle_sold(event):
+        if not await check_admin(event):
+            return
+        arg = event.pattern_match.group(1)
+        if not arg:
+            await event.reply(
+                texts.SOLD_USAGE,
+                buttons=_home_keyboard(),
+            )
+            return
+        await _execute_sold(event, post_number=int(arg))
+
+    @bot.on(events.NewMessage(pattern=r"^(?:/health|🩺 Health)"))
+    async def handle_health(event):
+        if not await check_admin(event):
+            return
+        user_ok = "🟢 Connected" if (user_client_ref and user_client_ref.is_connected()) else "🔴 Disconnected"
+        if forward_client_ref:
+            fwd_ok = "🟢 Connected" if forward_client_ref.is_connected() else "🔴 Disconnected"
+        else:
+            fwd_ok = "⚪ Shared / Not separate"
+        bot_ok = "🟢 Connected" if bot.is_connected() else "🔴 Disconnected"
+        active_srcs = len(db.list_suppliers(active_only=True))
+        active_dests = len(db.list_destinations(active_only=True))
+        last_inbound_raw = db.get_setting("last_inbound_at", None)
+        last_inbound_disp = _relative_time(last_inbound_raw) if last_inbound_raw else "None recorded"
+
+        report = texts.HEALTH_STATUS.format(
+            user_status=user_ok,
+            fwd_status=fwd_ok,
+            bot_status=bot_ok,
+            sources=active_srcs,
+            dests=active_dests,
+            last_msg=last_inbound_disp,
+        )
+        await event.reply(report, buttons=_home_keyboard(), parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/preview(?:[ \t]+(\d+))?"))
     async def handle_preview(event):
@@ -3055,6 +3231,17 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 except Exception:
                     pass
                 await _advance_review(bot)
+                return
+
+        sold_match = re.match(r"^sold:(\d+)$", data_str)
+        if sold_match:
+            lid = int(sold_match.group(1))
+            await _execute_sold(event, listing_id=lid)
+            return
+
+        if data_str.startswith("sold_info:"):
+            await event.answer("This post is already marked as SOLD.", alert=True)
+            return
 
     @bot.on(events.NewMessage())
     async def handle_header_capture(event):
