@@ -396,8 +396,35 @@ async def send_skipped_alert(
         src_part = texts.SKIP_ALERT_SOURCE.format(source=src) if src and src != "?" else ""
         text = texts.SKIP_ALERT.format(reason=label, id=listing_id, source=src_part)
 
+    buttons = None
+    if reason != "duplicate" and listing_id:
+        row_buttons = []
+        try:
+            skips = db.get_skipped_listings(limit=10)
+            for s in skips:
+                if s.get("listing_id") == listing_id or (
+                    s.get("supplier_id") == listing.get("supplier_id")
+                    and s.get("message_id") == listing.get("source_message_id")
+                ):
+                    row_buttons.append(
+                        Button.inline(texts.BTN_REREVIEW, data=f"reskip:{s['skip_id']}")
+                    )
+                    break
+        except Exception:
+            pass
+
+        src_url = _source_url({
+            "supplier_username": listing.get("supplier_username") or listing.get("channel_username"),
+            "supplier_channel_id": listing.get("supplier_channel_id") or listing.get("channel_id"),
+            "source_message_id": listing.get("source_message_id"),
+        })
+        if src_url:
+            row_buttons.append(Button.url(texts.BTN_VIEW_BUYER, src_url))
+        if row_buttons:
+            buttons = [row_buttons]
+
     try:
-        await bot_client.send_message(admin_id, text, parse_mode="markdown")
+        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
     except Exception:
         logger.exception(
             "Failed to send skip alert for listing #%s (reason %s)",
@@ -405,14 +432,20 @@ async def send_skipped_alert(
             reason,
         )
 
+    # Advance the skip digest marker so the background digest does not duplicate this alert
+    try:
+        recent = db.get_skipped_listings(limit=1)
+        if recent and recent[0].get("skip_id"):
+            await db.run_async(db.set_skip_digest_marker, recent[0]["skip_id"])
+    except Exception:
+        pass
+
 
 async def skip_digest_worker(bot: TelegramClient) -> None:
     """Per-skip DM cards for skipped messages (SKIP-1): fires at most once per
-    10-minute window, only when new skips exist since the last marker, sending
-    ONE send_published_alert-style card per newly-skipped message (capped by
-    SKIP_DIGEST_MAX_CARDS) so each card carries its own Re-review + source-link
-    buttons. Immediate DMs are reserved for payment-proof detections, which
-    never land in the skips table."""
+    10-minute window, only when new un-alerted skips exist since the last marker,
+    sending ONE card per newly-skipped message (capped by SKIP_DIGEST_MAX_CARDS)
+    so each card carries its own Re-review + source-link buttons."""
     global _skip_digest_last_sent
     while True:
         try:
@@ -426,7 +459,9 @@ async def skip_digest_worker(bot: TelegramClient) -> None:
             recent = await asyncio.to_thread(db.get_skipped_listings, 1000)
             new_skips = [
                 k for k in recent
-                if k["skip_id"] > marker and k.get("reason") != "admin_skip"
+                if k["skip_id"] > marker
+                and k.get("reason") != "admin_skip"
+                and k.get("reason") != "duplicate"
             ]
             if not new_skips:
                 continue

@@ -2520,6 +2520,7 @@ async def health_check_worker(
             except Exception:
                 logger.exception("Could not read destination health for logging")
             await _report_destination_health(bot_client)
+            await _alert_stuck_workers(bot_client)
         except Exception:
             logger.exception("Error in health check worker")
 
@@ -2834,19 +2835,24 @@ async def main() -> None:
                                 username = getattr(chat, "username", None)
                                 store_ref = f"@{username.lower()}" if username else str(chat_id)
                                 title = (getattr(chat, "title", None) or username or f"chat {chat_id}")[:100]
+                                existing_rows = await db.run_async(db.list_destinations)
+                                existing_refs = {str(d["chat_id"]) for d in existing_rows}
+                                is_new = store_ref not in existing_refs and str(chat_id) not in existing_refs
+
                                 await db.run_async(db.add_destination, store_ref, title, True)
-                                logger.info(
-                                    "Auto-registered new destination from forward account join: %s (%s)",
-                                    title, store_ref,
-                                )
-                                if bot_client and ADMIN_USER_ID:
-                                    try:
-                                        await bot_client.send_message(
-                                            ADMIN_USER_ID,
-                                            texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref),
-                                        )
-                                    except Exception:
-                                        pass
+                                if is_new:
+                                    logger.info(
+                                        "Auto-registered new destination from forward account join: %s (%s)",
+                                        title, store_ref,
+                                    )
+                                    if bot_client and ADMIN_USER_ID:
+                                        try:
+                                            await bot_client.send_message(
+                                                ADMIN_USER_ID,
+                                                texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref),
+                                            )
+                                        except Exception:
+                                            pass
                 except Exception:
                     logger.exception("Error handling chat action on forward client")
         except Exception:
