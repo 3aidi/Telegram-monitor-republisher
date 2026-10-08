@@ -802,8 +802,8 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertFalse(admin_bot.listing_is_editable(""))
 
     def test_edit_prompt_seeds_current_content(self):
-        """The ✏️ Edit prompt is seeded with the current body as a blockquote
-        (copy-tweak-resend) instead of a blank slate."""
+        """The ✏️ Edit prompt is seeded with the current body in a copyable code block
+        (copy-tweak-resend) without the redundant blockquote header."""
         import admin_bot
 
         listing = {
@@ -811,12 +811,12 @@ class TestMonitorSystem(unittest.TestCase):
             "clean_text": "KYC CURVE PAY\nANY EU",
         }
         prompt = admin_bot._edit_prompt(listing, None)
-        self.assertIn("Current content", prompt)
-        self.assertIn("> KYC CURVE PAY", prompt)
-        self.assertIn("> ANY EU", prompt)
+        self.assertIn("Tap below to copy", prompt)
+        self.assertIn("KYC CURVE PAY\nANY EU", prompt)
+        self.assertNotIn("Current content", prompt)
+        self.assertNotIn("> KYC CURVE PAY", prompt)
         self.assertNotIn("$", prompt)
         self.assertNotIn("12.5", prompt)
-        self.assertIn("send back the FULL body", prompt)
 
     def test_edit_prompt_prior_draft_wins_and_no_price_note(self):
         """Re-entering Edit keeps the last draft as context, not the DB text."""
@@ -827,8 +827,7 @@ class TestMonitorSystem(unittest.TestCase):
             "clean_text": "OLD LINE FROM AI",
         }
         prompt = admin_bot._edit_prompt(listing, "MY EDITED LINE\nCHANGED")
-        self.assertIn("> MY EDITED LINE", prompt)
-        self.assertIn("> CHANGED", prompt)
+        self.assertIn("MY EDITED LINE\nCHANGED", prompt)
         self.assertNotIn("OLD LINE FROM AI", prompt)
         self.assertNotIn("$", prompt)
         self.assertNotIn("not set yet", prompt)
@@ -838,11 +837,11 @@ class TestMonitorSystem(unittest.TestCase):
 
         listing = {"id": 3, "clean_text": "", "raw_text": "RAW FALLBACK BODY"}
         prompt = admin_bot._edit_prompt(listing, None)
-        self.assertIn("> RAW FALLBACK BODY", prompt)
+        self.assertIn("RAW FALLBACK BODY", prompt)
 
         prompt2 = admin_bot._edit_prompt({"id": 4, "clean_text": "", "raw_text": "  "}, None)
         self.assertIn("no content yet", prompt2)
-        self.assertNotIn("> ", prompt2)
+        self.assertNotIn("Tap below to copy", prompt2)
 
     def test_normalize_channel_id_marks_bare_keeps_marked(self):
         """Every channel_id in the DB must be the marked form (-100... prefix)
@@ -6468,7 +6467,42 @@ class MainChannelConfigTests(unittest.TestCase):
         asyncio.run(health_handler(MockEvent()))
         self.assertEqual(len(replies), 1)
         self.assertIn("System Health & Heartbeat", replies[0])
-        self.assertIn("Admin Bot:", replies[0])
+    def test_sold_callback_dispatches_correctly(self):
+        """Callback 'sold:<id>' and 'sold_info:<id>' must NOT trigger 'Unknown action'."""
+        import admin_bot
+        import texts
+
+        class FakeBot:
+            def __init__(self):
+                self.handlers = []
+            def on(self, filt):
+                def deco(fn):
+                    self.handlers.append((filt, fn))
+                    return fn
+                return deco
+            def is_connected(self):
+                return True
+
+        fake_bot = FakeBot()
+        admin_bot.setup_admin_handlers(fake_bot)
+
+        callback_handler = next(
+            (fn for _, fn in fake_bot.handlers if getattr(fn, "__name__", "") == "handle_callback"),
+            None,
+        )
+        self.assertIsNotNone(callback_handler)
+
+        answered = []
+        class MockCbEvent:
+            sender_id = admin_bot.ADMIN_USER_ID
+            data = b"sold_info:99"
+            async def answer(self, text=None, alert=False):
+                answered.append({"text": text, "alert": alert})
+
+        asyncio.run(callback_handler(MockCbEvent()))
+        self.assertTrue(len(answered) > 0)
+        self.assertNotEqual(answered[0]["text"], texts.UNKNOWN_ACTION)
+        self.assertIn("already marked as SOLD", answered[0]["text"])
 
 
 if __name__ == "__main__":

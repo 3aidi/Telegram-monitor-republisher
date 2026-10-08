@@ -464,8 +464,8 @@ def _edit_prompt(listing: dict, existing_draft: Optional[str]) -> str:
     admin can copy-tweak-resend the body instead of retyping it from scratch.
 
     The current body comes from the last draft (if any), else the listing's
-    clean_text, else its raw_text — rendered with both a blockquote preview
-    and a monospace code block for 1-tap copying on mobile."""
+    clean_text, else its raw_text — rendered in a monospace code block for
+    1-tap copying on mobile."""
     content = (existing_draft or "").strip()
     if not content:
         content = (listing.get("clean_text") or "").strip()
@@ -474,13 +474,10 @@ def _edit_prompt(listing: dict, existing_draft: Optional[str]) -> str:
     lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
     if not lines:
         body = texts.EDIT_EMPTY
-        code_block = ""
     else:
-        body = "\n".join(f"> {ln}" for ln in lines)
         raw_clean = "\n".join(lines).replace("```", "'''")
-        code_block = f"\n\n📋 **Tap below to copy:**\n```{raw_clean}```"
-    base = texts.EDIT_PROMPT.format(id=listing["id"], body=body)
-    return f"{base}{code_block}"
+        body = f"📋 **Tap below to copy:**\n```{raw_clean}```"
+    return texts.EDIT_PROMPT.format(id=listing["id"], body=body)
 
 
 # Home reply keyboard — persistent 1-tap UI. Labels reflect current state.
@@ -2925,6 +2922,16 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 logger.exception("Failed to send edit prompt for listing #%s", listing_id)
             return
 
+        sold_match = re.match(r"^sold:(\d+)$", data_str)
+        if sold_match:
+            lid = int(sold_match.group(1))
+            await _execute_sold(event, listing_id=lid)
+            return
+
+        if data_str.startswith("sold_info:"):
+            await event.answer("This post is already marked as SOLD.", alert=True)
+            return
+
         match = re.match(r"^(approve|skip):(\d+)$", data_str)
         if not match:
             await event.answer(texts.UNKNOWN_ACTION, alert=True)
@@ -3232,16 +3239,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     pass
                 await _advance_review(bot)
                 return
-
-        sold_match = re.match(r"^sold:(\d+)$", data_str)
-        if sold_match:
-            lid = int(sold_match.group(1))
-            await _execute_sold(event, listing_id=lid)
-            return
-
-        if data_str.startswith("sold_info:"):
-            await event.answer("This post is already marked as SOLD.", alert=True)
-            return
 
     @bot.on(events.NewMessage())
     async def handle_header_capture(event):

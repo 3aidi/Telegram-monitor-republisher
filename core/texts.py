@@ -116,8 +116,7 @@ PREVIEW_TOO_LONG = "⚠️ Preview #{id} exceeds maximum display length. Use `/p
 PREVIEW_USAGE = "Usage: `/preview 12`"
 EDIT_PROMPT = (
     "✏️ **Edit Listing #{id}**\n\n"
-    "Current content — edit and send back the FULL body:\n"
-    ">{body}\n\n"
+    "{body}\n\n"
     "• Price & contact details are attached automatically.\n"
     "/cancel to abort."
 )
