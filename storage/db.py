@@ -2257,10 +2257,13 @@ def set_setting(key: str, value: str, db_path: Optional[str] = None) -> None:
 def get_setting(key: str, default: Optional[str] = None, db_path: Optional[str] = None) -> Optional[str]:
     """Read a key/value setting, returning default if unset."""
     with db_session(db_path) as conn:
-        row = conn.execute(
-            "SELECT value FROM app_settings WHERE key = ?", (key,)
-        ).fetchone()
-    return row["value"] if row else default
+        try:
+            row = conn.execute(
+                "SELECT value FROM app_settings WHERE key = ?", (key,)
+            ).fetchone()
+            return row["value"] if row else default
+        except sqlite3.OperationalError:
+            return default
 
 
 def delete_setting(key: str, db_path: Optional[str] = None) -> None:

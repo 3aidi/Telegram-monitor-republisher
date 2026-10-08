@@ -1275,6 +1275,33 @@ async def sync_destinations_from_forward_client(
     return newly_added
 
 
+async def destination_sync_worker(
+    forward_client: TelegramClient,
+    stop_event: asyncio.Event,
+    bot_client: Optional[TelegramClient] = None,
+    interval: float = 45.0,
+) -> None:
+    """Continuously poll forward account dialogs to auto-register newly joined groups."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            raise
+
+        if stop_event.is_set():
+            break
+
+        try:
+            if forward_client and forward_client.is_connected():
+                await sync_destinations_from_forward_client(forward_client, bot_client)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error in destination sync worker")
+
+
 async def forwarding_worker(
     client: TelegramClient,
     stop_event: asyncio.Event,
@@ -2910,6 +2937,11 @@ async def main() -> None:
         forwarding_worker(user_client, stop_event, forward_client=forward_client)
     )
     retention_task = asyncio.create_task(retention_worker(stop_event))
+    dest_sync_task = None
+    if forward_client is not None:
+        dest_sync_task = asyncio.create_task(
+            destination_sync_worker(forward_client, stop_event, bot_client)
+        )
     health_task = None
     resolve_task = None
     rephrase_task = None
@@ -2946,6 +2978,8 @@ async def main() -> None:
         worker_task.cancel()
         forward_task.cancel()
         retention_task.cancel()
+        if dest_sync_task is not None:
+            dest_sync_task.cancel()
         for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 task.cancel()
@@ -2954,6 +2988,8 @@ async def main() -> None:
         # SHUT-1: actually await the cancelled tasks so their finally-blocks and
         # DB connection check-ins complete instead of leaking as orphans.
         pending_tasks = [held_task, worker_task, forward_task, retention_task]
+        if dest_sync_task is not None:
+            pending_tasks.append(dest_sync_task)
         for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 pending_tasks.append(task)
