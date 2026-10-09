@@ -6271,6 +6271,73 @@ class TestForwardDedicatedAccount(unittest.TestCase):
         self.assertIn("@beta_super", chat_ids)
         os.remove(db_path)
 
+    def test_sync_destinations_skips_and_leaves_unwritable_group(self):
+        """sync_destinations_from_forward_client skips unwritable groups and leaves them."""
+        import main as main_mod
+        db_path = self._fresh_db("test_fwd_unwritable.db")
+
+        class FakeRights:
+            send_messages = True
+
+        class FakeEntity:
+            def __init__(self, cid, title=None, broadcast=False, megagroup=True, default_banned=None):
+                self.id = cid
+                self.title = title
+                self.username = None
+                self.broadcast = broadcast
+                self.megagroup = megagroup
+                self.default_banned_rights = default_banned
+                self.admin_rights = None
+                self.creator = False
+
+        class FakeDialog:
+            def __init__(self, cid, entity, is_group=True, is_channel=False):
+                self.id = cid
+                self.is_group = is_group
+                self.is_channel = is_channel
+                self.entity = entity
+
+        class FakeClient:
+            def __init__(self):
+                self.left_dialogs = []
+
+            async def get_dialogs(self, limit=200):
+                return [
+                    FakeDialog(111, FakeEntity(111, title="Normal Group", megagroup=True)),
+                    FakeDialog(222, FakeEntity(222, title="Read-Only Group", megagroup=True, default_banned=FakeRights())),
+                ]
+
+            async def delete_dialog(self, entity):
+                self.left_dialogs.append(entity)
+
+        class FakeBot:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, target, text, **kwargs):
+                self.sent.append((target, text))
+
+        client = FakeClient()
+        bot = FakeBot()
+        old_default = db.DEFAULT_DB_PATH
+        old_admin = main_mod.ADMIN_USER_ID
+        db.DEFAULT_DB_PATH = db_path
+        main_mod.ADMIN_USER_ID = 99999
+        try:
+            added = asyncio.run(main_mod.sync_destinations_from_forward_client(client, bot_client=bot))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+            main_mod.ADMIN_USER_ID = old_admin
+
+        self.assertEqual(added, 1)
+        dests = db.list_destinations(db_path=db_path)
+        self.assertEqual(len(dests), 1)
+        self.assertEqual(dests[0]["title"], "Normal Group")
+        self.assertEqual(len(client.left_dialogs), 1)
+        self.assertEqual(len(bot.sent), 2)
+        self.assertTrue(any("Read-Only Group" in m[1] for m in bot.sent))
+        os.remove(db_path)
+
 
 class MainChannelConfigTests(unittest.TestCase):
     def setUp(self):
@@ -6536,6 +6603,64 @@ class MainChannelConfigTests(unittest.TestCase):
         self.assertTrue(len(answered) > 0)
         self.assertNotEqual(answered[0]["text"], texts.UNKNOWN_ACTION)
         self.assertIn("already marked as SOLD", answered[0]["text"])
+
+    def test_delete_all_dead_destinations_leaves_chats(self):
+        """Callback 'destdel:confirm_dead' leaves groups on forward_client_ref."""
+        import admin_bot
+        from core import runtime as core_runtime
+
+        class FakeClient:
+            def __init__(self):
+                self.left_dialogs = []
+            def is_connected(self):
+                return True
+            async def delete_dialog(self, entity):
+                self.left_dialogs.append(entity)
+
+        fake_fwd = FakeClient()
+        admin_bot.set_forward_client(fake_fwd)
+
+        class FakeBot:
+            def __init__(self):
+                self.handlers = []
+            def on(self, filt):
+                def deco(fn):
+                    self.handlers.append((filt, fn))
+                    return fn
+                return deco
+            def is_connected(self):
+                return True
+            async def send_message(self, *args, **kwargs):
+                pass
+
+        fake_bot = FakeBot()
+        admin_bot.setup_admin_handlers(fake_bot)
+
+        callback_handler = next(
+            (fn for _, fn in fake_bot.handlers if getattr(fn, "__name__", "") == "handle_callback"),
+            None,
+        )
+        self.assertIsNotNone(callback_handler)
+
+        class MockEvent:
+            sender_id = admin_bot.ADMIN_USER_ID
+            data = b"destdel:confirm_dead"
+            client = fake_bot
+            answered = []
+            deleted = False
+            async def answer(self, text=None, alert=False):
+                self.answered.append(text)
+            async def delete(self):
+                self.deleted = True
+
+        # Mock get_destination_health to return 1 dead destination
+        with mock.patch("db.get_destination_health", return_value=[{"id": 42, "chat_id": "-100999888", "is_dead": True}]):
+            with mock.patch("db.delete_destination", return_value=True):
+                asyncio.run(callback_handler(MockEvent()))
+
+        self.assertEqual(len(fake_fwd.left_dialogs), 1)
+        self.assertEqual(str(fake_fwd.left_dialogs[0]), "-100999888")
+        admin_bot.set_forward_client(None)
 
 
 if __name__ == "__main__":

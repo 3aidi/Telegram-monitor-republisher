@@ -294,6 +294,8 @@ async def _alert_stuck_workers(bot_client: Optional[TelegramClient]) -> None:
 from core.runtime import (
     destination_health_handle as _destination_health_handle,
     format_destination_health_report as _format_destination_health_report,
+    leave_destination_chat,
+    check_can_write_to_destination,
 )
 
 
@@ -1165,12 +1167,6 @@ async def sync_destinations_from_forward_client(
             if not (d.is_group or d.is_channel):
                 continue
             entity = d.entity
-            is_megagroup = getattr(entity, "megagroup", False)
-            if d.is_channel and not is_megagroup:
-                admin_rights = getattr(entity, "admin_rights", None)
-                if not admin_rights or not getattr(admin_rights, "post_messages", False):
-                    continue
-
             chat_id = db.normalize_channel_id(entity)
             if not chat_id:
                 continue
@@ -1181,6 +1177,29 @@ async def sync_destinations_from_forward_client(
                 continue
 
             title = (getattr(entity, "title", None) or username or f"chat {chat_id}")[:100]
+
+            # Verify that the account can actually write/post in this group
+            can_write, reason = await check_can_write_to_destination(forward_client, entity)
+            if not can_write:
+                logger.warning(
+                    "Skipping destination candidate %s (%s): %s; leaving group",
+                    title, store_ref, reason,
+                )
+                await leave_destination_chat(forward_client, entity)
+                if bot_client and ADMIN_USER_ID:
+                    try:
+                        await bot_client.send_message(
+                            ADMIN_USER_ID,
+                            f"⚠️ <b>Cannot add destination group:</b>\n"
+                            f"• <b>{title}</b> (<code>{store_ref}</code>)\n"
+                            f"❌ {reason}\n"
+                            f"🚪 Left the group automatically.",
+                            parse_mode="html",
+                        )
+                    except Exception:
+                        pass
+                continue
+
             await db.run_async(db.add_destination, store_ref, title, True)
             existing[store_ref] = {"chat_id": store_ref}
             existing[str(chat_id)] = {"chat_id": str(chat_id)}
@@ -2763,21 +2782,41 @@ async def main() -> None:
                                 existing_rows = await db.run_async(db.list_destinations)
                                 existing_refs = {str(d["chat_id"]) for d in existing_rows}
                                 is_new = store_ref not in existing_refs and str(chat_id) not in existing_refs
+                                if not is_new:
+                                    return
 
-                                await db.run_async(db.add_destination, store_ref, title, True)
-                                if is_new:
-                                    logger.info(
-                                        "Auto-registered new destination from forward account join: %s (%s)",
-                                        title, store_ref,
+                                # Check write permissions before adding
+                                can_write, reason = await check_can_write_to_destination(forward_client, chat)
+                                if not can_write:
+                                    logger.warning(
+                                        "Joined group %s (%s) but cannot send messages (%s); leaving group",
+                                        title, store_ref, reason,
                                     )
+                                    await leave_destination_chat(forward_client, chat)
                                     if bot_client and ADMIN_USER_ID:
                                         try:
                                             await bot_client.send_message(
                                                 ADMIN_USER_ID,
-                                                texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref),
+                                                texts.DEST_CANNOT_WRITE.format(title=title, ref=store_ref, reason=reason),
+                                                parse_mode="markdown",
                                             )
                                         except Exception:
                                             pass
+                                    return
+
+                                await db.run_async(db.add_destination, store_ref, title, True)
+                                logger.info(
+                                    "Auto-registered new destination from forward account join: %s (%s)",
+                                    title, store_ref,
+                                )
+                                if bot_client and ADMIN_USER_ID:
+                                    try:
+                                        await bot_client.send_message(
+                                            ADMIN_USER_ID,
+                                            texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref),
+                                        )
+                                    except Exception:
+                                        pass
                 except Exception:
                     logger.exception("Error handling chat action on forward client")
         except Exception:

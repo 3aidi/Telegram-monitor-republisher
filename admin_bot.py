@@ -1166,6 +1166,7 @@ from core.runtime import (
     destination_username as _destination_username,
     destination_open_url,
     format_destination_health_report,
+    leave_destination_chat,
 )
 
 
@@ -2721,6 +2722,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if not d:
                 await event.answer(texts.DEST_NOT_FOUND, alert=True)
                 return
+            chat_ref = d.get("chat_id")
+            for cl in [forward_client_ref, user_client_ref]:
+                if cl and hasattr(cl, "is_connected") and cl.is_connected():
+                    await leave_destination_chat(cl, chat_ref)
             await db.run_async(db.delete_destination, did)
             await db.run_async(
                 db.record_audit,
@@ -2760,10 +2765,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             text = (
                 f"🗑 <b>Delete {count} Dead Destination(s)?</b>\n\n"
                 f"This will permanently delete all {count} channels/groups that are not delivering (100% fail rate, banned or private).\n\n"
-                f"They will be completely removed from destinations."
+                f"The forwarding account will also automatically leave these groups so they stop being re-synced."
             )
             buttons = [
-                [Button.inline(f"✅ Yes, Delete {count} Dead", data="destdel:confirm_dead")],
+                [Button.inline(f"✅ Yes, Delete & Leave {count} Dead", data="destdel:confirm_dead")],
                 [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
             ]
             await _message_delete_send(event, text, buttons=buttons, parse_mode="html")
@@ -2773,25 +2778,30 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             rows = await db.run_async(db.get_destination_health)
             dead = [r for r in rows if r.get("is_dead")]
             deleted_count = 0
+            left_count = 0
             for d in dead:
+                chat_ref = d.get("chat_id")
+                left = False
+                for cl in [forward_client_ref, user_client_ref]:
+                    if cl and hasattr(cl, "is_connected") and cl.is_connected():
+                        if await leave_destination_chat(cl, chat_ref):
+                            left = True
+                if left:
+                    left_count += 1
                 await db.run_async(db.delete_destination, d["id"])
                 await db.run_async(
                     db.record_audit,
                     "destination_deleted",
                     None,
                     actor_id=ADMIN_USER_ID,
-                    detail=f"bulk_dead_delete id={d['id']} chat={d.get('chat_id')}",
+                    detail=f"bulk_dead_delete id={d['id']} chat={chat_ref} left={left}",
                 )
                 deleted_count += 1
             await event.answer(f"🗑 Deleted {deleted_count} dead destination(s).")
-            try:
-                await event.delete()
-            except Exception:
-                pass
-            destinations = db.get_destination_health()
-            await event.client.send_message(
-                ADMIN_USER_ID,
-                f"🗑 <b>Deleted {deleted_count} dead destination(s).</b>",
+            left_msg = f"\n🚪 Left {left_count} dead group(s) on the forwarding account." if left_count else ""
+            await _message_delete_send(
+                event,
+                f"🗑 <b>Deleted {deleted_count} dead destination(s).</b>{left_msg}",
                 buttons=[
                     [Button.inline("📊 Check Health Again", data="desthealth:view")],
                     [Button.inline(DESTINATIONS_BTN, data="menu:destinations")],

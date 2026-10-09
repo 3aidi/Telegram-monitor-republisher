@@ -205,3 +205,105 @@ def format_destination_health_report(rows: list) -> str:
             "FORWARD_PACING_SECONDS to queue fewer at once."
         )
     return "\n".join(lines)
+
+
+async def leave_destination_chat(client: Any, chat_ref: Any) -> bool:
+    """Safely leaves a chat/channel and deletes the dialog on a Telethon client."""
+    if not client:
+        return False
+    if hasattr(client, "is_connected") and not client.is_connected():
+        return False
+    try:
+        try:
+            peer = int(chat_ref)
+        except (ValueError, TypeError):
+            peer = str(chat_ref or "").strip()
+
+        if not peer:
+            return False
+
+        entity = peer
+        if hasattr(client, "get_input_entity") and callable(client.get_input_entity):
+            try:
+                entity = await client.get_input_entity(peer)
+            except Exception:
+                entity = peer
+
+        # 1. Try delete_dialog to clear from active dialogs
+        if hasattr(client, "delete_dialog") and callable(client.delete_dialog):
+            try:
+                await client.delete_dialog(entity)
+                return True
+            except Exception:
+                pass
+
+        # 2. Try LeaveChannelRequest for channels/supergroups
+        try:
+            from telethon.tl.functions.channels import LeaveChannelRequest
+            await client(LeaveChannelRequest(entity))
+            return True
+        except Exception:
+            pass
+
+        return False
+    except Exception as exc:
+        logger.debug("Failed leaving destination chat %s: %s", chat_ref, exc)
+        return False
+
+
+async def check_can_write_to_destination(client: Any, entity: Any) -> Tuple[bool, str]:
+    """Check if client has write/send permission in entity.
+    
+    Returns (True, '') if client can send messages, or (False, reason) if write forbidden,
+    banned, read-only, or member posting is disabled.
+    """
+    if client is None:
+        return True, ""
+    try:
+        is_channel = getattr(entity, "broadcast", False) or (
+            hasattr(entity, "megagroup") and not getattr(entity, "megagroup", False)
+        )
+        is_megagroup = getattr(entity, "megagroup", False)
+
+        # In broadcast channels (not megagroups), ONLY admins can post messages
+        if is_channel and not is_megagroup:
+            admin_rights = getattr(entity, "admin_rights", None)
+            if not admin_rights or not getattr(admin_rights, "post_messages", False):
+                return False, "Broadcast channel requires admin posting permissions"
+
+        # Check group-level default restricted permissions (e.g. read-only group)
+        default_banned = getattr(entity, "default_banned_rights", None)
+        has_admin_rights = bool(getattr(entity, "admin_rights", None) or getattr(entity, "creator", False))
+        if default_banned and getattr(default_banned, "send_messages", False) and not has_admin_rights:
+            return False, "Group has send messages disabled for members (read-only)"
+
+        # Check client participant permissions if supported
+        if hasattr(client, "get_permissions") and callable(client.get_permissions):
+            try:
+                perms = await client.get_permissions(entity, "me")
+            except Exception as e:
+                err_name = type(e).__name__
+                if "ChatWriteForbidden" in err_name or "UserBanned" in err_name:
+                    return False, f"Write forbidden ({err_name})"
+                if "ChannelPrivate" in err_name or "UserKicked" in err_name:
+                    return False, f"Access denied ({err_name})"
+                perms = None
+
+            if perms:
+                if getattr(perms, "is_banned", False):
+                    return False, "Account is banned or muted in this group"
+                if getattr(perms, "has_left", False):
+                    return False, "Account is not a member of this group"
+
+                participant = getattr(perms, "participant", None)
+                banned_rights = getattr(participant, "banned_rights", None)
+                if banned_rights and getattr(banned_rights, "send_messages", False):
+                    return False, "Account is restricted from sending messages in this group"
+
+                if is_channel and not is_megagroup and not getattr(perms, "post_messages", False):
+                    return False, "Admin rights do not include post_messages in this channel"
+
+        return True, ""
+    except Exception as exc:
+        logger.debug("Permission check error on destination %s: %s", entity, exc)
+        return True, ""
