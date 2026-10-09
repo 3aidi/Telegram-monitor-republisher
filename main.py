@@ -291,101 +291,10 @@ async def _alert_stuck_workers(bot_client: Optional[TelegramClient]) -> None:
             logger.exception("Could not send stuck-worker alert for %s", name)
 
 
-def _destination_health_handle(chat_ref) -> str:
-    """HTML for one destination reference in the health DM.
-
-    A public @username is a normal clickable t.me link so the admin can jump
-    straight into the chat they are being rate-limited in or banned from. A
-    private destination has no public URL, so its numeric id is left as plain
-    text instead of a code span or a link that cannot resolve.
-    """
-    ref = str(chat_ref or "").strip()
-    if not ref:
-        return "id ?"
-    if ref.startswith("@"):
-        url = admin_bot.destination_open_url(ref)
-        if url:
-            return f'<a href="{url}">{ref}</a>'
-        return ref
-    return f"id {ref}"
-
-
-def _format_destination_health_report(rows: list) -> str:
-    """Render a DM listing every destination that is not fully healthy.
-
-    DEST-HEALTH: the admin had no way to see that several destination groups
-    were banned until the log filled with forward warnings. This names each
-    unhealthy destination with its @username/chat id, the failure rate, and the
-    last error, so the fix (remove it, or re-join the account) is obvious.
-
-    Throttled destinations are reported separately on purpose: a FloodWait is
-    the forwarding ACCOUNT being rate-limited, not a bad group, and telling the
-    admin to delete a working destination would lose real reach.
-    """
-    dead = [r for r in rows if r.get("is_dead")]
-    flapping = [r for r in rows if r.get("is_flapping")]
-    throttled = [r for r in rows if r.get("is_throttled")]
-
-    if not dead and not flapping and not throttled:
-        return ""
-
-    lines = [
-        "📊 <b>Destination health</b>",
-        "",
-    ]
-    if dead:
-        lines.append(f"<b>❌ Not delivering at all ({len(dead)})</b>")
-        sorted_dead = sorted(dead, key=lambda x: -x["failures"])
-        shown_dead = sorted_dead[:15]
-        for r in shown_dead:
-            handle = _destination_health_handle(r["chat_id"])
-            last = (r["last_error"] or "unknown error").split(" (caused by")[0][:90]
-            lines.append(
-                f"• {handle}\n"
-                f"   {r['failures']}/{r['attempts']} failed · {r['fail_pct']:.0f}%\n"
-                f"   {last}"
-            )
-        if len(sorted_dead) > 15:
-            lines.append(
-                f"<i>...and {len(sorted_dead) - 15} more failing destination(s). "
-                f"Use the delete button below to remove all {len(dead)} dead channels.</i>"
-            )
-        lines.append("")
-    if flapping:
-        lines.append(f"<b>⚠️ Intermittent ({len(flapping)})</b>")
-        sorted_flapping = sorted(flapping, key=lambda x: -x["consecutive_failures"])
-        shown_flapping = sorted_flapping[:15]
-        for r in shown_flapping:
-            handle = _destination_health_handle(r["chat_id"])
-            lines.append(
-                f"• {handle} — {r['fail_pct']:.0f}% fail, "
-                f"{r['consecutive_failures']} in a row (still succeeds sometimes)"
-            )
-        if len(sorted_flapping) > 15:
-            lines.append(f"<i>...and {len(sorted_flapping) - 15} more intermittent destination(s).</i>")
-        lines.append("")
-    if throttled:
-        lines.append(f"<b>⏳ Waiting on Telegram rate limit ({len(throttled)})</b>")
-        for r in sorted(throttled, key=lambda x: -x.get("deferred", 0)):
-            handle = _destination_health_handle(r["chat_id"])
-            lines.append(
-                f"• {handle} — {r.get('deferred', 0)} queued, "
-                f"waiting for the rate limit to clear"
-            )
-        lines.append("")
-
-    if dead or flapping:
-        lines.append(
-            "Banned or private groups can never be delivered to. Disable or delete "
-            "them in Destinations so they stop being retried."
-        )
-    if throttled:
-        lines.append(
-            "Rate-limit waits are the forwarding account's fault, not the "
-            "group's — these will deliver on their own. Raise "
-            "FORWARD_PACING_SECONDS to queue fewer at once."
-        )
-    return "\n".join(lines)
+from core.runtime import (
+    destination_health_handle as _destination_health_handle,
+    format_destination_health_report as _format_destination_health_report,
+)
 
 
 async def _report_destination_health(bot_client: Optional[TelegramClient]) -> None:

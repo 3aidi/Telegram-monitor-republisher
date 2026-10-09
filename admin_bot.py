@@ -1162,39 +1162,11 @@ def _destination_label(d: dict) -> str:
     return ref or "?"
 
 
-def _destination_username(chat_ref) -> str:
-    """Public @handle of a destination peer, or '' when it has no public username.
-
-    A destination stores exactly one peer reference in chat_id: '@username' for a
-    public chat/channel/group, or the marked numeric id ('-100...') for a private
-    one (see db._destination_chat_ref). Only the '@' form names a chat Telegram
-    can open from a link, so a numeric id deliberately yields no handle. The
-    handle grammar mirrors db._destination_chat_ref, so anything that could be
-    stored can be linked and a half-typed handle never becomes a dead link.
-    """
-    ref = str(chat_ref or "").strip()
-    if not ref.startswith("@"):
-        return ""
-    handle = ref[1:]
-    if not handle or not all(c.isalnum() or c == "_" for c in handle):
-        return ""
-    return handle
-
-
-def destination_open_url(chat_ref) -> Optional[str]:
-    """t.me URL that opens a destination chat, or None when it isn't public.
-
-    Public rather than module-private because the destination health DM in
-    main.py links the same handles.
-
-    'https://t.me/<handle>' is the one deep link that reliably opens a public
-    chat, channel or group. A private destination has no handle and therefore no
-    public URL, so nothing is built for it: its 't.me/c/<id>' form only resolves
-    inside a client that already holds the entity, so handing it out would add a
-    button that silently fails. Callers must treat None as "show plain text".
-    """
-    handle = _destination_username(chat_ref)
-    return f"https://t.me/{handle}" if handle else None
+from core.runtime import (
+    destination_username as _destination_username,
+    destination_open_url,
+    format_destination_health_report,
+)
 
 
 def _destination_open_button(chat_ref, label: str = texts.BTN_OPEN_CHAT):
@@ -2270,9 +2242,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
     async def handle_dest_health_check(event):
         if not await check_admin(event):
             return
-        import main as main_mod
         rows = await db.run_async(db.get_destination_health)
-        text = main_mod._format_destination_health_report(rows)
+        text = format_destination_health_report(rows)
         dead = [r for r in rows if r.get("is_dead")]
         if not text:
             total_active = len([r for r in rows if r.get("active")])
@@ -2830,9 +2801,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         if data_str == "desthealth:view":
-            import main as main_mod
             rows = await db.run_async(db.get_destination_health)
-            text = main_mod._format_destination_health_report(rows)
+            text = format_destination_health_report(rows)
             dead = [r for r in rows if r.get("is_dead")]
             if not text:
                 total_active = len([r for r in rows if r.get("active")])
