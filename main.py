@@ -296,6 +296,7 @@ from core.runtime import (
     format_destination_health_report as _format_destination_health_report,
     leave_destination_chat,
     check_can_write_to_destination,
+    is_group_chat,
 )
 
 
@@ -1164,9 +1165,10 @@ async def sync_destinations_from_forward_client(
         existing = {str(d["chat_id"]): d for d in existing_rows}
 
         for d in dialogs:
-            if not (d.is_group or d.is_channel):
+            entity = getattr(d, "entity", None)
+            # Destinations must ONLY be groups, NEVER broadcast channels
+            if not is_group_chat(entity):
                 continue
-            entity = d.entity
             chat_id = db.normalize_channel_id(entity)
             if not chat_id:
                 continue
@@ -1190,11 +1192,8 @@ async def sync_destinations_from_forward_client(
                     try:
                         await bot_client.send_message(
                             ADMIN_USER_ID,
-                            f"⚠️ <b>Cannot add destination group:</b>\n"
-                            f"• <b>{title}</b> (<code>{store_ref}</code>)\n"
-                            f"❌ {reason}\n"
-                            f"🚪 Left the group automatically.",
-                            parse_mode="html",
+                            texts.DEST_CANNOT_WRITE.format(title=title, ref=store_ref, reason=reason),
+                            parse_mode="markdown",
                         )
                     except Exception:
                         pass
@@ -2754,15 +2753,8 @@ async def main() -> None:
             )
             admin_bot.set_forward_client(forward_client)
 
-            # Auto-sync destination groups from forward account dialogs on startup
-            try:
-                synced_count = await sync_destinations_from_forward_client(
-                    forward_client, bot_client
-                )
-                if synced_count:
-                    logger.info("Auto-synced %d destination(s) from forward account dialogs.", synced_count)
-            except Exception:
-                logger.exception("Could not auto-sync destinations from forward client dialogs")
+            # Auto-registration only happens when the forwarding account joins a new group in real time.
+            # Do NOT scan all existing dialogs across the account.
 
             # Listen for when the forwarding account joins or is added to groups in real time
             @forward_client.on(events.ChatAction)
@@ -2774,6 +2766,11 @@ async def main() -> None:
                         user_ids = [getattr(u, "id", None) for u in users] if users else []
                         if event.user_id == me.id or me.id in user_ids:
                             chat = await event.get_chat()
+
+                            # Destinations must ONLY be groups, NEVER broadcast channels
+                            if not is_group_chat(chat):
+                                return
+
                             chat_id = db.normalize_channel_id(chat)
                             if chat_id:
                                 username = getattr(chat, "username", None)
@@ -2908,10 +2905,8 @@ async def main() -> None:
     )
     retention_task = asyncio.create_task(retention_worker(stop_event))
     dest_sync_task = None
-    if forward_client is not None:
-        dest_sync_task = asyncio.create_task(
-            destination_sync_worker(forward_client, stop_event, bot_client)
-        )
+    # Periodic background dialog scanning disabled:
+    # destinations are only auto-added when the forwarding account joins a new group in real time.
     health_task = None
     resolve_task = None
     rephrase_task = None

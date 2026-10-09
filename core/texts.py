@@ -353,7 +353,7 @@ DEST_ADD_USAGE = (
     "Example: `/adddestination @group`"
 )
 DEST_AUTO_DETECTED = "➕ **New destination auto-detected**: {title} (`{ref}`)"
-DEST_CANNOT_WRITE = "⚠️ **Cannot use as destination**: {title} (`{ref}`)\n❌ {reason}\n🚪 Left the group automatically."
+DEST_CANNOT_WRITE = "🚪 Left unwritable group: **{title}** (`{ref}`)"
 SYNC_NO_CLIENT = "⚠️ Cannot sync: Forwarding client disconnected."
 SYNC_SCANNING = "🔄 Scanning dialogs for channels/groups..."
 SYNC_ADDED = "✅ Synced {n} new destination(s)."

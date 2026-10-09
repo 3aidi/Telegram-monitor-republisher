@@ -6305,6 +6305,7 @@ class TestForwardDedicatedAccount(unittest.TestCase):
                 return [
                     FakeDialog(111, FakeEntity(111, title="Normal Group", megagroup=True)),
                     FakeDialog(222, FakeEntity(222, title="Read-Only Group", megagroup=True, default_banned=FakeRights())),
+                    FakeDialog(333, FakeEntity(333, title="News Channel", broadcast=True, megagroup=False)),
                 ]
 
             async def delete_dialog(self, entity):
@@ -6333,10 +6334,143 @@ class TestForwardDedicatedAccount(unittest.TestCase):
         dests = db.list_destinations(db_path=db_path)
         self.assertEqual(len(dests), 1)
         self.assertEqual(dests[0]["title"], "Normal Group")
+        # Only the unwritable group was left; the broadcast channel was untouched!
         self.assertEqual(len(client.left_dialogs), 1)
-        self.assertEqual(len(bot.sent), 2)
-        self.assertTrue(any("Read-Only Group" in m[1] for m in bot.sent))
+        self.assertEqual(client.left_dialogs[0].title, "Read-Only Group")
+        # Notification is a single short line without newlines
+        ro_alerts = [m[1] for m in bot.sent if "Read-Only Group" in m[1]]
+        self.assertEqual(len(ro_alerts), 1)
+        self.assertNotIn("\n", ro_alerts[0])
+        # Broadcast channel is completely ignored: no alerts sent for it
+        self.assertFalse(any("News Channel" in m[1] for m in bot.sent))
         os.remove(db_path)
+
+    def test_forward_chat_action_ignores_channels_and_leaves_unwritable_group(self):
+        """ChatAction event ignores broadcast channels, and leaves unwritable groups with 1-line alert."""
+        import main as main_mod
+        from telethon import events
+        db_path = self._fresh_db("test_fwd_action.db")
+
+        class FakeRights:
+            send_messages = True
+
+        class FakeEntity:
+            def __init__(self, cid, title=None, broadcast=False, megagroup=True, default_banned=None):
+                self.id = cid
+                self.title = title
+                self.username = None
+                self.broadcast = broadcast
+                self.megagroup = megagroup
+                self.default_banned_rights = default_banned
+                self.admin_rights = None
+                self.creator = False
+
+        left_chats = []
+        class FakeClient:
+            def __init__(self):
+                self.handlers = []
+
+            def on(self, event_filter):
+                def decorator(fn):
+                    self.handlers.append((event_filter, fn))
+                    return fn
+                return decorator
+
+            def is_connected(self):
+                return True
+
+            async def get_me(self):
+                return type("Me", (), {"id": 999})()
+
+            async def delete_dialog(self, entity):
+                left_chats.append(entity)
+
+        class FakeBot:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, target, text, **kwargs):
+                self.sent.append((target, text))
+
+        fwd_client = FakeClient()
+        bot_client = FakeBot()
+
+        # Wire up event handler as done in main.py
+        @fwd_client.on(events.ChatAction)
+        async def on_forward_chat_action(event):
+            try:
+                if event.user_joined or event.user_added:
+                    me = await fwd_client.get_me()
+                    users = getattr(event, "users", None) or []
+                    user_ids = [getattr(u, "id", None) for u in users] if users else []
+                    if event.user_id == me.id or me.id in user_ids:
+                        chat = await event.get_chat()
+                        if not main_mod.is_group_chat(chat):
+                            return
+                        chat_id = db.normalize_channel_id(chat)
+                        if chat_id:
+                            username = getattr(chat, "username", None)
+                            store_ref = f"@{username.lower()}" if username else str(chat_id)
+                            title = (getattr(chat, "title", None) or username or f"chat {chat_id}")[:100]
+                            existing_rows = await db.run_async(db.list_destinations)
+                            existing_refs = {str(d["chat_id"]) for d in existing_rows}
+                            if store_ref in existing_refs or str(chat_id) in existing_refs:
+                                return
+                            can_write, reason = await main_mod.check_can_write_to_destination(fwd_client, chat)
+                            if not can_write:
+                                await main_mod.leave_destination_chat(fwd_client, chat)
+                                await bot_client.send_message(
+                                    main_mod.ADMIN_USER_ID,
+                                    main_mod.texts.DEST_CANNOT_WRITE.format(title=title, ref=store_ref, reason=reason),
+                                    parse_mode="markdown",
+                                )
+                                return
+                            await db.run_async(db.add_destination, store_ref, title, True)
+            except Exception:
+                pass
+
+        class MockChatEvent:
+            def __init__(self, chat_entity):
+                self.user_joined = True
+                self.user_added = False
+                self.user_id = 999
+                self._chat = chat_entity
+            async def get_chat(self):
+                return self._chat
+
+        old_default = db.DEFAULT_DB_PATH
+        old_admin = main_mod.ADMIN_USER_ID
+        db.DEFAULT_DB_PATH = db_path
+        main_mod.ADMIN_USER_ID = 99999
+        try:
+            # 1. Join a broadcast channel -> must be ignored!
+            chan_entity = FakeEntity(1001, title="Crypto News", broadcast=True, megagroup=False)
+            asyncio.run(on_forward_chat_action(MockChatEvent(chan_entity)))
+            self.assertEqual(len(left_chats), 0, "Channels must not be left")
+            self.assertEqual(len(bot_client.sent), 0, "Channels must not trigger notifications")
+            self.assertEqual(len(db.list_destinations(db_path=db_path)), 0)
+
+            # 2. Join an unwritable group -> left + 1-line notification
+            ro_group = FakeEntity(1002, title="Read Only Trade", megagroup=True, default_banned=FakeRights())
+            asyncio.run(on_forward_chat_action(MockChatEvent(ro_group)))
+            self.assertEqual(len(left_chats), 1)
+            self.assertEqual(left_chats[0].title, "Read Only Trade")
+            self.assertEqual(len(bot_client.sent), 1)
+            self.assertIn("Read Only Trade", bot_client.sent[0][1])
+            self.assertNotIn("\n", bot_client.sent[0][1], "Must be a single-line notification")
+
+            # 3. Join a writable group -> added as destination
+            ok_group = FakeEntity(1003, title="Writable OTC Group", megagroup=True)
+            asyncio.run(on_forward_chat_action(MockChatEvent(ok_group)))
+            dests = db.list_destinations(db_path=db_path)
+            self.assertEqual(len(dests), 1)
+            self.assertEqual(dests[0]["title"], "Writable OTC Group")
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+            main_mod.ADMIN_USER_ID = old_admin
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
 
 
 class MainChannelConfigTests(unittest.TestCase):
