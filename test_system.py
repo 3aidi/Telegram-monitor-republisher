@@ -1854,7 +1854,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("@kycgroupke", text)
         self.assertEqual(len(buttons), 1, "one row of buttons")
         row = buttons[0]
-        self.assertTrue(any(getattr(b, "text", "") == "🔁 Re-review" for b in row))
+        self.assertTrue(any(getattr(b, "text", "") == "Review" for b in row))
         urls = [getattr(b, "url", None) for b in row]
         self.assertIn("https://t.me/kycgroupke/9001", urls)
 
@@ -1966,9 +1966,9 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("@kycgroupke", buttons[0][0].text)
         self.assertIn("Unresolved Chan", buttons[1][0].text)
         self.assertIn("-1004567890", buttons[2][0].text)  # numeric-id supplier label IS the id
-        self.assertEqual([b.text for b in buttons[3]], ["⬅️ Back"])
+        self.assertEqual([b.text for b in buttons[3]], ["Back"])
         self.assertEqual(buttons[3][0].data.decode(), "menu:home")
-        self.assertEqual([b.text for b in buttons[4]], ["➕ Add Source"])
+        self.assertEqual([b.text for b in buttons[4]], ["Add Source"])
 
     def test_page_window_boundaries(self):
         """_page_window clamps pages and reports nav state correctly."""
@@ -1994,22 +1994,22 @@ class TestMonitorSystem(unittest.TestCase):
 
         self.assertEqual(admin_bot._nav_row("sup", 0, 1), [], "no nav row on a single page")
         row = admin_bot._nav_row("sup", 0, 1, back_data="menu:home")[0]
-        self.assertEqual([b.text for b in row], ["⬅️ Back"])
+        self.assertEqual([b.text for b in row], ["Back"])
         self.assertEqual([b.data.decode() for b in row], ["menu:home"])
         self.assertEqual(admin_bot._page_footer(0, 1), "")
         self.assertEqual(admin_bot._page_footer(1, 3), "Page 2 of 3")
 
         row = admin_bot._nav_row("sup", 0, 3)[0]
-        self.assertEqual([b.text for b in row], ["➡️ Next"])
+        self.assertEqual([b.text for b in row], ["Next"])
         self.assertEqual([b.data.decode() for b in row], ["sup:page:1"])
         row = admin_bot._nav_row("sup", 0, 3, back_data="menu:home")[0]
-        self.assertEqual([b.text for b in row], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([b.text for b in row], ["Back", "Next"])
         self.assertEqual([b.data.decode() for b in row], ["menu:home", "sup:page:1"])
         row = admin_bot._nav_row("sup", 1, 3)[0]
-        self.assertEqual([b.text for b in row], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([b.text for b in row], ["Back", "Next"])
         self.assertEqual([b.data.decode() for b in row], ["sup:page:0", "sup:page:2"])
         row = admin_bot._nav_row("dest", 2, 3)[0]
-        self.assertEqual([b.text for b in row], ["⬅️ Back"])
+        self.assertEqual([b.text for b in row], ["Back"])
         self.assertEqual([b.data.decode() for b in row], ["dest:page:1"])
 
     def test_sources_buttons_pagination(self):
@@ -2024,25 +2024,25 @@ class TestMonitorSystem(unittest.TestCase):
 
         b0 = admin_bot._sources_buttons(suppliers, 0)
         self.assertEqual(len(b0), 8, "6 supplier rows + Back/Next nav + Add")
-        self.assertEqual([x.text for x in b0[6]], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([x.text for x in b0[6]], ["Back", "Next"])
         self.assertEqual([x.data.decode() for x in b0[6]], ["menu:home", "sup:page:1"])
-        self.assertEqual([x.text for x in b0[7]], ["➕ Add Source"])
+        self.assertEqual([x.text for x in b0[7]], ["Add Source"])
 
         b1 = admin_bot._sources_buttons(suppliers, 1)
         self.assertEqual(len(b1), 8)
-        self.assertEqual([x.text for x in b1[6]], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([x.text for x in b1[6]], ["Back", "Next"])
         self.assertEqual([x.data.decode() for x in b1[6]], ["sup:page:0", "sup:page:2"])
 
         b2 = admin_bot._sources_buttons(suppliers, 2)
         self.assertEqual(len(b2), 3, "1 supplier row + Back nav + Add")
         self.assertEqual(b2[0][0].data.decode(), "sup:13")
-        self.assertEqual([x.text for x in b2[1]], ["⬅️ Back"])
+        self.assertEqual([x.text for x in b2[1]], ["Back"])
         self.assertEqual(b2[1][0].data.decode(), "sup:page:1")
 
         small = admin_bot._sources_buttons(suppliers[:3], 0)
         self.assertEqual(len(small), 5, "3 rows + Back row + Add row")
         self.assertEqual(small[3][0].data.decode(), "menu:home")
-        self.assertEqual(small[4][0].text, "➕ Add Source")
+        self.assertEqual(small[4][0].text, "Add Source")
 
     def test_sources_menu_text_pagination(self):
         """Menu text gains 'Page X of Y' only for multi-page lists."""
@@ -2068,17 +2068,17 @@ class TestMonitorSystem(unittest.TestCase):
         ]
         b0 = admin_bot._destinations_buttons(dests, 0)
         self.assertEqual(len(b0), 17, "15 destinations + Back/Next row + Add row")
-        self.assertEqual([x.text for x in b0[15]], ["⬅️ Back", "➡️ Next"])
+        self.assertEqual([x.text for x in b0[15]], ["Back", "Next"])
         self.assertEqual([x.data.decode() for x in b0[15]], ["menu:home", "dest:page:1"])
         self.assertEqual(b0[16][0].data.decode(), "destadd")
 
         b1 = admin_bot._destinations_buttons(dests, 1)
         self.assertEqual(len(b1), 7, "5 destinations + Back row + Add row")
-        self.assertEqual([x.text for x in b1[5]], ["⬅️ Back"])
+        self.assertEqual([x.text for x in b1[5]], ["Back"])
 
         small = admin_bot._destinations_buttons(dests[:5], 0)
         self.assertEqual(len(small), 7, "5 rows + Back row + Add row")
-        self.assertEqual(small[5][0].text, "⬅️ Back")
+        self.assertEqual(small[5][0].text, "Back")
         self.assertEqual(small[6][0].data.decode(), "destadd")
 
     def test_skipped_digest_pagination(self):
@@ -2098,13 +2098,13 @@ class TestMonitorSystem(unittest.TestCase):
 
         text, buttons = admin_bot._skipped_digest(skips, 0, total=13)
         self.assertIn("Page 1 of 3", text)
-        self.assertEqual([x.text for x in buttons[-2]], ["➡️ Next"])
+        self.assertEqual([x.text for x in buttons[-2]], ["Next"])
         self.assertEqual([x.data.decode() for x in buttons[-2]], ["skip:page:1"])
         self.assertEqual(buttons[-1][0].data.decode(), "menu:home")
 
         text, buttons = admin_bot._skipped_digest(skips, 2, total=13)
         self.assertIn("Page 3 of 3", text)
-        self.assertEqual([x.text for x in buttons[-2]], ["⬅️ Back"])
+        self.assertEqual([x.text for x in buttons[-2]], ["Back"])
 
     def test_published_digest_pagination(self):
         """published nav row sits BEFORE the Search Post row, uses pub:page:N."""
@@ -2153,7 +2153,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual(page, 1)
         buttons = admin_bot._sources_buttons(shrunk, page)
         self.assertEqual(len(buttons[0]), 1)
-        self.assertEqual([x.text for x in buttons[6]], ["⬅️ Back"])
+        self.assertEqual([x.text for x in buttons[6]], ["Back"])
         # total=0 is safe (empty queue after last page tapped)
         self.assertEqual(admin_bot._page_window(0, 42), (0, 0, 1, False, False))
 
@@ -2279,7 +2279,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("1 more recent skip(s) not re-reviewable", text)
 
         home = buttons[-1][0].text
-        self.assertTrue(home.startswith("🏠"))
+        self.assertEqual(home, "Home")
 
     def test_skipped_digest_buttons_only_none_reopenable(self):
         """When no recent skip can be reopened, say so instead of showing an
@@ -2294,7 +2294,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertIn("🚫 **Skipped posts**", text)
         self.assertIn("None of the recent skips can be re-opened", text)
         self.assertEqual(len(buttons), 1, "just the home row")
-        self.assertTrue(buttons[0][0].text.startswith("🏠"))
+        self.assertEqual(buttons[0][0].text, "Home")
 
     def test_get_published_listings_joins_supplier(self):
         sid = db.add_supplier("trace_src", channel_id=-100777, db_path=TEST_DB)
@@ -3632,14 +3632,14 @@ class TestDestinationsForwarding(unittest.TestCase):
                          ["🟢 **OTC_Market_Binance**", "Status: Active",
                           "ID: [@otc_market_binance](https://t.me/otc_market_binance)"])
         rows = out["buttons"]
-        self.assertEqual(rows[0][0].text, "🔗 Open Chat")
+        self.assertEqual(rows[0][0].text, "Open Chat")
         self.assertEqual(rows[0][0].url, "https://t.me/otc_market_binance")
         # Pause/Resume, Delete and Back keep their exact callback data.
         cbs = [b.data.decode() for r in rows for b in r
                if getattr(b, "data", None) is not None]
         self.assertEqual(cbs, ["desttoggle:7", "destdel:7", "menu:destinations"])
         self.assertEqual([r[0].text for r in rows[1:]],
-                         ["⏸ Pause ", "🗑 Delete Permanently", "⬅️ Back"])
+                         ["Pause", "Delete Permanently", "Back"])
 
         # Private destination: no link row, plain numeric ID, same callbacks.
         out = asyncio.run(render(dict(base, chat_id="-1001234567890", active=0)))
@@ -3652,7 +3652,7 @@ class TestDestinationsForwarding(unittest.TestCase):
         cbs = [b.data.decode() for r in out["buttons"] for b in r
                if getattr(b, "data", None) is not None]
         self.assertEqual(cbs, ["desttoggle:7", "destdel:7", "menu:destinations"])
-        self.assertEqual(out["buttons"][0][0].text, "▶ Resume")
+        self.assertEqual(out["buttons"][0][0].text, "Resume")
 
     def test_destination_health_report_links_usernames_not_numeric_ids(self):
         """The health DM links a public handle and leaves a private id plain."""
@@ -7686,6 +7686,156 @@ class TestLatencyAndDelaysPerformance(unittest.IsolatedAsyncioTestCase):
         res = await main.resolve_supplier_for_event(non_event)
         self.assertIsNone(res)
         self.assertIn(-100123456, main._supplier_neg_cache)
+
+    def test_forward_accounts_db_operations(self):
+        """Forward accounts repository supports add, list, get, and delete."""
+        a1_id = db.add_forward_account(
+            "session_alpha", phone="+1111111111", username="alpha_user", display_name="Alpha", db_path=self._test_db
+        )
+        self.assertIsNotNone(a1_id)
+        a2_id = db.add_forward_account(
+            "session_beta", phone="+2222222222", username="beta_user", display_name="Beta", db_path=self._test_db
+        )
+        self.assertIsNotNone(a2_id)
+
+        all_accts = db.list_forward_accounts(db_path=self._test_db)
+        self.assertEqual(len(all_accts), 2)
+        sessions = [a["session_name"] for a in all_accts]
+        self.assertIn("session_alpha", sessions)
+        self.assertIn("session_beta", sessions)
+
+        by_s = db.get_forward_account_by_session("session_alpha", db_path=self._test_db)
+        self.assertIsNotNone(by_s)
+        self.assertEqual(by_s["username"], "alpha_user")
+
+        del_ok = db.delete_forward_account(a1_id, db_path=self._test_db)
+        self.assertTrue(del_ok)
+        rem = db.list_forward_accounts(db_path=self._test_db)
+        self.assertEqual(len(rem), 1)
+        self.assertEqual(rem[0]["session_name"], "session_beta")
+
+    def test_forward_queue_cascading_failover(self):
+        """When account #1 is banned/forbidden in a group, account #2 takes over and succeeds."""
+        import main
+        from telethon.errors import ChatWriteForbiddenError
+
+        db_path = self._test_db
+        dest_id = db.add_destination("@cascade_group", title="Cascade Group", db_path=db_path)
+        db.queue_forwarding(1, "@mainchan", 777, db_path=db_path)
+
+        calls_1 = []
+        calls_2 = []
+
+        class FakeFwd1:
+            def is_connected(self):
+                return True
+            async def forward_messages(self, entity, messages, from_peer):
+                calls_1.append((entity, messages))
+                raise ChatWriteForbiddenError(request=None)
+            async def get_dialogs(self, limit=50):
+                return []
+
+        class FakeFwd2:
+            def is_connected(self):
+                return True
+            async def forward_messages(self, entity, messages, from_peer):
+                calls_2.append((entity, messages))
+                fake_msg = _types.SimpleNamespace(id=8888)
+                return [fake_msg]
+            async def get_dialogs(self, limit=50):
+                return []
+
+        fwd1 = FakeFwd1()
+        fwd2 = FakeFwd2()
+
+        old_default = db.DEFAULT_DB_PATH
+        old_restrict = main.FORWARD_SESSION_RESTRICT
+        db.DEFAULT_DB_PATH = db_path
+        main.FORWARD_SESSION_RESTRICT = False
+        try:
+            asyncio.run(main._drain_forward_queue(client=None, forward_client=[fwd1, fwd2]))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+            main.FORWARD_SESSION_RESTRICT = old_restrict
+
+        # Account 1 was tried and failed
+        self.assertEqual(len(calls_1), 1)
+        # Account 2 was tried and succeeded
+        self.assertEqual(len(calls_2), 1)
+
+        # Check DB: row is marked 'forwarded' with msg id 8888!
+        pending = db.get_pending_forwardings(10, db_path=db_path)
+        self.assertEqual(len(pending), 0)
+
+        with db.db_session(db_path) as conn:
+            row = conn.execute("SELECT status, destination_message_id FROM forwardings WHERE destination_id = ?", (dest_id,)).fetchone()
+            self.assertEqual(row["status"], "forwarded")
+            self.assertEqual(row["destination_message_id"], 8888)
+
+    def test_forward_queue_all_failover_marks_failed(self):
+        """When all accounts fail in a group, row is marked failed."""
+        import main
+        from telethon.errors import ChatWriteForbiddenError
+
+        db_path = self._test_db
+        dest_id = db.add_destination("@all_fail_group", title="Fail Group", db_path=db_path)
+        db.queue_forwarding(1, "@mainchan", 778, db_path=db_path)
+
+        class FailingFwd:
+            def is_connected(self):
+                return True
+            async def forward_messages(self, entity, messages, from_peer):
+                raise ChatWriteForbiddenError(request=None)
+            async def get_dialogs(self, limit=50):
+                return []
+
+        old_default = db.DEFAULT_DB_PATH
+        old_restrict = main.FORWARD_SESSION_RESTRICT
+        db.DEFAULT_DB_PATH = db_path
+        main.FORWARD_SESSION_RESTRICT = False
+        try:
+            asyncio.run(main._drain_forward_queue(client=None, forward_client=[FailingFwd(), FailingFwd()]))
+        finally:
+            db.DEFAULT_DB_PATH = old_default
+            main.FORWARD_SESSION_RESTRICT = old_restrict
+
+        with db.db_session(db_path) as conn:
+            row = conn.execute("SELECT status FROM forwardings WHERE destination_id = ?", (dest_id,)).fetchone()
+            self.assertEqual(row["status"], "failed")
+
+    def test_admin_bot_forward_clients_pool_management(self):
+        """admin_bot manages pool of forward clients and renders dashboard."""
+        import admin_bot
+
+        class DummyClient:
+            def __init__(self, name):
+                self.name = name
+            def is_connected(self):
+                return True
+
+        c1 = DummyClient("c1")
+        c2 = DummyClient("c2")
+
+        admin_bot.set_forward_clients([c1, c2])
+        self.assertEqual(len(admin_bot.forward_clients_ref), 2)
+        self.assertEqual(admin_bot.forward_client_ref, c1)
+
+        c3 = DummyClient("c3")
+        admin_bot.add_forward_client(c3)
+        self.assertEqual(len(admin_bot.forward_clients_ref), 3)
+
+        admin_bot.remove_forward_client(c1)
+        self.assertEqual(len(admin_bot.forward_clients_ref), 2)
+        self.assertEqual(admin_bot.forward_client_ref, c2)
+
+        # Dashboard rendering
+        db.add_forward_account("sess_1", phone="+12345", username="user1", display_name="User 1", db_path=self._test_db)
+        text, buttons = asyncio.run(admin_bot._forwarders_menu_payload())
+        self.assertIn("Forwarder Accounts Pool", text)
+        self.assertTrue(any("Add" in getattr(b, "text", "") for row in buttons for b in row))
+
+        # Cleanup
+        admin_bot.set_forward_clients([])
 
 
 if __name__ == "__main__":

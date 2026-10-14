@@ -176,6 +176,7 @@ def listing_is_editable(status: str) -> bool:
 # Global reference to user_client if running unified under main.py
 user_client_ref: Optional[TelegramClient] = None
 forward_client_ref: Optional[TelegramClient] = None
+forward_clients_ref: List[TelegramClient] = []
 
 
 def set_user_client(client: TelegramClient) -> None:
@@ -184,10 +185,39 @@ def set_user_client(client: TelegramClient) -> None:
     user_client_ref = client
 
 
-def set_forward_client(client: TelegramClient) -> None:
-    """Set reference to the forward-dedicated Telethon client."""
-    global forward_client_ref
+def set_forward_clients(clients: List[TelegramClient]) -> None:
+    """Set references to the pool of forward-dedicated Telethon clients."""
+    global forward_clients_ref, forward_client_ref
+    forward_clients_ref = [c for c in clients if c is not None]
+    forward_client_ref = forward_clients_ref[0] if forward_clients_ref else None
+
+
+def set_forward_client(client: Optional[TelegramClient]) -> None:
+    """Set reference to the forward-dedicated Telethon client (backward compatibility)."""
+    global forward_clients_ref, forward_client_ref
     forward_client_ref = client
+    if client is not None:
+        if client not in forward_clients_ref:
+            forward_clients_ref.append(client)
+    else:
+        forward_clients_ref = []
+
+
+def add_forward_client(client: TelegramClient) -> None:
+    """Add a newly connected forward client to the active pool."""
+    global forward_clients_ref, forward_client_ref
+    if client and client not in forward_clients_ref:
+        forward_clients_ref.append(client)
+    if not forward_client_ref and forward_clients_ref:
+        forward_client_ref = forward_clients_ref[0]
+
+
+def remove_forward_client(client: TelegramClient) -> None:
+    """Remove a forward client from the active pool."""
+    global forward_clients_ref, forward_client_ref
+    if client in forward_clients_ref:
+        forward_clients_ref.remove(client)
+    forward_client_ref = forward_clients_ref[0] if forward_clients_ref else None
 
 
 async def send_approval_prompt(
@@ -290,16 +320,13 @@ async def send_review_notification(
             Button.inline("Edit", data=f"edit:{listing_id}"),
         ]
     ]
-    row2 = []
     src_url = _source_url({
         "supplier_username": listing.get("supplier_username") or listing.get("channel_username"),
         "supplier_channel_id": listing.get("supplier_channel_id") or listing.get("channel_id"),
         "source_message_id": listing.get("source_message_id") or listing.get("message_id"),
     })
     if src_url:
-        row2.append(Button.url("Source", src_url))
-    row2.append(Button.inline("Dismiss", data="dismiss_msg"))
-    buttons.append(row2)
+        buttons.append([Button.url("Source", src_url)])
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
@@ -332,8 +359,8 @@ async def send_edit_rejected_alert(
     )
     buttons = [
         [
-            Button.inline("✅ Apply", data=f"apply_edit:{listing_id}"),
-            Button.inline("❌ Ignore", data=f"ignore_edit:{listing_id}"),
+            Button.inline("Apply", data=f"apply_edit:{listing_id}"),
+            Button.inline("Ignore", data=f"ignore_edit:{listing_id}"),
         ]
     ]
     try:
@@ -372,11 +399,8 @@ async def send_published_alert(
     )
 
     buttons = _channel_view_buttons(listing)
-    action_row = []
     if listing_id:
-        action_row.append(Button.inline("Sold", data=f"sold:{listing_id}"))
-    action_row.append(Button.inline("Dismiss", data="dismiss_msg"))
-    buttons.append(action_row)
+        buttons.append([Button.inline("Sold", data=f"sold:{listing_id}")])
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
@@ -388,19 +412,6 @@ async def send_published_alert(
         except Exception:
             logger.exception("Failed to send published alert to admin for listing #%s", listing_id)
 
-
-def _format_listing(n: int, l: dict) -> str:
-    """Single-line listing summary for /pending, /preview lists."""
-    platform = l.get("platform_name") or l.get("game_name") or "?"
-    created = (l.get("created_at") or "")[:16].replace("T", " ")
-    return texts.FORMAT_LISTING.format(
-        n=n,
-        id=l["id"],
-        platform=platform,
-        source=_pretty_source(l.get("supplier_username"), l.get("supplier_display_name")),
-        status=l.get("status"),
-        created=created,
-    )
 
 
 async def _header_emoji_for_listing(listing_id: int) -> list:
@@ -470,7 +481,7 @@ def _skip_notification(k: dict) -> Tuple[str, List[List[object]]]:
         "source_message_id": k.get("message_id"),
     })
     if src_url:
-        buttons[0].append(Button.url("View in Buyer channel", src_url))
+        buttons[0].append(Button.url("Source", src_url))
     return text, buttons
 
 
@@ -542,7 +553,7 @@ async def send_skipped_alert(
             suffix="y" if len(dropped) == 1 else "ies",
             dropped=dropped_text,
         )
-        buttons = [[Button.inline("🗑️ Dismiss", data="dismiss_msg")]]
+        buttons = []
     else:
         label = _SKIP_REASON_LABELS.get(reason, reason)
         human_desc = _HUMAN_SKIP_REASONS.get(reason, label.replace("_", " ").title())
@@ -573,16 +584,13 @@ async def send_skipped_alert(
                 Button.inline("Approve", data=f"force_approve:{listing_id}"),
             ])
 
-        row2 = []
         src_url = _source_url({
             "supplier_username": listing.get("supplier_username") or listing.get("channel_username"),
             "supplier_channel_id": listing.get("supplier_channel_id") or listing.get("channel_id"),
             "source_message_id": listing.get("source_message_id") or listing.get("message_id"),
         })
         if src_url:
-            row2.append(Button.url("Source", src_url))
-        row2.append(Button.inline("Dismiss", data="dismiss_msg"))
-        buttons.append(row2)
+            buttons.append([Button.url("Source", src_url)])
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
@@ -733,6 +741,7 @@ BOT_MENU = [
     ("headers", " Manage the custom-emoji WTB headers"),
     ("setchannel", "Change or view main destination channel"),
     ("desthealth", "Destination channels health check & clean"),
+    ("forwarders", " Manage forwarding accounts pool"),
     ("post", " Look up a post by its number: /post 12"),
     ("help", " Show buttons and shortcuts"),
 ]
@@ -881,11 +890,11 @@ def _headers_menu_text(headers: List[dict]) -> str:
 def _headers_buttons(headers: List[dict], undo_header_id: Optional[int] = None) -> List[List[object]]:
     """Compact grid of header delete buttons, prominent Add button, and Home row."""
     buttons: List[List[object]] = [
-        [Button.inline("➕ Add Header", data="headeradd")]
+        [Button.inline("Add Header", data="headeradd")]
     ]
     if undo_header_id:
         buttons.append([
-            Button.inline(f"↩️ Undo Restore #{undo_header_id}", data=f"undoheader:{undo_header_id}")
+            Button.inline(f"Undo #{undo_header_id}", data=f"undoheader:{undo_header_id}")
         ])
 
     if headers:
@@ -1460,7 +1469,8 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
     buttons.append([
         Button.inline(texts.BTN_ADD_DEST, data="destadd"),
         Button.inline(texts.BTN_MAIN_CHANNEL, data="mainchan:view"),
-        Button.inline("📊 Health", data="desthealth:view"),
+        Button.inline("Health", data="desthealth:view"),
+        Button.inline("Forwarders", data="forwarders:view"),
     ])
     return buttons
 
@@ -1525,7 +1535,10 @@ async def _edit_destination_menu(event, d: dict) -> None:
 async def _resolve_destination_peer(target) -> Optional[object]:
     """Resolve a destination chat entity using forward_client_ref or user_client_ref."""
     clients = []
-    if forward_client_ref and forward_client_ref.is_connected():
+    for fc in forward_clients_ref:
+        if fc and hasattr(fc, "is_connected") and fc.is_connected() and fc not in clients:
+            clients.append(fc)
+    if forward_client_ref and forward_client_ref.is_connected() and forward_client_ref not in clients:
         clients.append(forward_client_ref)
     if user_client_ref and user_client_ref.is_connected() and user_client_ref not in clients:
         clients.append(user_client_ref)
@@ -1540,6 +1553,76 @@ async def _resolve_destination_peer(target) -> Optional[object]:
             except Exception:
                 pass
     return None
+
+
+async def _forwarders_menu_payload() -> Tuple[str, List[List[object]]]:
+    """Render the forwarder accounts pool dashboard and action buttons."""
+    accounts = await db.run_async(db.list_forward_accounts)
+    active_count = sum(1 for a in accounts if a.get("active"))
+
+    header = (
+        f"👥 **Forwarder Accounts Pool** ({active_count} Active)\n"
+        f"{texts.LINE}\n"
+        f"Posts are forwarded to groups with cascading failover:\n"
+        f"• **1st account** forwards\n"
+        f"• If restricted/banned, **2nd account** takes over\n"
+        f"• Stops on success and proceeds to the next group\n\n"
+    )
+
+    body_lines = []
+    if not accounts:
+        body_lines.append("_No dedicated forwarder accounts added yet._\n_The main listener account is currently used as fallback._")
+    else:
+        connected_sessions = set()
+        for cl in forward_clients_ref:
+            try:
+                if hasattr(cl, "session") and hasattr(cl.session, "filename"):
+                    fn = os.path.splitext(os.path.basename(str(cl.session.filename or "")))[0]
+                    if fn:
+                        connected_sessions.add(fn)
+            except Exception:
+                pass
+
+        for idx, acct in enumerate(accounts, start=1):
+            s_name = acct.get("session_name")
+            display = acct.get("display_name") or acct.get("phone") or s_name
+            username_part = f" (@{acct['username']})" if acct.get("username") else ""
+
+            is_conn = s_name in connected_sessions or (
+                len(forward_clients_ref) >= idx and getattr(forward_clients_ref[idx - 1], "is_connected", lambda: False)()
+            )
+            status_icon = "🟢 Ready" if is_conn else "⚪ Offline"
+            if not acct.get("active"):
+                status_icon = "⏸️ Paused"
+
+            body_lines.append(f"**{idx}.** {display}{username_part}\n    └ Status: {status_icon}")
+
+    full_text = header + "\n\n".join(body_lines) + f"\n\n{texts.LINE}"
+
+    buttons: List[List[object]] = [
+        [
+            Button.inline("Add Forwarder", data="fwdadd:start"),
+            Button.inline("Auto-Join Groups", data="fwdjoin:all"),
+        ]
+    ]
+
+    if accounts:
+        del_row: List[object] = []
+        for idx, a in enumerate(accounts, start=1):
+            lbl = "Remove" if len(accounts) == 1 else f"Remove #{idx}"
+            del_row.append(Button.inline(lbl, data=f"fwddel:{a['id']}"))
+            if len(del_row) == 2:
+                buttons.append(del_row)
+                del_row = []
+        if del_row:
+            buttons.append(del_row)
+
+    buttons.append([
+        Button.inline("Destinations", data="menu:destinations"),
+        Button.inline(texts.BTN_HOME, data="menu:home"),
+    ])
+
+    return full_text, buttons
 
 
 async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
@@ -1751,19 +1834,19 @@ def _home_text() -> str:
 
 
 def _home_inline_keyboard() -> List[List[object]]:
-    """Inline navigation for the Home landing message (mirrors the reply keyboard)."""
-    pause_label = texts.BTN_RESUME if db.is_paused() else texts.BTN_PAUSE
+    """Inline navigation for the Home landing message."""
+    pause_label = "Resume" if db.is_paused() else "Pause"
     return [
         [
-            Button.inline("⏳ Pending", data="home:pending"),
-            Button.inline("📋 Sources", data="menu:sources"),
+            Button.inline("Pending", data="home:pending"),
+            Button.inline("Sources", data="menu:sources"),
         ],
         [
-            Button.inline("✅ Published", data="home:published"),
-            Button.inline(DESTINATIONS_BTN, data="menu:destinations"),
+            Button.inline("Published", data="home:published"),
+            Button.inline("Destinations", data="menu:destinations"),
         ],
         [
-            Button.inline("🚫 Skipped", data="home:skipped"),
+            Button.inline("Skipped", data="home:skipped"),
             Button.inline(pause_label, data="home:toggle"),
         ],
     ]
@@ -2318,6 +2401,13 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             logger.exception("Error running /syncdestinations")
             await status_msg.edit(texts.SYNC_FAIL.format(error=exc), buttons=_home_keyboard())
 
+    @bot.on(events.NewMessage(pattern=r"^(?:/forwarders|👥 Forwarders)"))
+    async def handle_forwarders(event):
+        if not await check_admin(event):
+            return
+        text, buttons = await _forwarders_menu_payload()
+        await event.reply(text, buttons=buttons, parse_mode="markdown")
+
     @bot.on(events.NewMessage(pattern=r"^/removesupplier(?:\s+(.+))?"))
     async def handle_remove_supplier(event):
         if not await check_admin(event):
@@ -2466,8 +2556,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if not await check_admin(event):
             return
         user_ok = "🟢 Connected" if (user_client_ref and user_client_ref.is_connected()) else "🔴 Disconnected"
-        if forward_client_ref:
-            fwd_ok = "🟢 Connected" if forward_client_ref.is_connected() else "🔴 Disconnected"
+        if forward_clients_ref:
+            conn_count = len([c for c in forward_clients_ref if c and hasattr(c, "is_connected") and c.is_connected()])
+            fwd_ok = f"🟢 Connected ({conn_count}/{len(forward_clients_ref)} in pool)"
+        elif forward_client_ref:
+            fwd_ok = "🟢 Connected" if (hasattr(forward_client_ref, "is_connected") and forward_client_ref.is_connected()) else "🔴 Disconnected"
         else:
             fwd_ok = "⚪ Shared / Not separate"
         bot_ok = "🟢 Connected" if bot.is_connected() else "🔴 Disconnected"
@@ -2501,15 +2594,15 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 f"• Total configured: {len(rows)}\n"
                 f"• Active: {total_active}\n"
                 f"• Delivering without persistent errors.",
-                buttons=[[Button.inline(DESTINATIONS_BTN, data="menu:destinations")]],
+                buttons=[[Button.inline("Destinations", data="menu:destinations")]],
                 parse_mode="html",
             )
             return
 
         buttons = []
         if dead:
-            buttons.append([Button.inline(f"🗑 Delete All Dead ({len(dead)})", data="destdel:all_dead")])
-        buttons.append([Button.inline(DESTINATIONS_BTN, data="menu:destinations")])
+            buttons.append([Button.inline(f"Delete All Dead ({len(dead)})", data="destdel:all_dead")])
+        buttons.append([Button.inline("Destinations", data="menu:destinations")])
         await event.reply(text, buttons=buttons, parse_mode="html")
 
     @bot.on(events.NewMessage(pattern=r"^/preview(?:[ \t]+(\d+))?"))
@@ -2915,6 +3008,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         if data_str == "wiz:cancel":
+            import services.forwarders_manager as fwd_mgr
+            fwd_mgr.clear_in_flight_login(ADMIN_USER_ID)
             # Dropping the wizard must ALSO drop any half-typed edit draft:
             # otherwise the stale text silently resurrects on a later Approve
             # of the same listing (wizard-draft leak).
@@ -3192,7 +3287,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 f"The forwarding account will also automatically leave these groups so they stop being re-synced."
             )
             buttons = [
-                [Button.inline(f"✅ Yes, Delete & Leave {count} Dead", data="destdel:confirm_dead")],
+                [Button.inline(f"Yes, Delete All Dead ({count})", data="destdel:confirm_dead")],
                 [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
             ]
             await _message_delete_send(event, text, buttons=buttons, parse_mode="html")
@@ -3227,8 +3322,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 event,
                 f"🗑 <b>Deleted {deleted_count} dead destination(s).</b>{left_msg}",
                 buttons=[
-                    [Button.inline("📊 Check Health Again", data="desthealth:view")],
-                    [Button.inline(DESTINATIONS_BTN, data="menu:destinations")],
+                    [Button.inline("Check Health Again", data="desthealth:view")],
+                    [Button.inline("Destinations", data="menu:destinations")],
                 ],
                 parse_mode="html",
             )
@@ -3247,15 +3342,102 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     f"• Total configured: {len(rows)}\n"
                     f"• Active: {total_active}\n"
                     f"• Delivering without persistent errors.",
-                    buttons=[[Button.inline(DESTINATIONS_BTN, data="menu:destinations")]],
+                    buttons=[[Button.inline("Destinations", data="menu:destinations")]],
                     parse_mode="html",
                 )
                 return
             buttons = []
             if dead:
-                buttons.append([Button.inline(f"🗑 Delete All Dead ({len(dead)})", data="destdel:all_dead")])
-            buttons.append([Button.inline(DESTINATIONS_BTN, data="menu:destinations")])
+                buttons.append([Button.inline(f"Delete All Dead ({len(dead)})", data="destdel:all_dead")])
+            buttons.append([Button.inline("Destinations", data="menu:destinations")])
             await _message_delete_send(event, text, buttons=buttons, parse_mode="html")
+            return
+
+        if data_str == "forwarders:view":
+            text, buttons = await _forwarders_menu_payload()
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
+            return
+
+        if data_str == "fwdadd:start":
+            _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_phone"}
+            text = (
+                "📱 **Add Forwarder Account**\n\n"
+                "Please enter the phone number in international format:\n"
+                "Example: `+1234567890`\n\n"
+                "Telegram will send an official verification code to this account."
+            )
+            await _message_delete_send(
+                event,
+                text,
+                buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                parse_mode="markdown",
+            )
+            return
+
+        if data_str == "fwdjoin:all":
+            if not forward_clients_ref:
+                await event.answer("No connected forwarder accounts available.", alert=True)
+                return
+            await event.answer("🔄 Starting destination sync across all accounts...", alert=True)
+            status_msg = await event.client.send_message(
+                ADMIN_USER_ID,
+                "🔄 **Auto-joining destination groups across all accounts in background...**",
+                parse_mode="markdown",
+            )
+            import services.forwarders_manager as fwd_mgr
+            for fc in forward_clients_ref:
+                if fc and hasattr(fc, "is_connected") and fc.is_connected():
+                    asyncio.create_task(
+                        fwd_mgr.auto_join_destinations_for_client(
+                            fc, bot_client=event.client, admin_user_id=ADMIN_USER_ID, status_message=status_msg
+                        )
+                    )
+            return
+
+        fwddel_match = re.match(r"^fwddel:(\d+)$", data_str)
+        if fwddel_match:
+            aid = int(fwddel_match.group(1))
+            accts = await db.run_async(db.list_forward_accounts)
+            acct = next((a for a in accts if a["id"] == aid), None)
+            if not acct:
+                await event.answer("Account not found.", alert=True)
+                return
+            disp = acct.get("display_name") or acct.get("phone") or acct.get("session_name")
+            text = (
+                f"⚠️ **Remove Forwarder Account?**\n\n"
+                f"Are you sure you want to remove **{disp}**?\n"
+                f"It will be disconnected and removed from the cascading pool."
+            )
+            buttons = [
+                [Button.inline("Yes, Remove", data=f"fwddelyes:{aid}")],
+                [Button.inline(texts.BTN_CANCEL_X, data="forwarders:view")],
+            ]
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
+            return
+
+        fwddelyes_match = re.match(r"^fwddelyes:(\d+)$", data_str)
+        if fwddelyes_match:
+            aid = int(fwddelyes_match.group(1))
+            accts = await db.run_async(db.list_forward_accounts)
+            acct = next((a for a in accts if a["id"] == aid), None)
+            if acct:
+                s_name = acct.get("session_name")
+                for cl in list(forward_clients_ref):
+                    try:
+                        if hasattr(cl, "session") and hasattr(cl.session, "filename"):
+                            fn = os.path.splitext(os.path.basename(str(cl.session.filename or "")))[0]
+                            if fn == s_name:
+                                remove_forward_client(cl)
+                                import main as main_mod
+                                if hasattr(main_mod, "forward_clients_pool") and cl in main_mod.forward_clients_pool:
+                                    main_mod.forward_clients_pool.remove(cl)
+                                await cl.disconnect()
+                    except Exception:
+                        pass
+                await db.run_async(db.delete_forward_account, aid)
+                await event.answer("🗑️ Forwarder account removed.")
+            text, buttons = await _forwarders_menu_payload()
+            await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
             return
 
         if data_str == "destaddunresolved":
@@ -3383,7 +3565,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             current = get_dest_channel()
             text = texts.MAIN_CHANNEL_CARD.format(current=current or "(None)")
             buttons = [
-                [Button.inline("✏️ Change Main Channel", data="mainchan:edit")],
+                [Button.inline("Change Main Channel", data="mainchan:edit")],
                 [Button.inline(texts.BTN_BACK, data="menu:destinations")],
             ]
             await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
@@ -3932,6 +4114,109 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         if state["step"] == "add":
             await _run_add_supplier_flow(event, text)
+            return
+
+        if state["step"] == "add_fwd_phone":
+            import services.forwarders_manager as fwd_mgr
+            wait_msg = await event.reply("⏳ Connecting to Telegram...")
+            ok, msg, code_hash = await fwd_mgr.start_login_flow(
+                ADMIN_USER_ID, text, API_ID, API_HASH
+            )
+            if not ok:
+                await wait_msg.edit(
+                    f"❌ {msg}\n\nPlease check the number and try again, or tap Cancel:",
+                    buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                )
+                _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_phone"}
+                return
+            _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
+            await wait_msg.edit(
+                f"📩 **Verification Code Sent**\n\n"
+                f"Telegram sent a verification code to `{text}`.\n"
+                f"Please reply here with the code you received:",
+                buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                parse_mode="markdown",
+            )
+            return
+
+        if state["step"] == "add_fwd_code":
+            import services.forwarders_manager as fwd_mgr
+            wait_msg = await event.reply("⏳ Verifying code...")
+            ok, status, client = await fwd_mgr.submit_login_code(ADMIN_USER_ID, text)
+            if status == "2FA_REQUIRED":
+                _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_password"}
+                await wait_msg.edit(
+                    "🔒 **Two-Step Verification (2FA) Required**\n\n"
+                    "This account has cloud password enabled.\n"
+                    "Please reply with your 2FA password:",
+                    buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                    parse_mode="markdown",
+                )
+                return
+            if not ok:
+                await wait_msg.edit(
+                    f"❌ {status}\n\nPlease try entering the code again, or tap Cancel:",
+                    buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                )
+                _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
+                return
+
+            acct_data = await fwd_mgr.save_and_activate_account(ADMIN_USER_ID)
+            if acct_data:
+                new_cl = acct_data["client"]
+                add_forward_client(new_cl)
+                import main as main_mod
+                if hasattr(main_mod, "forward_clients_pool") and new_cl not in main_mod.forward_clients_pool:
+                    main_mod.forward_clients_pool.append(new_cl)
+                if hasattr(main_mod, "attach_forward_client_listeners"):
+                    main_mod.attach_forward_client_listeners(new_cl, bot)
+                disp = acct_data.get("display_name") or acct_data.get("phone")
+                await wait_msg.edit(
+                    f"✅ **Account Added Successfully!**\n\n"
+                    f"Account **{disp}** is now active in the forwarder pool.\n\n"
+                    f"🔄 Auto-joining all destination groups in the background...",
+                    parse_mode="markdown",
+                )
+                asyncio.create_task(
+                    fwd_mgr.auto_join_destinations_for_client(
+                        new_cl, bot_client=bot, admin_user_id=ADMIN_USER_ID
+                    )
+                )
+            return
+
+        if state["step"] == "add_fwd_password":
+            import services.forwarders_manager as fwd_mgr
+            wait_msg = await event.reply("⏳ Authenticating password...")
+            ok, status, client = await fwd_mgr.submit_login_2fa(ADMIN_USER_ID, text)
+            if not ok:
+                await wait_msg.edit(
+                    f"❌ {status}\n\nPlease re-enter your 2FA password, or tap Cancel:",
+                    buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                )
+                _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_password"}
+                return
+
+            acct_data = await fwd_mgr.save_and_activate_account(ADMIN_USER_ID)
+            if acct_data:
+                new_cl = acct_data["client"]
+                add_forward_client(new_cl)
+                import main as main_mod
+                if hasattr(main_mod, "forward_clients_pool") and new_cl not in main_mod.forward_clients_pool:
+                    main_mod.forward_clients_pool.append(new_cl)
+                if hasattr(main_mod, "attach_forward_client_listeners"):
+                    main_mod.attach_forward_client_listeners(new_cl, bot)
+                disp = acct_data.get("display_name") or acct_data.get("phone")
+                await wait_msg.edit(
+                    f"✅ **Account Added Successfully!**\n\n"
+                    f"Account **{disp}** is now active in the forwarder pool.\n\n"
+                    f"🔄 Auto-joining all destination groups in the background...",
+                    parse_mode="markdown",
+                )
+                asyncio.create_task(
+                    fwd_mgr.auto_join_destinations_for_client(
+                        new_cl, bot_client=bot, admin_user_id=ADMIN_USER_ID
+                    )
+                )
             return
 
         if state["step"] == "adddest":

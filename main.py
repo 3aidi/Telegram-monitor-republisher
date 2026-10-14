@@ -172,6 +172,13 @@ FORWARD_PACING_SECONDS = float(os.environ.get("FORWARD_PACING_SECONDS", "1.0") o
 # having to wait for the main account.
 # Empty FORWARD_SESSION_NAME disables the second account entirely.
 FORWARD_SESSION_NAME = os.environ.get("FORWARD_SESSION_NAME", "").strip() or None
+FORWARD_SESSION_NAMES = [
+    s.strip() for s in os.environ.get("FORWARD_SESSION_NAMES", "").split(",")
+    if s.strip()
+]
+# Runtime pool of active forwarder accounts for cascading delivery
+forward_clients_pool: List[TelegramClient] = []
+
 FORWARD_SESSION_DESTINATIONS = {
     chat.strip() for chat in os.environ.get("FORWARD_SESSION_DESTINATIONS", "").split(",")
     if chat.strip()
@@ -433,8 +440,8 @@ async def _report_destination_health(bot_client: Optional[TelegramClient]) -> No
     dead = [r for r in rows if r.get("is_dead")]
     buttons = []
     if dead:
-        buttons.append([Button.inline(f"🗑 Delete All Dead ({len(dead)})", data="destdel:all_dead")])
-    buttons.append([Button.inline(admin_bot.DESTINATIONS_BTN, data="menu:destinations")])
+        buttons.append([Button.inline(f"Delete All Dead ({len(dead)})", data="destdel:all_dead")])
+    buttons.append([Button.inline("Destinations", data="menu:destinations")])
     try:
         await bot_client.send_message(admin, text, buttons=buttons, parse_mode="html")
     except Exception:
@@ -1169,26 +1176,28 @@ async def _drain_forward_queue(
     FORWARD_PACING_SECONDS between destinations so neither account bursts.
     """
     pending = await db.run_async(db.get_pending_forwardings, 10)
+    fwd_pool: List[TelegramClient] = []
+    if forward_client is not None:
+        if isinstance(forward_client, (list, tuple)):
+            fwd_pool = [c for c in forward_client if c is not None]
+        else:
+            fwd_pool = [forward_client]
+    elif forward_clients_pool:
+        fwd_pool = [c for c in forward_clients_pool if c is not None]
+
     for row in pending:
         fwd_id = row["id"]
         to_peer = db.to_peer_reference(row["destination_chat_id"])
         from_peer = db.to_peer_reference(row["published_chat_id"])
         expected_post_id = int(row["published_message_id"])
 
-        if forward_client is not None:
+        if fwd_pool:
             if FORWARD_SESSION_RESTRICT and FORWARD_SESSION_DESTINATIONS:
-                use_fwd = row["destination_chat_id"] in FORWARD_SESSION_DESTINATIONS
+                candidate_senders = list(fwd_pool) if row["destination_chat_id"] in FORWARD_SESSION_DESTINATIONS else [client]
             else:
-                use_fwd = True
+                candidate_senders = list(fwd_pool)
         else:
-            use_fwd = False
-
-        if use_fwd:
-            sender = forward_client
-            sender_tag = "fwd-session"
-        else:
-            sender = client
-            sender_tag = "main-session"
+            candidate_senders = [client]
 
         claimed = await db.run_async(db.claim_forwarding, fwd_id)
         if not claimed:
@@ -1203,7 +1212,7 @@ async def _drain_forward_queue(
         # actually have landed, and a blind resend would duplicate it.
         if (row.get("error") or "") == "stale_claim_reset":
             already_there = await _confirm_forward_on_destination(
-                sender, to_peer, expected_post_id
+                candidate_senders[0], to_peer, expected_post_id
             )
             if already_there is not None:
                 await db.run_async(db.mark_forwarded, fwd_id, already_there)
@@ -1216,107 +1225,122 @@ async def _drain_forward_queue(
                 )
                 continue
 
-        async def _forward_call():
-            try:
-                return await sender.forward_messages(
-                    to_peer,
-                    messages=[expected_post_id],
-                    from_peer=from_peer,
-                )
-            except (ValueError, ChannelInvalidError) as res_err:
-                # If the peer wasn't cached in this session yet (e.g. private group),
-                # refresh dialogs to fetch entity access_hash and retry once.
-                logger.info(
-                    "Destination peer %s not resolved (%s); refreshing dialogs and retrying...",
-                    row["destination_chat_id"],
-                    res_err,
-                )
-                try:
-                    await sender.get_dialogs(limit=50)
-                except Exception as diag_err:
-                    logger.debug("Failed refreshing dialogs during forward retry: %s", diag_err)
-                return await sender.forward_messages(
-                    to_peer,
-                    messages=[expected_post_id],
-                    from_peer=from_peer,
-                )
+        success = False
+        last_error = None
+        all_throttled = True
 
-        sent_forward = None
-        try:
-            sent_forward = await publish_guard.run_with_floodwait_retry(
-                _forward_call,
-                f"forward listing #{row['listing_id']} "
-                f"msg {expected_post_id} to {row['destination_chat_id']}",
-                max_total_sleep=FORWARD_FLOODWAIT_BUDGET_SECONDS,
-            )
-        except asyncio.CancelledError:
-            raise
-        except FloodWaitError as fwe:
-            # DEST-2: the forwarding ACCOUNT is throttled, not this destination.
-            # run_with_floodwait_retry already slept up to
-            # FORWARD_FLOODWAIT_BUDGET_SECONDS; anything past that is a long
-            # throttle. Defer the row WITHOUT spending a retry, because charging
-            # throttling against FORWARD_MAX_RETRIES is what burned all 8
-            # attempts and marked healthy destinations dead, and every later post
-            # then re-queued the same doomed row.
-            wait = max(int(getattr(fwe, "seconds", 60) or 60), 60)
-            capped = min(wait, FORWARD_FLOODWAIT_MAX_DEFERRAL_SECONDS)
-            await db.run_async(
-                db.defer_forwarding,
-                fwd_id,
-                f"throttled: FloodWait {wait}s",
-                capped,
-            )
-            logger.warning(
-                "Forward to destination %s deferred %ss: forwarding account "
-                "throttled by Telegram (retry budget untouched). [%s]",
-                row["destination_chat_id"],
-                capped,
-                sender_tag,
-            )
-            continue
-        except Exception as exc:
-            raise_as_error = exc
-            # Ambiguous failure: the forward may have landed before the error
-            # surfaced (timeout/lost response). Verify BEFORE declaring failure,
-            # otherwise the retry below would forward the message a second time.
-            already_there = await _confirm_forward_on_destination(
-                sender, to_peer, expected_post_id
-            )
-            if already_there is not None:
-                await db.run_async(db.mark_forwarded, fwd_id, already_there)
-                logger.warning(
-                    "Forward to %s reported %r but the message is already there "
-                    "(msg id %s) — recorded, not re-sent.",
+        for sender_idx, sender in enumerate(candidate_senders, start=1):
+            sender_tag = f"fwd-account-{sender_idx}" if len(candidate_senders) > 1 else ("fwd-session" if fwd_pool else "main-session")
+
+            async def _forward_call(s=sender):
+                try:
+                    return await s.forward_messages(
+                        to_peer,
+                        messages=[expected_post_id],
+                        from_peer=from_peer,
+                    )
+                except (ValueError, ChannelInvalidError) as res_err:
+                    # If the peer wasn't cached in this session yet (e.g. private group),
+                    # refresh dialogs to fetch entity access_hash and retry once.
+                    logger.info(
+                        "Destination peer %s not resolved (%s); refreshing dialogs and retrying...",
+                        row["destination_chat_id"],
+                        res_err,
+                    )
+                    try:
+                        await s.get_dialogs(limit=50)
+                    except Exception as diag_err:
+                        logger.debug("Failed refreshing dialogs during forward retry: %s", diag_err)
+                    return await s.forward_messages(
+                        to_peer,
+                        messages=[expected_post_id],
+                        from_peer=from_peer,
+                    )
+
+            try:
+                sent_forward = await publish_guard.run_with_floodwait_retry(
+                    _forward_call,
+                    f"forward listing #{row['listing_id']} "
+                    f"msg {expected_post_id} to {row['destination_chat_id']} via {sender_tag}",
+                    max_total_sleep=FORWARD_FLOODWAIT_BUDGET_SECONDS,
+                )
+                dest_msg_id = None
+                if isinstance(sent_forward, list) and sent_forward:
+                    dest_msg_id = getattr(sent_forward[0], "id", None)
+                elif sent_forward is not None:
+                    dest_msg_id = getattr(sent_forward, "id", None)
+                await db.run_async(db.mark_forwarded, fwd_id, dest_msg_id)
+                logger.info(
+                    "Forwarded bot post #%s (msg %s) to destination %s [%s]",
+                    row["listing_id"],
+                    row["published_message_id"],
                     row["destination_chat_id"],
-                    str(exc)[:200],
-                    already_there,
+                    sender_tag,
+                )
+                success = True
+                break
+            except asyncio.CancelledError:
+                raise
+            except FloodWaitError as fwe:
+                last_error = fwe
+                logger.warning(
+                    "Forward to %s hit FloodWait (%ss) on [%s]; failing over to next forwarder account...",
+                    row["destination_chat_id"],
+                    getattr(fwe, "seconds", 60),
+                    sender_tag,
                 )
                 continue
-            permanent = isinstance(raise_as_error, PERMANENT_FORWARD_ERRORS)
-            await db.run_async(db.mark_forward_failed, fwd_id, str(exc)[:500], permanent)
-            logger.warning(
-                "Forward to destination %s failed%s [%s]: %s",
-                row["destination_chat_id"],
-                " (permanent)" if permanent else "",
-                sender_tag,
-                exc,
-            )
-            continue
+            except Exception as exc:
+                all_throttled = False
+                last_error = exc
+                already_there = await _confirm_forward_on_destination(
+                    sender, to_peer, expected_post_id
+                )
+                if already_there is not None:
+                    await db.run_async(db.mark_forwarded, fwd_id, already_there)
+                    logger.warning(
+                        "Forward to %s reported %r but the message is already there "
+                        "(msg id %s) — recorded, not re-sent.",
+                        row["destination_chat_id"],
+                        str(exc)[:200],
+                        already_there,
+                    )
+                    success = True
+                    break
+                logger.warning(
+                    "Forward to destination %s failed on [%s]: %s; failing over to next forwarder account...",
+                    row["destination_chat_id"],
+                    sender_tag,
+                    exc,
+                )
+                continue
 
-        dest_msg_id = None
-        if isinstance(sent_forward, list) and sent_forward:
-            dest_msg_id = getattr(sent_forward[0], "id", None)
-        elif sent_forward is not None:
-            dest_msg_id = getattr(sent_forward, "id", None)
-        await db.run_async(db.mark_forwarded, fwd_id, dest_msg_id)
-        logger.info(
-            "Forwarded bot post #%s (msg %s) to destination %s [%s]",
-            row["listing_id"],
-            row["published_message_id"],
-            row["destination_chat_id"],
-            sender_tag,
-        )
+        if not success:
+            if isinstance(last_error, FloodWaitError) and all_throttled:
+                wait = max(int(getattr(last_error, "seconds", 60) or 60), 60)
+                capped = min(wait, FORWARD_FLOODWAIT_MAX_DEFERRAL_SECONDS)
+                await db.run_async(
+                    db.defer_forwarding,
+                    fwd_id,
+                    f"throttled: FloodWait {wait}s across accounts",
+                    capped,
+                )
+                logger.warning(
+                    "Forward to destination %s deferred %ss: all forwarder accounts throttled (retry budget untouched).",
+                    row["destination_chat_id"],
+                    capped,
+                )
+            else:
+                permanent = isinstance(last_error, PERMANENT_FORWARD_ERRORS)
+                err_str = str(last_error or "All forwarder accounts failed")[:500]
+                await db.run_async(db.mark_forward_failed, fwd_id, err_str, permanent)
+                logger.warning(
+                    "Forward to destination %s failed across all accounts%s: %s",
+                    row["destination_chat_id"],
+                    " (permanent)" if permanent else "",
+                    last_error,
+                )
+            continue
 
         if FORWARD_PACING_SECONDS > 0:
             await asyncio.sleep(FORWARD_PACING_SECONDS)
@@ -2876,6 +2900,71 @@ async def rephrase_unpublished() -> None:
     )
 
 
+def attach_forward_client_listeners(
+    forward_client: TelegramClient, bot_client: Optional[TelegramClient] = None
+) -> None:
+    """Listen for when any forward account joins or is added to groups in real time."""
+    @forward_client.on(events.ChatAction)
+    async def on_forward_chat_action(event):
+        try:
+            if event.user_joined or event.user_added:
+                me = await forward_client.get_me()
+                users = getattr(event, "users", None) or []
+                user_ids = [getattr(u, "id", None) for u in users] if users else []
+                if event.user_id == me.id or me.id in user_ids:
+                    chat = await event.get_chat()
+
+                    # Destinations must ONLY be groups, NEVER broadcast channels
+                    if not is_group_chat(chat):
+                        return
+
+                    chat_id = db.normalize_channel_id(chat)
+                    if chat_id:
+                        username = getattr(chat, "username", None)
+                        store_ref = f"@{username.lower()}" if username else str(chat_id)
+                        title = (getattr(chat, "title", None) or username or f"chat {chat_id}")[:100]
+                        existing_rows = await db.run_async(db.list_destinations)
+                        existing_refs = {str(d["chat_id"]) for d in existing_rows}
+                        is_new = store_ref not in existing_refs and str(chat_id) not in existing_refs
+                        if not is_new:
+                            return
+
+                        # Check write permissions before adding
+                        can_write, reason = await check_can_write_to_destination(forward_client, chat)
+                        if not can_write:
+                            logger.warning(
+                                "Joined group %s (%s) but cannot send messages (%s); leaving group",
+                                title, store_ref, reason,
+                            )
+                            await leave_destination_chat(forward_client, chat)
+                            if bot_client and ADMIN_USER_ID:
+                                try:
+                                    await bot_client.send_message(
+                                        ADMIN_USER_ID,
+                                        texts.DEST_CANNOT_WRITE.format(title=title, ref=store_ref, reason=reason),
+                                        parse_mode="markdown",
+                                    )
+                                except Exception:
+                                    pass
+                            return
+
+                        await db.run_async(db.add_destination, store_ref, title, True)
+                        logger.info(
+                            "Auto-registered new destination from forward account join: %s (%s)",
+                            title, store_ref,
+                        )
+                        if bot_client and ADMIN_USER_ID:
+                            try:
+                                await bot_client.send_message(
+                                    ADMIN_USER_ID,
+                                    texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref),
+                                )
+                            except Exception:
+                                pass
+        except Exception:
+            logger.exception("Error handling chat action on forward client")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -3040,99 +3129,49 @@ async def main() -> None:
     except Exception as exc:
         logger.warning("Startup crash recovery sweep failed: %s", exc)
 
-    # Optional dedicated forward-only account (DEST-ROUTE): a second Telethon
-    # session whose job is forwarding posts to destination groups.
-    forward_client: Optional[TelegramClient] = None
-    if FORWARD_SESSION_NAME:
-        try:
-            forward_client = TelegramClient(FORWARD_SESSION_NAME, API_ID, API_HASH)
-            await forward_client.start()
+    # Cascading Forwarder Accounts Pool (DEST-ROUTE): Telethon sessions
+    # whose job is forwarding posts to destination groups.
+    global forward_clients_pool
+    forward_clients_pool = []
+
+    try:
+        db_accounts = await db.run_async(db.list_forward_accounts, True)
+    except Exception:
+        db_accounts = []
+    active_sessions = [a["session_name"] for a in db_accounts]
+
+    env_sessions = list(FORWARD_SESSION_NAMES)
+    if FORWARD_SESSION_NAME and FORWARD_SESSION_NAME not in env_sessions:
+        env_sessions.append(FORWARD_SESSION_NAME)
+
+    for env_s in env_sessions:
+        if env_s not in active_sessions:
+            active_sessions.append(env_s)
             try:
-                await forward_client.get_dialogs(limit=200)
-            except Exception:
-                logger.debug("Could not pre-warm forward-client dialogs cache.")
-            logger.info(
-                "Forward-dedicated client connected (%s); forwarding destinations "
-                "via the second account.",
-                FORWARD_SESSION_NAME,
-            )
-            admin_bot.set_forward_client(forward_client)
-
-            # Auto-registration only happens when the forwarding account joins a new group in real time.
-            # Do NOT scan all existing dialogs across the account.
-
-            # Listen for when the forwarding account joins or is added to groups in real time
-            @forward_client.on(events.ChatAction)
-            async def on_forward_chat_action(event):
-                try:
-                    if event.user_joined or event.user_added:
-                        me = await forward_client.get_me()
-                        users = getattr(event, "users", None) or []
-                        user_ids = [getattr(u, "id", None) for u in users] if users else []
-                        if event.user_id == me.id or me.id in user_ids:
-                            chat = await event.get_chat()
-
-                            # Destinations must ONLY be groups, NEVER broadcast channels
-                            if not is_group_chat(chat):
-                                return
-
-                            chat_id = db.normalize_channel_id(chat)
-                            if chat_id:
-                                username = getattr(chat, "username", None)
-                                store_ref = f"@{username.lower()}" if username else str(chat_id)
-                                title = (getattr(chat, "title", None) or username or f"chat {chat_id}")[:100]
-                                existing_rows = await db.run_async(db.list_destinations)
-                                existing_refs = {str(d["chat_id"]) for d in existing_rows}
-                                is_new = store_ref not in existing_refs and str(chat_id) not in existing_refs
-                                if not is_new:
-                                    return
-
-                                # Check write permissions before adding
-                                can_write, reason = await check_can_write_to_destination(forward_client, chat)
-                                if not can_write:
-                                    logger.warning(
-                                        "Joined group %s (%s) but cannot send messages (%s); leaving group",
-                                        title, store_ref, reason,
-                                    )
-                                    await leave_destination_chat(forward_client, chat)
-                                    if bot_client and ADMIN_USER_ID:
-                                        try:
-                                            await bot_client.send_message(
-                                                ADMIN_USER_ID,
-                                                texts.DEST_CANNOT_WRITE.format(title=title, ref=store_ref, reason=reason),
-                                                parse_mode="markdown",
-                                            )
-                                        except Exception:
-                                            pass
-                                    return
-
-                                await db.run_async(db.add_destination, store_ref, title, True)
-                                logger.info(
-                                    "Auto-registered new destination from forward account join: %s (%s)",
-                                    title, store_ref,
-                                )
-                                if bot_client and ADMIN_USER_ID:
-                                    try:
-                                        await bot_client.send_message(
-                                            ADMIN_USER_ID,
-                                            texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref),
-                                        )
-                                    except Exception:
-                                        pass
-                except Exception:
-                    logger.exception("Error handling chat action on forward client")
-        except Exception:
-            logger.exception(
-                "Could not start forward-dedicated client %s; "
-                "forwarding will use the main account for all destinations.",
-                FORWARD_SESSION_NAME,
-            )
-            try:
-                if forward_client is not None:
-                    await forward_client.disconnect()
+                await db.run_async(db.add_forward_account, env_s, None, None, None, True)
             except Exception:
                 pass
-            forward_client = None
+
+    forward_client: Optional[TelegramClient] = None
+    for s_name in active_sessions:
+        try:
+            fc = TelegramClient(s_name, API_ID, API_HASH)
+            await fc.start()
+            try:
+                await fc.get_dialogs(limit=200)
+            except Exception:
+                logger.debug("Could not pre-warm forward-client dialogs cache for %s", s_name)
+            attach_forward_client_listeners(fc, bot_client)
+            forward_clients_pool.append(fc)
+            logger.info("Forward-dedicated client connected (%s); added to cascading pool.", s_name)
+        except Exception:
+            logger.exception("Could not start forward-dedicated client %s", s_name)
+
+    if forward_clients_pool:
+        forward_client = forward_clients_pool[0]
+        admin_bot.set_forward_clients(forward_clients_pool)
+    else:
+        admin_bot.set_forward_clients([])
 
     try:
         await user_client.get_dialogs(limit=50)
@@ -3206,7 +3245,7 @@ async def main() -> None:
     )
     worker_task = asyncio.create_task(approved_listings_worker(user_client, stop_event, bot_client))
     forward_task = asyncio.create_task(
-        forwarding_worker(user_client, stop_event, forward_client=forward_client)
+        forwarding_worker(user_client, stop_event, forward_client=forward_clients_pool or forward_client)
     )
     retention_task = asyncio.create_task(retention_worker(stop_event))
     dest_sync_task = None
@@ -3274,11 +3313,16 @@ async def main() -> None:
                 await bot_client.disconnect()
             except Exception:
                 logger.exception("Error disconnecting admin bot client")
-        if forward_client:
+        for fc in forward_clients_pool:
+            try:
+                await fc.disconnect()
+            except Exception:
+                logger.exception("Error disconnecting forward-dedicated client")
+        if forward_client and forward_client not in forward_clients_pool:
             try:
                 await forward_client.disconnect()
             except Exception:
-                logger.exception("Error disconnecting forward-dedicated client")
+                pass
         try:
             await user_client.disconnect()
         except Exception:

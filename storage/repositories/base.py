@@ -287,6 +287,25 @@ def init_db(db_path: Optional[str] = None) -> None:
             "CREATE INDEX IF NOT EXISTS idx_forwardings_listing ON forwardings(listing_id);"
         )
 
+        # 10. Forwarder accounts — multiple Telethon sessions for cascading destination forwarding
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS forward_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_name TEXT NOT NULL UNIQUE,
+                phone TEXT,
+                username TEXT,
+                display_name TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forward_accounts_active ON forward_accounts(active);"
+        )
+
         # Safe indexes on columns present in both v0 and v1 schemas
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_suppliers_channel_id ON suppliers(channel_id);"
@@ -635,6 +654,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     if version < 13:
         cursor.execute("PRAGMA user_version = 13")
+
+    # v14: Forwarder accounts pool
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS forward_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_name TEXT NOT NULL UNIQUE,
+            phone TEXT,
+            username TEXT,
+            display_name TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_forward_accounts_active ON forward_accounts(active);"
+    )
+    if version < 14:
+        cursor.execute("PRAGMA user_version = 14")
 
 # Schema objects the running code depends on. Used by verify_schema() so a
 # diverged database is reported loudly at startup instead of failing later
