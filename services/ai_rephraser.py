@@ -28,9 +28,20 @@ logger = logging.getLogger("ai_rephraser")
 _client = None
 _api_key: Optional[str] = None
 _model_name: str = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b").strip() or "qwen/qwen3.8-27b"
-_temperature: float = float(os.environ.get("GROQ_TEMPERATURE", "0.8") or 0.8)
+_raw_temp = float(os.environ.get("GROQ_TEMPERATURE", "0.1") or 0.1)
+if _raw_temp > 0.3:
+    logger.warning("GROQ_TEMPERATURE (%.2f) exceeds allowed maximum 0.3; clamping to 0.3", _raw_temp)
+    _temperature = 0.3
+elif _raw_temp < 0.0:
+    _temperature = 0.0
+else:
+    _temperature = _raw_temp
+
+GROQ_TEMPERATURE = _temperature
+
+_model_resolution_failed = False
 _max_tokens: int = int(os.environ.get("GROQ_MAX_TOKENS", "1024") or 1024)
-_timeout: float = float(os.environ.get("GROQ_TIMEOUT", "45") or 45)
+_timeout: float = float(os.environ.get("GROQ_TIMEOUT", "15") or 15)
 _max_retries: int = int(os.environ.get("GROQ_MAX_RETRIES", "3") or 3)
 _max_concurrency: int = max(1, int(os.environ.get("GROQ_MAX_CONCURRENCY", "2") or 2))
 _semaphore = None
@@ -44,7 +55,7 @@ _openrouter_model: str = (
     os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b:free").strip()
     or "openai/gpt-oss-120b:free"
 )
-_openrouter_timeout: float = float(os.environ.get("OPENROUTER_TIMEOUT", "30") or 30)
+_openrouter_timeout: float = float(os.environ.get("OPENROUTER_TIMEOUT", "15") or 15)
 # Circuit breaker: after an OpenRouter failure we cool down before trying again
 # so a sustained Groq outage can't burn the ~50/day free quota in minutes.
 _openrouter_cooldown_seconds: float = float(
@@ -253,11 +264,18 @@ def init_groq(api_key: Optional[str] = None) -> bool:
     global _client, _api_key, _semaphore
     global _model_name, _temperature, _max_tokens, _timeout, _max_retries, _max_concurrency
     global _openrouter_api_key, _openrouter_model, _openrouter_timeout, _ai_cache_ttl_hours
-    global _openrouter_next_attempt_ts
+    global _openrouter_next_attempt_ts, _model_resolution_failed
     _model_name = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b").strip() or "qwen/qwen3.8-27b"
-    _temperature = float(os.environ.get("GROQ_TEMPERATURE", "0.8") or 0.8)
+    _raw_temp = float(os.environ.get("GROQ_TEMPERATURE", "0.1") or 0.1)
+    if _raw_temp > 0.3:
+        logger.warning("GROQ_TEMPERATURE (%.2f) exceeds allowed maximum 0.3; clamping to 0.3", _raw_temp)
+        _temperature = 0.3
+    elif _raw_temp < 0.0:
+        _temperature = 0.0
+    else:
+        _temperature = _raw_temp
     _max_tokens = int(os.environ.get("GROQ_MAX_TOKENS", "1024") or 1024)
-    _timeout = float(os.environ.get("GROQ_TIMEOUT", "45") or 45)
+    _timeout = float(os.environ.get("GROQ_TIMEOUT", "15") or 15)
     _max_retries = int(os.environ.get("GROQ_MAX_RETRIES", "3") or 3)
     _max_concurrency = max(1, int(os.environ.get("GROQ_MAX_CONCURRENCY", "2") or 2))
     _openrouter_api_key = (os.environ.get("OPENROUTER_API_KEY", "") or "").strip() or None
@@ -265,7 +283,7 @@ def init_groq(api_key: Optional[str] = None) -> bool:
         os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b:free").strip()
         or "openai/gpt-oss-120b:free"
     )
-    _openrouter_timeout = float(os.environ.get("OPENROUTER_TIMEOUT", "30") or 30)
+    _openrouter_timeout = float(os.environ.get("OPENROUTER_TIMEOUT", "15") or 15)
     _ai_cache_ttl_hours = float(os.environ.get("AI_CACHE_TTL_HOURS", "48") or 48)
     _openrouter_cooldown_seconds = float(
         os.environ.get("OPENROUTER_COOLDOWN_SECONDS", "60") or 60
@@ -304,7 +322,32 @@ def init_groq(api_key: Optional[str] = None) -> bool:
 
 def is_available() -> bool:
     """Check if the AI client is ready."""
-    return _client is not None
+    return _client is not None and not _model_resolution_failed
+
+
+async def verify_model_available() -> bool:
+    """Check Groq model availability against Groq's model list at startup."""
+    global _model_resolution_failed
+    if not _client or not _api_key:
+        return False
+    try:
+        models_resp = await asyncio.wait_for(_client.models.list(), timeout=10.0)
+        available_ids = {getattr(m, "id", "") for m in getattr(models_resp, "data", [])}
+        if _model_name not in available_ids:
+            logger.error(
+                "Configured GROQ_MODEL '%s' was NOT found in Groq's model list. "
+                "Available models: %s. Falling back to OpenRouter or pending_approval.",
+                _model_name,
+                sorted(list(available_ids))[:10],
+            )
+            _model_resolution_failed = True
+            return False
+        _model_resolution_failed = False
+        return True
+    except Exception as exc:
+        logger.error("Failed to verify Groq model '%s': %s", _model_name, exc)
+        _model_resolution_failed = True
+        return False
 
 
 def is_openrouter_available() -> bool:
@@ -389,13 +432,15 @@ async def analyze_message(raw_text: str) -> Optional[dict]:
         cached = db.get_ai_cache(cache_key, max_age_hours=_ai_cache_ttl_hours)
         if cached is not None:
             cached_json, cached_model = cached
-            result = _parse_analysis_json(cached_json)
-            if result is not None:
-                logger.info(
-                    "AI analysis cache hit (model=%s); reusing result.",
-                    cached_model or "unknown",
-                )
-                return result
+            raw_cached = _find_json_object(cached_json)
+            if raw_cached is not None and validate_ai_schema(raw_cached):
+                result = _parse_analysis_json(cached_json)
+                if result is not None:
+                    logger.info(
+                        "AI analysis cache hit (model=%s); reusing result.",
+                        cached_model or "unknown",
+                    )
+                    return result
 
     try:
         # First attempt: strict JSON mode. Some messages make Groq's JSON validator
@@ -412,6 +457,10 @@ async def analyze_message(raw_text: str) -> Optional[dict]:
         content = (response.choices[0].message.content or "").strip()
         if not content:
             logger.warning("AI analysis returned empty content.")
+            return None
+        raw_obj = _find_json_object(content)
+        if raw_obj is None or not validate_ai_schema(raw_obj):
+            logger.warning("AI analysis returned schema violation: %.120s", content)
             return None
         result = _parse_analysis_json(content)
         if result is None:
@@ -452,6 +501,13 @@ async def _create_completion(prompt: str, json_mode: bool):
     manual review. If the fallback also fails, the original exception is
     re-raised so the caller's existing retry paths stay intact.
     """
+    if _model_resolution_failed:
+        logger.info("Groq model resolution failed; trying OpenRouter fallback.")
+        fallback = await _create_openrouter_completion(prompt, json_mode=False)
+        if fallback is not None:
+            return fallback
+        return None
+
     kwargs = {
         "model": _model_name,
         "messages": [{"role": "user", "content": prompt}],
@@ -571,12 +627,58 @@ def _adapt_openrouter_response(data) -> Optional[types.SimpleNamespace]:
     return adapted
 
 
-def _parse_analysis_json(text: str) -> Optional[dict]:
-    """Tolerant JSON parse of the AI analysis response."""
+def validate_ai_schema(data: Any) -> bool:
+    """Validate parsed AI JSON against a strict schema.
+
+    Enforces:
+    - Must be a dictionary.
+    - is_listing: boolean type.
+    - blocked: optional boolean type.
+    - intent: must be one of 'buy', 'sell', 'neutral'.
+    - content: list of strings, max 40 items, each item max 500 chars.
+    - platform: optional string max 100 chars or None.
+    - price: optional number (int/float) >= 0 or None.
+    - block_reason: optional string max 500 chars or None.
+    - dm_request: optional boolean type.
+    """
+    if not isinstance(data, dict):
+        return False
+    if "is_listing" not in data or type(data["is_listing"]) is not bool:
+        return False
+    if "blocked" in data and data["blocked"] is not None and type(data["blocked"]) is not bool:
+        return False
+    if "intent" not in data or data["intent"] not in ("buy", "sell", "neutral"):
+        return False
+    if "content" not in data or not isinstance(data["content"], list):
+        return False
+    if len(data["content"]) > 40:
+        return False
+    for item in data["content"]:
+        if not isinstance(item, str) or len(item) > 500:
+            return False
+    platform = data.get("platform")
+    if platform is not None and (not isinstance(platform, str) or len(platform) > 100):
+        return False
+    price = data.get("price")
+    if price is not None and (type(price) not in (int, float) or price < 0):
+        return False
+    block_reason = data.get("block_reason")
+    if block_reason is not None and (not isinstance(block_reason, str) or len(block_reason) > 500):
+        return False
+    dm_request = data.get("dm_request")
+    if dm_request is not None and type(dm_request) is not bool:
+        return False
+    return True
+
+
+def _parse_analysis_json(text: str, strict: bool = False) -> Optional[dict]:
+    """Tolerant (or strict) JSON parse of the AI analysis response."""
     if not text:
         return None
     data = _find_json_object(text)
     if not data:
+        return None
+    if strict and not validate_ai_schema(data):
         return None
 
     def _as_str(v, default=None):

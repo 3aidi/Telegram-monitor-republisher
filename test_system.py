@@ -1040,12 +1040,12 @@ class TestMonitorSystem(unittest.TestCase):
         )
         self.assertTrue(is_dup)
 
-        # ...while the same product at a DIFFERENT price is NOT a duplicate.
-        is_not_dup_price = filters.is_duplicate_listing(
+        # Task 6: with DEDUP_IGNORE_PRICE=1 (default), price variations are caught as duplicates
+        is_dup_price = filters.is_duplicate_listing(
             clean_text="WTS Bybit verified account $100",
             hours=48, price=150.0, db_path=TEST_DB,
         )
-        self.assertFalse(is_not_dup_price)
+        self.assertTrue(is_dup_price)
 
         # And a different product entirely is not a duplicate.
         is_not_dup = filters.is_duplicate_listing(
@@ -1641,35 +1641,53 @@ class TestMonitorSystem(unittest.TestCase):
         ))
 
     def test_deterministic_fallback_gate_respects_pause(self):
-        """'All Stop' must gate the deterministic AI-down fallback auto-publish."""
+        """'All Stop' must gate the deterministic AI-down fallback auto-publish,
+        and fallback never auto-publishes unless FALLBACK_AUTOPUBLISH=1."""
         import main as main_mod
-        old = main_mod.DETERMINISTIC_FALLBACK
+        old_fb = main_mod.DETERMINISTIC_FALLBACK
+        old_ap = main_mod.FALLBACK_AUTOPUBLISH
         main_mod.DETERMINISTIC_FALLBACK = True
         try:
+            # Default: FALLBACK_AUTOPUBLISH is False -> never auto-publishes
+            main_mod.FALLBACK_AUTOPUBLISH = False
+            self.assertFalse(main_mod.deterministic_fallback_publish_ok(
+                paused=False, risky_keyword=None, has_payment_proof=None,
+                has_clear_signal=True, body_ok=True,
+                raw_text="WTB Netflix account", platform="netflix",
+            ))
+
+            # When enabled: auto-publishes if clean buy listing and unpaused
+            main_mod.FALLBACK_AUTOPUBLISH = True
             self.assertTrue(main_mod.deterministic_fallback_publish_ok(
                 paused=False, risky_keyword=None, has_payment_proof=None,
                 has_clear_signal=True, body_ok=True,
+                raw_text="WTB Netflix account", platform="netflix",
             ))
             # Paused -> fallback listing routes to manual review, never auto-publishes.
             self.assertFalse(main_mod.deterministic_fallback_publish_ok(
                 paused=True, risky_keyword=None, has_payment_proof=None,
                 has_clear_signal=True, body_ok=True,
+                raw_text="WTB Netflix account", platform="netflix",
             ))
             # Unpaused, the safety valves still route to manual review.
             self.assertFalse(main_mod.deterministic_fallback_publish_ok(
                 paused=False, risky_keyword="hacked", has_payment_proof=None,
                 has_clear_signal=True, body_ok=True,
+                raw_text="WTB Netflix account", platform="netflix",
             ))
             self.assertFalse(main_mod.deterministic_fallback_publish_ok(
                 paused=False, risky_keyword=None, has_payment_proof="receipt shown",
                 has_clear_signal=True, body_ok=True,
+                raw_text="WTB Netflix account", platform="netflix",
             ))
             self.assertFalse(main_mod.deterministic_fallback_publish_ok(
                 paused=False, risky_keyword=None, has_payment_proof=None,
                 has_clear_signal=False, body_ok=True,
+                raw_text="WTB Netflix account", platform="netflix",
             ))
         finally:
-            main_mod.DETERMINISTIC_FALLBACK = old
+            main_mod.DETERMINISTIC_FALLBACK = old_fb
+            main_mod.FALLBACK_AUTOPUBLISH = old_ap
 
     def test_approved_listings_drain_ignores_pause(self):
         """Approved-but-unpublished listings drain even while 'All Stop' is on."""
@@ -2954,9 +2972,9 @@ class TestMonitorSystem(unittest.TestCase):
         old_time = (now - timedelta(hours=9)).isoformat()
         recent_time = (now - timedelta(hours=1)).isoformat()
 
-        # Insert old pending listing
+        # Insert old skipped listing (non-protected status)
         old_listing_id = db.insert_listing(
-            sup_id, 5001, None, None, "pending_review",
+            sup_id, 5001, None, None, "skipped_filter",
             "old pending ad", "old pending ad",
             db_path=TEST_DB,
         )
@@ -3012,9 +3030,12 @@ class TestMonitorSystem(unittest.TestCase):
         fp_ai = ai_rephraser._cache_fingerprint("Netflix 1 Month $40")
         fp_db = db.make_listing_fingerprint("Netflix 1 Month $40", price=40.0)
         self.assertEqual(fp_ai, fp_db)
-        # A different price must map to a different cache entry.
+        # Task 6: with DEDUP_IGNORE_PRICE=1, same text with different price maps to same key
         fp_other = db.make_listing_fingerprint("Netflix 1 Month $40", price=41.0)
-        self.assertNotEqual(fp_ai, fp_other)
+        self.assertEqual(fp_ai, fp_other)
+        # When ignore_price=False, different price maps to different key
+        fp_diff = db.make_listing_fingerprint("Netflix 1 Month $40", price=41.0, ignore_price=False)
+        self.assertNotEqual(fp_ai, fp_diff)
         # No price -> key built from text alone still matches the dedup key.
         no_price_ai = ai_rephraser._cache_fingerprint("KYC full access VPS")
         self.assertEqual(no_price_ai, db.make_listing_fingerprint("KYC full access VPS"))
@@ -6797,5 +6818,875 @@ class MainChannelConfigTests(unittest.TestCase):
         admin_bot.set_forward_client(None)
 
 
+class TestHardenTasks(unittest.TestCase):
+    """Unit and regression tests for Tasks 1-11 and Section 2 hard invariants."""
+
+    def setUp(self):
+        import asyncio
+        self._test_db = f"test_harden_{int(time.time() * 1000)}_{os.getpid()}.db"
+        db.init_db(self._test_db)
+        self._old_db = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = self._test_db
+        import admin_bot
+        import main as main_mod
+        from pipeline import rules
+        self.admin_bot = admin_bot
+        self.main_mod = main_mod
+        self.rules = rules
+        self._orig_admin_id = admin_bot.ADMIN_USER_ID
+        self._orig_main_admin = main_mod.ADMIN_USER_ID
+        admin_bot.ADMIN_USER_ID = 555000111
+        main_mod.ADMIN_USER_ID = 555000111
+        self._orig_blocked_cats = main_mod.BLOCKED_PLATFORM_CATEGORIES
+        self._orig_fallback_auto = main_mod.FALLBACK_AUTOPUBLISH
+
+    def tearDown(self):
+        db.DEFAULT_DB_PATH = self._old_db
+        self.admin_bot.ADMIN_USER_ID = self._orig_admin_id
+        self.main_mod.ADMIN_USER_ID = self._orig_main_admin
+        self.main_mod.BLOCKED_PLATFORM_CATEGORIES = self._orig_blocked_cats
+        self.main_mod.FALLBACK_AUTOPUBLISH = self._orig_fallback_auto
+        self.admin_bot.set_user_client(None)
+        self.admin_bot.set_forward_client(None)
+        if os.path.exists(self._test_db):
+            try:
+                os.remove(self._test_db)
+            except Exception:
+                pass
+
+    # -------------------------------------------------------------
+    # TASK 1: Edit propagation
+    # -------------------------------------------------------------
+    def test_task1_edit_published_rejected_payment_proof(self):
+        """Clean published post edited to add payment proof does NOT touch post and alerts admin."""
+        import asyncio
+        sid = db.add_supplier("@test_src1", channel_id=-100101, db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 201, "WTB Netflix 1 Month", None, "published",
+            "WTB Netflix 1 Month", "WTB Netflix 1 Month",
+            published_message_id=901, db_path=self._test_db,
+        )
+
+        class MockTeleClient:
+            def __init__(self):
+                self.edited_messages = []
+            def is_connected(self):
+                return True
+            async def edit_message(self, peer, msg_id, text, **kw):
+                self.edited_messages.append({"peer": peer, "msg_id": msg_id, "text": text})
+
+        class MockBotClient:
+            def __init__(self):
+                self.sent_messages = []
+            async def send_message(self, peer, text, **kw):
+                self.sent_messages.append({"peer": peer, "text": text, "kw": kw})
+
+        class MockMsg:
+            id = 201
+            text = "proof of payment confirmed 100 USDT txid 0xabcdef1234567890abcdef1234567890"
+
+        class MockChat:
+            id = -100101
+            username = "test_src1"
+
+        class MockEvent:
+            chat_id = -100101
+            chat = MockChat()
+            message = MockMsg()
+
+        mock_user = MockTeleClient()
+        mock_bot = MockBotClient()
+
+        asyncio.run(self.main_mod.process_edited_message(mock_user, MockEvent(), mock_bot))
+
+        # Destination post was NOT touched
+        self.assertEqual(len(mock_user.edited_messages), 0)
+        # Audit log has edit_rejected_review
+        audits = db.get_audit_logs(limit=10, db_path=self._test_db)
+        self.assertTrue(any(a["action"] == "edit_rejected_review" for a in audits))
+        # Admin alert sent with Apply / Ignore
+        self.assertTrue(len(mock_bot.sent_messages) > 0)
+        self.assertIn("Edit Rejected", mock_bot.sent_messages[0]["text"])
+        pending_edit = db.get_setting(f"pending_edit:{lid}", db_path=self._test_db)
+        self.assertEqual(pending_edit, MockMsg.text)
+
+    def test_task1_edit_published_rejected_blocked_keyword(self):
+        """Clean published post edited to add blocked keyword does NOT touch post and alerts admin."""
+        import asyncio
+        sid = db.add_supplier("@test_src2", channel_id=-100102, db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 202, "WTB Netflix 1 Month", None, "published",
+            "WTB Netflix 1 Month", "WTB Netflix 1 Month",
+            published_message_id=902, db_path=self._test_db,
+        )
+
+        class MockTeleClient:
+            def __init__(self):
+                self.edited_messages = []
+            def is_connected(self):
+                return True
+            async def edit_message(self, peer, msg_id, text, **kw):
+                self.edited_messages.append({"peer": peer, "msg_id": msg_id, "text": text})
+
+        class MockBotClient:
+            def __init__(self):
+                self.sent_messages = []
+            async def send_message(self, peer, text, **kw):
+                self.sent_messages.append({"peer": peer, "text": text, "kw": kw})
+
+        class MockMsg:
+            id = 202
+            text = "WTB Netflix dump database logs"
+
+        class MockChat:
+            id = -100102
+            username = "test_src2"
+
+        class MockEvent:
+            chat_id = -100102
+            chat = MockChat()
+            message = MockMsg()
+
+        mock_user = MockTeleClient()
+        mock_bot = MockBotClient()
+
+        asyncio.run(self.main_mod.process_edited_message(mock_user, MockEvent(), mock_bot))
+
+        self.assertEqual(len(mock_user.edited_messages), 0)
+        audits = db.get_audit_logs(limit=10, db_path=self._test_db)
+        self.assertTrue(any(a["action"] == "edit_rejected_review" for a in audits))
+        self.assertTrue(len(mock_bot.sent_messages) > 0)
+
+    def test_task1_edit_published_rejected_tme_link(self):
+        """Clean published post edited to add t.me link does NOT touch post and alerts admin."""
+        import asyncio
+        sid = db.add_supplier("@test_src3", channel_id=-100103, db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 203, "WTB Netflix 1 Month", None, "published",
+            "WTB Netflix 1 Month", "WTB Netflix 1 Month",
+            published_message_id=903, db_path=self._test_db,
+        )
+
+        class MockTeleClient:
+            def __init__(self):
+                self.edited_messages = []
+            def is_connected(self):
+                return True
+            async def edit_message(self, peer, msg_id, text, **kw):
+                self.edited_messages.append({"peer": peer, "msg_id": msg_id, "text": text})
+
+        class MockBotClient:
+            def __init__(self):
+                self.sent_messages = []
+            async def send_message(self, peer, text, **kw):
+                self.sent_messages.append({"peer": peer, "text": text, "kw": kw})
+
+        class MockMsg:
+            id = 203
+            text = "WTB Netflix join https://t.me/scamchannel for more"
+
+        class MockChat:
+            id = -100103
+            username = "test_src3"
+
+        class MockEvent:
+            chat_id = -100103
+            chat = MockChat()
+            message = MockMsg()
+
+        mock_user = MockTeleClient()
+        mock_bot = MockBotClient()
+
+        asyncio.run(self.main_mod.process_edited_message(mock_user, MockEvent(), mock_bot))
+
+        self.assertEqual(len(mock_user.edited_messages), 0)
+        audits = db.get_audit_logs(limit=10, db_path=self._test_db)
+        self.assertTrue(any(a["action"] == "edit_rejected_review" for a in audits))
+        self.assertTrue(len(mock_bot.sent_messages) > 0)
+
+    def test_task1_edit_published_rejected_wts(self):
+        """Clean published post edited to add WTS does NOT touch post and alerts admin."""
+        import asyncio
+        sid = db.add_supplier("@test_src4", channel_id=-100104, db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 204, "WTB Netflix 1 Month", None, "published",
+            "WTB Netflix 1 Month", "WTB Netflix 1 Month",
+            published_message_id=904, db_path=self._test_db,
+        )
+
+        class MockTeleClient:
+            def __init__(self):
+                self.edited_messages = []
+            def is_connected(self):
+                return True
+            async def edit_message(self, peer, msg_id, text, **kw):
+                self.edited_messages.append({"peer": peer, "msg_id": msg_id, "text": text})
+
+        class MockBotClient:
+            def __init__(self):
+                self.sent_messages = []
+            async def send_message(self, peer, text, **kw):
+                self.sent_messages.append({"peer": peer, "text": text, "kw": kw})
+
+        class MockMsg:
+            id = 204
+            text = "WTS Netflix 4K UHD accounts in stock"
+
+        class MockChat:
+            id = -100104
+            username = "test_src4"
+
+        class MockEvent:
+            chat_id = -100104
+            chat = MockChat()
+            message = MockMsg()
+
+        mock_user = MockTeleClient()
+        mock_bot = MockBotClient()
+
+        asyncio.run(self.main_mod.process_edited_message(mock_user, MockEvent(), mock_bot))
+
+        self.assertEqual(len(mock_user.edited_messages), 0)
+        audits = db.get_audit_logs(limit=10, db_path=self._test_db)
+        self.assertTrue(any(a["action"] == "edit_rejected_review" for a in audits))
+        self.assertTrue(len(mock_bot.sent_messages) > 0)
+
+    def test_task1_edit_held_listing(self):
+        """Editing a held listing updates raw_text and fingerprint, preserving hold_until."""
+        import asyncio
+        sid = db.add_supplier("@test_held_src", channel_id=-100105, db_path=self._test_db)
+        hold_time = (datetime.now(timezone.utc) + timedelta(seconds=80)).isoformat()
+        lid = db.insert_listing(
+            sid, 205, "Original text", None, "held",
+            "Original text", "Original text",
+            hold_until=hold_time, db_path=self._test_db,
+        )
+
+        class MockMsg:
+            id = 205
+            text = "Updated text with Netflix 1 Month"
+
+        class MockChat:
+            id = -100105
+            username = "test_held_src"
+
+        class MockEvent:
+            chat_id = -100105
+            chat = MockChat()
+            message = MockMsg()
+
+        asyncio.run(self.main_mod.process_edited_message(None, MockEvent(), None))
+
+        row = db.get_listing_by_id(lid, db_path=self._test_db)
+        self.assertEqual(row["raw_text"], "Updated text with Netflix 1 Month")
+        self.assertEqual(row["hold_until"], hold_time)
+        self.assertIsNotNone(row["fingerprint"])
+
+    def test_task1_edit_idempotent_same_hash(self):
+        """Edit event with text hash matching stored raw_text hash is ignored."""
+        import asyncio
+        sid = db.add_supplier("@test_idem_src", channel_id=-100106, db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 206, "Same text", None, "published",
+            "Same text", "Same text",
+            published_message_id=906, db_path=self._test_db,
+        )
+
+        class MockTeleClient:
+            def __init__(self):
+                self.edited_messages = []
+            def is_connected(self):
+                return True
+            async def edit_message(self, *a, **kw):
+                self.edited_messages.append(1)
+
+        class MockMsg:
+            id = 206
+            text = "Same text"
+
+        class MockChat:
+            id = -100106
+            username = "test_idem_src"
+
+        class MockEvent:
+            chat_id = -100106
+            chat = MockChat()
+            message = MockMsg()
+
+        mock_user = MockTeleClient()
+        asyncio.run(self.main_mod.process_edited_message(mock_user, MockEvent(), None))
+        self.assertEqual(len(mock_user.edited_messages), 0)
+
+    def test_task1_apply_and_ignore_edit_callbacks(self):
+        """Admin bot apply_edit and ignore_edit callback handlers function properly."""
+        import asyncio
+        sid = db.add_supplier("@test_cb_src", channel_id=-100107, db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 207, "Old text", None, "published",
+            "Old text", "Old text",
+            published_message_id=907, db_path=self._test_db,
+        )
+        db.set_setting(f"pending_edit:{lid}", "Netflix 4K UHD\nFast delivery", db_path=self._test_db)
+
+        class MockTeleClient:
+            def __init__(self):
+                self.edited_messages = []
+            def is_connected(self):
+                return True
+            async def edit_message(self, peer, msg_id, text, **kw):
+                self.edited_messages.append({"peer": peer, "msg_id": msg_id, "text": text})
+
+        mock_user = MockTeleClient()
+        self.admin_bot.set_user_client(mock_user)
+
+        class FakeBot:
+            def __init__(self):
+                self.handlers = []
+            def on(self, filt):
+                def deco(fn):
+                    self.handlers.append((filt, fn))
+                    return fn
+                return deco
+            def is_connected(self):
+                return True
+
+        fake_bot = FakeBot()
+        self.admin_bot.setup_admin_handlers(fake_bot)
+        callback_handler = next(
+            (fn for _, fn in fake_bot.handlers if getattr(fn, "__name__", "") == "handle_callback"),
+            None,
+        )
+        self.assertIsNotNone(callback_handler)
+
+        class MockCbEvent:
+            def __init__(self, data_bytes):
+                self.sender_id = self.admin_bot.ADMIN_USER_ID if hasattr(self, "admin_bot") else 555000111
+                self.data = data_bytes
+                self.answered = []
+                self.client = fake_bot
+            async def answer(self, text=None, alert=False):
+                self.answered.append({"text": text, "alert": alert})
+            async def edit(self, text=None, buttons=None, parse_mode=None):
+                pass
+            async def delete(self):
+                pass
+
+        ev = MockCbEvent(f"apply_edit:{lid}".encode("utf-8"))
+        ev.sender_id = self.admin_bot.ADMIN_USER_ID
+        asyncio.run(callback_handler(ev))
+
+        self.assertEqual(len(mock_user.edited_messages), 1)
+        self.assertIn("Netflix 4K UHD", mock_user.edited_messages[0]["text"])
+        audits = db.get_audit_logs(limit=10, db_path=self._test_db)
+        self.assertTrue(any(a["action"] == "edit_applied_manual" for a in audits))
+        self.assertIsNone(db.get_setting(f"pending_edit:{lid}", db_path=self._test_db))
+
+        # Test ignore_edit
+        db.set_setting(f"pending_edit:{lid}", "Some text", db_path=self._test_db)
+        ev_ignore = MockCbEvent(f"ignore_edit:{lid}".encode("utf-8"))
+        ev_ignore.sender_id = self.admin_bot.ADMIN_USER_ID
+        asyncio.run(callback_handler(ev_ignore))
+        self.assertIsNone(db.get_setting(f"pending_edit:{lid}", db_path=self._test_db))
+        audits = db.get_audit_logs(limit=10, db_path=self._test_db)
+        self.assertTrue(any(a["action"] == "edit_ignored" for a in audits))
+
+    # -------------------------------------------------------------
+    # TASK 2: Widen sanitizer
+    # -------------------------------------------------------------
+    def test_task2_sanitizer_regex_positives(self):
+        """Sanitizer regexes match URLs, handles, emails, phones, and crypto addresses."""
+        self.assertTrue(filters.URL_PATTERN.search("https://example.com/test"))
+        self.assertTrue(filters.URL_PATTERN.search("t.me/cryptochat"))
+        self.assertTrue(filters.URL_PATTERN.search("telegram.me/join"))
+        self.assertTrue(filters.URL_PATTERN.search("www.deal.xyz"))
+
+        self.assertTrue(filters.HANDLE_PATTERN.search("@seller_handle"))
+        self.assertTrue(filters.HANDLE_PATTERN.search("contact @tradebot for info"))
+
+        self.assertTrue(filters.EMAIL_PATTERN.search("buyer@example.com"))
+
+        self.assertTrue(filters.PHONE_PATTERN.search("+12345678901"))
+        self.assertTrue(filters.PHONE_PATTERN.search("+44 7911 123456"))
+
+        # Crypto patterns
+        self.assertTrue(filters.CRYPTO_ADDRESS_PATTERN.search("0x71C834586251299761424E6774c83e20e3E9a3C2"))
+        self.assertTrue(filters.CRYPTO_ADDRESS_PATTERN.search("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"))
+        self.assertTrue(filters.CRYPTO_ADDRESS_PATTERN.search("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"))
+        self.assertTrue(filters.CRYPTO_ADDRESS_PATTERN.search("T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb"))
+        self.assertTrue(filters.CRYPTO_ADDRESS_PATTERN.search("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"))
+
+    def test_task2_sanitizer_regex_negatives(self):
+        """Sanitizer regexes do NOT match valid account specifications."""
+        for text in ("4K UHD", "1 Month", "Hetzner CX22", "Price  DM", "2FA", "Windows 11", "3 Months", "60 FPS"):
+            self.assertIsNone(filters.URL_PATTERN.search(text), f"False positive URL in {text}")
+            self.assertIsNone(filters.HANDLE_PATTERN.search(text), f"False positive handle in {text}")
+            self.assertIsNone(filters.EMAIL_PATTERN.search(text), f"False positive email in {text}")
+            self.assertIsNone(filters.PHONE_PATTERN.search(text), f"False positive phone in {text}")
+            self.assertIsNone(filters.CRYPTO_ADDRESS_PATTERN.search(text), f"False positive crypto in {text}")
+
+    def test_task2_first_line_lost_routes_to_pending_approval(self):
+        """When offending tokens in the first line cause it to be dropped, ok is False."""
+        content = ["https://t.me/supplier_channel", "Netflix 4K UHD", "1 Month"]
+        sanitized, ok = parser.prepare_body(content, "\n".join(content))
+        self.assertFalse(ok)
+        self.assertNotIn("https://t.me/supplier_channel", sanitized)
+
+    # -------------------------------------------------------------
+    # TASK 3: Gate deterministic fallback
+    # -------------------------------------------------------------
+    def test_task3_fallback_never_autopublishes_by_default(self):
+        """Deterministic fallback NEVER auto-publishes by default (FALLBACK_AUTOPUBLISH=0)."""
+        self.main_mod.FALLBACK_AUTOPUBLISH = False
+        ok = self.main_mod.deterministic_fallback_publish_ok(
+            paused=False,
+            risky_keyword=None,
+            has_payment_proof=None,
+            has_clear_signal=True,
+            body_ok=True,
+            raw_text="WTB Netflix 1 Month",
+            rendered_body="Netflix 1 Month",
+            platform="netflix",
+        )
+        self.assertFalse(ok)
+
+    def test_task3_fallback_autopublishes_when_enabled_and_all_criteria_met(self):
+        """When FALLBACK_AUTOPUBLISH=1 and all gates pass, fallback auto-publish is allowed."""
+        self.main_mod.FALLBACK_AUTOPUBLISH = True
+        ok = self.main_mod.deterministic_fallback_publish_ok(
+            paused=False,
+            risky_keyword=None,
+            has_payment_proof=None,
+            has_clear_signal=True,
+            body_ok=True,
+            raw_text="WTB Netflix 1 Month account",
+            rendered_body="Netflix 1 Month account",
+            platform="netflix",
+        )
+        self.assertTrue(ok)
+
+    def test_task3_fallback_rejections(self):
+        """Deterministic fallback rejects sell phrases, unknown platforms, payment proofs, and keywords."""
+        self.main_mod.FALLBACK_AUTOPUBLISH = True
+        # Sell phrase
+        self.assertFalse(self.main_mod.deterministic_fallback_publish_ok(
+            paused=False, risky_keyword=None, has_payment_proof=None, has_clear_signal=True, body_ok=True,
+            raw_text="WTS Netflix 1 Month", rendered_body="Netflix 1 Month", platform="netflix",
+        ))
+        # Unknown platform
+        self.assertFalse(self.main_mod.deterministic_fallback_publish_ok(
+            paused=False, risky_keyword=None, has_payment_proof=None, has_clear_signal=True, body_ok=True,
+            raw_text="WTB UnknownThing 1 Month", rendered_body="UnknownThing 1 Month", platform=None,
+        ))
+        # Payment proof
+        self.assertFalse(self.main_mod.deterministic_fallback_publish_ok(
+            paused=False, risky_keyword=None, has_payment_proof="proof", has_clear_signal=True, body_ok=True,
+            raw_text="WTB Netflix 1 Month", rendered_body="Netflix 1 Month", platform="netflix",
+        ))
+        # Risky keyword
+        self.assertFalse(self.main_mod.deterministic_fallback_publish_ok(
+            paused=False, risky_keyword="hacked", has_payment_proof=None, has_clear_signal=True, body_ok=True,
+            raw_text="WTB Netflix 1 Month", rendered_body="Netflix 1 Month", platform="netflix",
+        ))
+
+    def test_task3_check_buyer_framing(self):
+        """rules.check_buyer_framing strictly rejects seller framing."""
+        self.assertTrue(self.rules.check_buyer_framing(["WTB Netflix 4K", "Fast deal"]))
+        self.assertTrue(self.rules.check_buyer_framing("WTB Bybit KYC"))
+
+        self.assertFalse(self.rules.check_buyer_framing(["WTS Netflix 4K", "Fast deal"]))
+        self.assertFalse(self.rules.check_buyer_framing("Selling Netflix accounts in stock"))
+        self.assertFalse(self.rules.check_buyer_framing("Accounts available for sale now"))
+        self.assertFalse(self.rules.check_buyer_framing("Stock available: 50 accounts"))
+
+    # -------------------------------------------------------------
+    # TASK 4: Retention and data integrity
+    # -------------------------------------------------------------
+    def test_task4_post_counter_atomic_and_survives_purges(self):
+        """Post counter increments atomically in app_settings and survives purges."""
+        db.set_setting("post_counter", "50", db_path=self._test_db)
+        p1 = db.next_post_number(db_path=self._test_db)
+        p2 = db.next_post_number(db_path=self._test_db)
+        self.assertEqual(p1, 51)
+        self.assertEqual(p2, 52)
+
+        # Run purge
+        db.purge_expired_data(0, db_path=self._test_db)
+
+        p3 = db.next_post_number(db_path=self._test_db)
+        self.assertEqual(p3, 53)
+
+    def test_task4_purge_fk_integrity_and_protected_statuses(self):
+        """Purge deletes children before parents with FK enabled and preserves protected statuses."""
+        sid = db.add_supplier("@test_purge_src", channel_id=-100108, db_path=self._test_db)
+        # 1. Unprotected listing (skipped_filter)
+        lid1 = db.insert_listing(
+            sid, 301, "Skip text", None, "skipped_filter",
+            "Skip text", "Skip text", db_path=self._test_db,
+        )
+        # Add referencing rows
+        did = db.add_destination("-10099902", "Dest Group 2", active=True, db_path=self._test_db)
+        db.queue_forwarding(lid1, "-10099902", 701, db_path=self._test_db)
+        db.record_audit("skipped_test", lid1, detail="audit", db_path=self._test_db)
+
+        # 2. Protected listings (held, received, pending_approval, pending_review, approved, publishing)
+        protected_ids = []
+        for st in ("held", "received", "pending_approval", "pending_review", "approved", "publishing"):
+            plid = db.insert_listing(
+                sid, 3000 + len(protected_ids), f"Text {st}", None, st,
+                f"Text {st}", f"Text {st}", db_path=self._test_db,
+            )
+            protected_ids.append(plid)
+
+        # Backdate all rows by 50 hours
+        with sqlite3.connect(self._test_db) as conn:
+            old_time = (datetime.now(timezone.utc) - timedelta(hours=50)).isoformat()
+            conn.execute("UPDATE listings SET created_at = ?", (old_time,))
+            conn.execute("UPDATE forwardings SET created_at = ?", (old_time,))
+            conn.execute("UPDATE audit_log SET created_at = ?", (old_time,))
+            conn.commit()
+
+        # Run purge with foreign keys on
+        counts = db.purge_expired_data(24, db_path=self._test_db)
+        self.assertGreater(counts.get("listings", 0), 0)
+
+        # Unprotected listing is purged
+        self.assertIsNone(db.get_listing_by_id(lid1, db_path=self._test_db))
+
+        # ALL protected listings MUST survive
+        for plid in protected_ids:
+            row = db.get_listing_by_id(plid, db_path=self._test_db)
+            self.assertIsNotNone(row, f"Protected listing {plid} was erroneously purged!")
+
+    # -------------------------------------------------------------
+    # TASK 5: Crash recovery for received
+    # -------------------------------------------------------------
+    def test_task5_claim_stale_received_listing(self):
+        """Stale received listings older than threshold are claimed atomically for recovery."""
+        sid = db.add_supplier("@test_rec_src", channel_id=-100109, db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 401, "Stale text", None, "received",
+            "Stale text", "Stale text", db_path=self._test_db,
+        )
+        old_time = (datetime.now(timezone.utc) - timedelta(seconds=200)).isoformat()
+        with sqlite3.connect(self._test_db) as conn:
+            conn.execute("UPDATE listings SET received_at = ? WHERE id = ?", (old_time, lid))
+            conn.commit()
+
+        claimed = db.claim_stale_received_listing(stale_threshold_seconds=120, limit=5, db_path=self._test_db)
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["id"], lid)
+
+        # Re-running claim immediately finds none (atomic claim avoids duplicate pickup)
+        second_claimed = db.claim_stale_received_listing(stale_threshold_seconds=120, limit=5, db_path=self._test_db)
+        self.assertEqual(len(second_claimed), 0)
+
+    # -------------------------------------------------------------
+    # TASK 6: Fingerprint and quarantine
+    # -------------------------------------------------------------
+    def test_task6_dedup_ignore_price(self):
+        """DEDUP_IGNORE_PRICE switch controls whether prices affect fingerprints."""
+        fp1 = db.make_listing_fingerprint("WTB Netflix 1 Month $40", ignore_price=True)
+        fp2 = db.make_listing_fingerprint("WTB Netflix 1 Month $50", ignore_price=True)
+        self.assertEqual(fp1, fp2)
+
+        fp3 = db.make_listing_fingerprint("WTB Netflix 1 Month $40", ignore_price=False, price=40.0)
+        fp4 = db.make_listing_fingerprint("WTB Netflix 1 Month $50", ignore_price=False, price=50.0)
+        self.assertNotEqual(fp3, fp4)
+
+    def test_task6_quarantine_claims_winner_and_concurrent_twins(self):
+        """Quarantine claim marks concurrently held twins as skipped_duplicate."""
+        sid = db.add_supplier("@test_quar_src", channel_id=-100110, db_path=self._test_db)
+        past_hold = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        future_hold = (datetime.now(timezone.utc) + timedelta(seconds=95)).isoformat()
+
+        fp = "netflix:1month4kuhd"
+        lid_winner = db.insert_listing(
+            sid, 501, "Netflix", None, "held",
+            "Netflix 1 Month 4K", "Netflix 1 Month 4K",
+            fingerprint=fp,
+            hold_until=past_hold, db_path=self._test_db,
+        )
+        lid_twin = db.insert_listing(
+            sid, 502, "Netflix", None, "held",
+            "Netflix 1 Month 4K", "Netflix 1 Month 4K",
+            fingerprint=fp,
+            hold_until=future_hold, db_path=self._test_db,
+        )
+
+        won_id = db.claim_held_listing(lid_winner, hours=6, db_path=self._test_db)
+        self.assertEqual(won_id, lid_winner)
+
+        # Twin must be marked skipped_duplicate immediately with duplicate_of = winner_id
+        twin_row = db.get_listing_by_id(lid_twin, db_path=self._test_db)
+        self.assertEqual(twin_row["status"], "skipped_duplicate")
+        self.assertEqual(twin_row["duplicate_of"], lid_winner)
+
+    # -------------------------------------------------------------
+    # TASK 7: AI configuration
+    # -------------------------------------------------------------
+    def test_task7_groq_temperature_clamped(self):
+        """GROQ_TEMPERATURE is clamped between 0.0 and 0.3."""
+        self.assertGreaterEqual(ai_rephraser.GROQ_TEMPERATURE, 0.0)
+        self.assertLessEqual(ai_rephraser.GROQ_TEMPERATURE, 0.3)
+
+    def test_task7_strict_ai_schema_validation(self):
+        """validate_ai_schema validates strict AI JSON schema."""
+        valid_payload = {
+            "is_listing": True,
+            "intent": "buy",
+            "platform": "netflix",
+            "content": ["1 Month", "4K UHD"],
+            "price": 0,
+            "blocked": False,
+        }
+        self.assertTrue(ai_rephraser.validate_ai_schema(valid_payload))
+
+        # Unknown intent
+        self.assertFalse(ai_rephraser.validate_ai_schema({**valid_payload, "intent": "trade"}))
+        # Non-list content
+        self.assertFalse(ai_rephraser.validate_ai_schema({**valid_payload, "content": "not a list"}))
+        # Item > 500 chars
+        self.assertFalse(ai_rephraser.validate_ai_schema({**valid_payload, "content": ["A" * 501]}))
+        # Negative price
+        self.assertFalse(ai_rephraser.validate_ai_schema({**valid_payload, "price": -5}))
+
+    # -------------------------------------------------------------
+    # TASK 8: Custom emoji / Premium check
+    # -------------------------------------------------------------
+    def test_task8_premium_status_and_fallback_preview(self):
+        """user_client_premium='0' displays fallback warnings and preview notes."""
+        import asyncio
+        db.set_setting("user_client_premium", "0", db_path=self._test_db)
+        status_text = self.admin_bot._status_report_text()
+        self.assertIn("not Telegram Premium", status_text)
+
+        preview_text = asyncio.run(self.admin_bot._build_preview_text({
+            "id": 1, "clean_text": "Netflix 1 Month", "raw_text": "Netflix 1 Month",
+        }))
+        self.assertIn("_(preview uses fallback glyphs)_", preview_text)
+
+    # -------------------------------------------------------------
+    # TASK 9: Status naming & docs consistency
+    # -------------------------------------------------------------
+    def test_task9_status_definitions(self):
+        """Verify pending_review is used for risk items and pending_approval for ambiguity."""
+        # Risk item (payment proof) -> pending_review
+        self.assertTrue(filters.detect_payment_proof("proof of payment confirmed 100 USDT"))
+        # Category blocked -> pending_review
+        self.assertTrue(filters.check_category_blocked("Need sumsub verification", "sumsub", ["kyc"]))
+
+    # -------------------------------------------------------------
+    # TASK 10: Security and ops
+    # -------------------------------------------------------------
+    def test_task10_unauthorized_callbacks_rejected(self):
+        """Every callback handler rejects non-admin senders with a silent answer and audit log."""
+        import asyncio
+
+        class FakeBot:
+            def __init__(self):
+                self.handlers = []
+            def on(self, filt):
+                def deco(fn):
+                    self.handlers.append((filt, fn))
+                    return fn
+                return deco
+            def is_connected(self):
+                return True
+
+        fake_bot = FakeBot()
+        self.admin_bot.setup_admin_handlers(fake_bot)
+        callback_handler = next(
+            (fn for _, fn in fake_bot.handlers if getattr(fn, "__name__", "") == "handle_callback"),
+            None,
+        )
+        self.assertIsNotNone(callback_handler)
+
+        class MockEvent:
+            def __init__(self, data_bytes):
+                self.sender_id = 999999999  # NOT admin
+                self.data = data_bytes
+                self.answered = False
+                self.client = fake_bot
+            async def answer(self, text=None, alert=False):
+                self.answered = True
+
+        prefixes = [
+            b"approve:1",
+            b"skip:1",
+            b"apply_edit:1",
+            b"ignore_edit:1",
+            b"destdel:confirm_dead",
+            b"sold:1",
+            b"sold_info:1",
+            b"home:view",
+            b"menu:settings",
+        ]
+        for p in prefixes:
+            ev = MockEvent(p)
+            asyncio.run(callback_handler(ev))
+            self.assertTrue(ev.answered, f"Callback {p} must answer silently for non-admin")
+
+        audits = db.get_audit_logs(limit=20, db_path=self._test_db)
+        unauth_count = sum(1 for a in audits if a["action"] == "unauthorized_callback")
+        self.assertEqual(unauth_count, len(prefixes))
+
+    def test_task10_gitignore_and_deploy_workflow(self):
+        """Verify .gitignore and deploy.yml configurations."""
+        with open(".gitignore", "r", encoding="utf-8") as f:
+            gi = f.read()
+            self.assertIn("*.session", gi)
+            self.assertIn("*.session-journal", gi)
+            self.assertIn("monitor.db*", gi)
+            self.assertIn(".env", gi)
+            self.assertIn("monitor.log*", gi)
+
+        with open(".github/workflows/deploy.yml", "r", encoding="utf-8") as f:
+            dep = f.read()
+            self.assertIn("python -m unittest test_system", dep)
+            self.assertIn("systemctl is-active --quiet tele-monitor", dep)
+
+    # -------------------------------------------------------------
+    # TASK 11: Category allowlist
+    # -------------------------------------------------------------
+    def test_task11_blocked_platform_categories(self):
+        """BLOCKED_PLATFORM_CATEGORIES blocks specified platform categories."""
+        self.assertTrue(filters.check_category_blocked("Need sumsub KYC", "sumsub", ["kyc"]))
+        self.assertFalse(filters.check_category_blocked("Need netflix", "netflix", ["kyc"]))
+        self.assertFalse(filters.check_category_blocked("Need sumsub KYC", "sumsub", []))
+
+    # -------------------------------------------------------------
+    # SECTION 2 HARD INVARIANTS REGRESSION TESTS
+    # -------------------------------------------------------------
+    def test_invariant_buyer_only_framing(self):
+        """Hard Invariant 1: Buyer-only framing. WTS/selling content is NEVER published."""
+        self.assertFalse(self.rules.check_buyer_framing("WTS Bybit account with full KYC"))
+        self.assertFalse(self.rules.check_buyer_framing("Selling Netflix 4K UHD accounts"))
+
+    def test_invariant_no_prices_in_posts(self):
+        """Hard Invariant 2: No prices in posts. Always Price  DM."""
+        msg, _ = parser.build_ai_message(
+            content_lines=["Netflix 1 Month 4K"],
+            platform="netflix",
+            contact_username="@buyer",
+            source_text="Netflix $50 for 1 month",
+        )
+        self.assertIn("🤑 Price  DM", msg)
+        self.assertNotIn("$50", msg)
+
+    def test_invariant_payment_proofs_never_autopublished(self):
+        """Hard Invariant 3: Payment proofs never auto-published; routed to admin review."""
+        proof_text = "Transaction completed: proof of payment for 50 USDT"
+        self.assertTrue(filters.detect_payment_proof(proof_text))
+
+    def test_invariant_utf16_offsets(self):
+        """Hard Invariant 5: UTF-16 offsets via _utf16_len."""
+        text = "🔥 WTB Bybit ⚡"
+        utf16_len = parser._utf16_len(text)
+        expected = len(text.encode("utf-16-le")) // 2
+        self.assertEqual(utf16_len, expected)
+
+    def test_invariant_atomic_claims(self):
+        """Hard Invariant 9: Atomic claims prevent race conditions."""
+        sid = db.add_supplier("@test_claim_src", channel_id=-100111, db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 601, "Claim test", "fp_claim", "approved",
+            "Claim test", "Claim test", db_path=self._test_db,
+        )
+        c1 = db.claim_listing_for_publish(lid, post_number=100, db_path=self._test_db)
+        self.assertTrue(c1)
+        # Second concurrent claim fails
+        c2 = db.claim_listing_for_publish(lid, post_number=100, db_path=self._test_db)
+        self.assertFalse(c2)
+
+
+class TestLatencyAndDelaysPerformance(unittest.IsolatedAsyncioTestCase):
+    """Verify elimination of all pipeline delays and event-driven wakeups."""
+
+    async def asyncSetUp(self):
+        self._test_db = f"test_perf_{int(time.time() * 1000)}_{os.getpid()}.db"
+        db.init_db(self._test_db)
+        self._orig_db_path = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = self._test_db
+
+    async def asyncTearDown(self):
+        db.DEFAULT_DB_PATH = self._orig_db_path
+        if os.path.exists(self._test_db):
+            try:
+                os.remove(self._test_db)
+            except Exception:
+                pass
+
+    async def test_instant_quarantine_hold_zero(self):
+        """When QUARANTINE_SECONDS is 0, messages are immediately due upon arrival."""
+        import main
+        orig_q = main.QUARANTINE_SECONDS
+        try:
+            main.QUARANTINE_SECONDS = 0
+            sid = db.add_supplier("@fast_src", channel_id=-100888, db_path=self._test_db)
+            msg = _P5FakeMsg(88001, text="WTB Binance account $100", media=None, chat=_types.SimpleNamespace(id=-100888))
+            fake_user = _P5FakeUserClient()
+            fake_bot = _P5FakeBot()
+
+            # Ensure wake event starts clear
+            main.get_wake_held_worker().clear()
+            await main._process_supplier_message(fake_user, fake_bot, {"id": sid, "channel_username": "fast_src", "channel_id": -100888}, msg)
+
+            # 1. Wake event is fired immediately
+            self.assertTrue(main.get_wake_held_worker().is_set())
+
+            # 2. Row is immediately due in DB without needing any _release_hold
+            due = db.get_held_listings_due(limit=10, db_path=self._test_db)
+            self.assertEqual(len(due), 1)
+            self.assertEqual(due[0]["source_message_id"], 88001)
+        finally:
+            main.QUARANTINE_SECONDS = orig_q
+
+    async def test_wake_forward_worker_on_enqueue(self):
+        """Enqueueing destination forwardings instantly triggers wake_forward_worker."""
+        import main
+        main.get_wake_forward_worker().clear()
+        self.assertFalse(main.get_wake_forward_worker().is_set())
+
+        main.wake_forward_worker()
+        self.assertTrue(main.get_wake_forward_worker().is_set())
+
+    async def test_wake_approved_worker_on_approval(self):
+        """Admin bot approval triggers wake_approved_worker instantly."""
+        import main
+        import admin_bot
+        admin_bot.set_on_approve_callback(main.wake_approved_worker)
+        main.get_wake_approved_worker().clear()
+        self.assertFalse(main.get_wake_approved_worker().is_set())
+
+        admin_bot.notify_approved()
+        self.assertTrue(main.get_wake_approved_worker().is_set())
+
+    async def test_supplier_cache_fast_path(self):
+        """Verified supplier chat_id is resolved and cached without repeated DB queries."""
+        import main
+        main.invalidate_supplier_cache()
+        sid = db.add_supplier("@cache_src", channel_id=-100999, db_path=self._test_db)
+
+        fake_event = _types.SimpleNamespace(
+            chat_id=-100999,
+            chat=_types.SimpleNamespace(username="cache_src"),
+        )
+        # First lookup
+        sup1 = await main.resolve_supplier_for_event(fake_event)
+        self.assertIsNotNone(sup1)
+        self.assertEqual(sup1["id"], sid)
+
+        # Second lookup hits in-memory cache directly
+        self.assertIn(-100999, main._supplier_cache_by_chat_id)
+        sup2 = await main.resolve_supplier_for_event(fake_event)
+        self.assertEqual(sup2["id"], sid)
+
+        # Non-supplier chat is negative cached
+        non_event = _types.SimpleNamespace(chat_id=-100123456, chat=_types.SimpleNamespace(username=None))
+        res = await main.resolve_supplier_for_event(non_event)
+        self.assertIsNone(res)
+        self.assertIn(-100123456, main._supplier_neg_cache)
+
+
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main()

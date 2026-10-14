@@ -15,7 +15,7 @@ from typing import Optional
 
 from telethon.errors import FloodWaitError
 
-PUBLISH_INTERVAL = float(os.environ.get("PUBLISH_INTERVAL", "1.5") or 1.5)
+PUBLISH_INTERVAL = float(os.environ.get("PUBLISH_INTERVAL", "0.5") or 0.5)
 
 logger = logging.getLogger("publish_guard")
 

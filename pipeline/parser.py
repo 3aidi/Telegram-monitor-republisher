@@ -227,11 +227,8 @@ def _is_leaky_line(raw: str, probe: str, low: str) -> bool:
     """True when a body line must not ship (leaked price, @handle, pure DM).
 
     ``probe`` is the NFKC-folded, emoji-stripped, single-spaced line; ``raw``
-    is the original. Real email addresses are treated as content so an account
-    id like ``user@example.com`` is never dropped as a handle.
+    is the original.
     """
-    if _EMAIL_RE.search(low):
-        return False
     if _is_styled_digit_price(raw, probe):
         return True
     if _HANDLE_RE.search(probe):
@@ -251,35 +248,85 @@ def _is_leaky_line(raw: str, probe: str, low: str) -> bool:
     return False
 
 
-def sanitize_body_lines(content_lines, max_lines: int = 40) -> List[str]:
-    """Drop leaked source prices, supplier @handles and pure DM lines from the
-    body, and erase mid-line money blobs. Keeps the original text of every
-    line that survives so the AI's wording stays intact."""
+def sanitize_body_lines_detailed(content_lines, max_lines: int = 40) -> Tuple[List[str], bool]:
+    """Sanitize body lines, stripping URLs, handles, emails, phone numbers,
+    crypto wallet addresses, money blobs, and asterisks.
+
+    Returns (kept_lines, first_line_lost).
+    If a line becomes empty or meaningless, it is dropped. If the very first
+    line (platform line) is dropped, first_line_lost is True.
+    """
+    from pipeline.filters import (
+        CRYPTO_ADDRESS_PATTERN,
+        EMAIL_PATTERN,
+        HANDLE_PATTERN,
+        PHONE_PATTERN,
+        URL_PATTERN,
+    )
+
     kept: List[str] = []
+    first_line_lost = False
+    first_candidate_processed = False
+
     for raw_ln in content_lines or []:
         ln = (raw_ln or "").strip()
         if not ln:
             continue
-        probe = re.sub(
-            r"\s+", " ", emoji.replace_emoji(_nfkc(ln), replace=" ")
-        ).strip()
-        if not probe:
-            continue
-        if _is_leaky_line(ln, probe, probe.lower()):
-            continue
-        stripped = _PRICE_BLOB_RE.sub("", ln)
-        # Strip literal markdown-bold syntax ("**ESTY KYC**") and lone single
-        # asterisks used the same way. THE published-post send passes
-        # formatting_entities WITHOUT parse_mode, so Telethon never interprets
-        # "**" as bold — without this, asterisks would leak into the post as
-        # literal characters. This runs in the ONE shared sanitizer each render
-        # path goes through (auto-publish, approve, preview).
+
+        # Strip offending tokens: URLs, handles, emails, phones, crypto addresses
+        stripped = URL_PATTERN.sub("", ln)
+        stripped = HANDLE_PATTERN.sub("", stripped)
+        stripped = EMAIL_PATTERN.sub("", stripped)
+        stripped = PHONE_PATTERN.sub("", stripped)
+        stripped = CRYPTO_ADDRESS_PATTERN.sub("", stripped)
+        stripped = _PRICE_BLOB_RE.sub("", stripped)
         stripped = stripped.replace("**", "").replace("*", "")
-        stripped = re.sub(r"\s{2,}", " ", stripped).strip()
-        if stripped:
-            kept.append(stripped)
+        stripped = re.sub(r"\s+", " ", stripped).strip(" \t-–—,:|")
+
+        has_offending = bool(
+            URL_PATTERN.search(ln)
+            or HANDLE_PATTERN.search(ln)
+            or EMAIL_PATTERN.search(ln)
+            or PHONE_PATTERN.search(ln)
+            or CRYPTO_ADDRESS_PATTERN.search(ln)
+        )
+
+        # Check if line became empty or meaningless (no alphanumeric chars)
+        if not stripped or not re.search(r"[a-zA-Z0-9]", stripped):
+            if not first_candidate_processed:
+                if has_offending:
+                    first_line_lost = True
+                first_candidate_processed = True
+            continue
+
+        probe = re.sub(
+            r"\s+", " ", emoji.replace_emoji(_nfkc(stripped), replace=" ")
+        ).strip()
+        if not probe or not re.search(r"[a-zA-Z0-9]", probe):
+            if not first_candidate_processed:
+                if has_offending:
+                    first_line_lost = True
+                first_candidate_processed = True
+            continue
+
+        if _is_leaky_line(stripped, probe, probe.lower()):
+            if not first_candidate_processed:
+                first_candidate_processed = True
+            continue
+
+        first_candidate_processed = True
+        kept.append(stripped)
         if len(kept) >= max_lines:
             break
+
+    return kept, first_line_lost
+
+
+def sanitize_body_lines(content_lines, max_lines: int = 40) -> List[str]:
+    """Drop leaked source prices, supplier @handles, URLs, emails, phones, crypto
+    addresses and pure DM lines from the body.
+    """
+    kept, _ = sanitize_body_lines_detailed(content_lines, max_lines=max_lines)
     return kept
 
 
@@ -289,11 +336,12 @@ def prepare_body(
     """Sanitize the body and decide whether it is safe to AUTO-publish.
 
     Returns (lines, ok). ``ok`` is False when the cleaned body is too thin to
-    represent a real listing (fewer than two lines, or nothing substantive) —
-    such messages must go to admin approval instead of the auto-publish path.
+    represent a real listing (fewer than two lines, or nothing substantive)
+    or when the first line (platform line) was lost during sanitization.
+    Such messages route to admin approval instead of auto-publishing.
     """
-    lines = sanitize_body_lines(content_lines)
-    ok = len(lines) >= 2 and any(len(ln.strip()) >= 8 for ln in lines)
+    lines, first_line_lost = sanitize_body_lines_detailed(content_lines)
+    ok = len(lines) >= 2 and any(len(ln.strip()) >= 8 for ln in lines) and not first_line_lost
     return lines, ok
 
 

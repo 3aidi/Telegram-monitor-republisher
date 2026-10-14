@@ -163,6 +163,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 published_at TEXT,
                 fingerprint TEXT,
                 intent TEXT,
+                received_at TEXT,
                 FOREIGN KEY(supplier_id) REFERENCES suppliers(id)
             );
             """
@@ -598,10 +599,47 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if version < 12:
         cursor.execute("PRAGMA user_version = 12")
 
+    # v13: Crash recovery for received listings + post_counter persistence
+    _v13_listings_info = cursor.execute("PRAGMA table_info(listings)").fetchall()
+    if _v13_listings_info:
+        _v13_cols = {r["name"] for r in _v13_listings_info}
+        if "received_at" not in _v13_cols:
+            cursor.execute("ALTER TABLE listings ADD COLUMN received_at TEXT")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_listings_received_at ON listings(status, received_at);"
+            )
+
+    # Initialize post_counter in app_settings from MAX(post_number) or post_seq
+    _post_counter_row = cursor.execute(
+        "SELECT value FROM app_settings WHERE key = 'post_counter'"
+    ).fetchone()
+    if not _post_counter_row:
+        _cur_max = 0
+        if "post_number" in _v13_cols:
+            _max_row = cursor.execute(
+                "SELECT MAX(post_number) AS mx FROM listings"
+            ).fetchone()
+            _cur_max = _max_row["mx"] if _max_row and _max_row["mx"] is not None else 0
+        _seq_row = cursor.execute(
+            "SELECT value FROM app_settings WHERE key = 'post_seq'"
+        ).fetchone()
+        if _seq_row and _seq_row["value"]:
+            try:
+                _cur_max = max(int(_cur_max), int(_seq_row["value"]))
+            except (ValueError, TypeError):
+                pass
+        cursor.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES ('post_counter', ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(_cur_max), datetime.now(timezone.utc).isoformat()),
+        )
+    if version < 13:
+        cursor.execute("PRAGMA user_version = 13")
+
 # Schema objects the running code depends on. Used by verify_schema() so a
 # diverged database is reported loudly at startup instead of failing later
 # inside a worker, where the traceback is easy to miss.
-_REQUIRED_LISTINGS_COLUMNS = ("hold_until", "duplicate_of", "header_id")
+_REQUIRED_LISTINGS_COLUMNS = ("hold_until", "duplicate_of", "header_id", "received_at")
 
 def verify_schema(db_path: str = None) -> list:
     """Return the list of required columns missing from `listings` (empty = ok).

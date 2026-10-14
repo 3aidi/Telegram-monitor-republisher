@@ -59,6 +59,7 @@ class ListingItem:
     header_id: Optional[int] = None
     supplier_username: Optional[str] = None
     supplier_display_name: Optional[str] = None
+    received_at: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: Union[Mapping[str, Any], Any]) -> "ListingItem":
@@ -93,6 +94,7 @@ class ListingItem:
             header_id=_extract_val(row, "header_id"),
             supplier_username=_extract_val(row, "supplier_username"),
             supplier_display_name=_extract_val(row, "supplier_display_name"),
+            received_at=_extract_val(row, "received_at"),
         )
 
     def to_dict(self) -> dict[str, Any]:

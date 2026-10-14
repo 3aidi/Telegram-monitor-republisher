@@ -85,13 +85,13 @@ REVIEW_ACTIONS = "Approve → Publish  |  Skip → Later"
 REVIEW_CARD = (
     "{header}\n"
     + LINE + "\n"
-    "Supplier: {source}\n"
-    "Platform: {platform}\n"
-    "{price}\n"
+    "📡 **Supplier:** {source}\n"
+    "🎮 **Platform:** {platform}\n"
+    "💰 **Price:** {price}\n"
     + LINE + "\n"
     "{content}\n"
     + LINE + "\n"
-    "{actions}"
+    "⚡ {actions}"
 )
 REVIEW_PLATFORM_NONE = "—"
 REVIEW_POS_REMAINING = "{remaining} remaining"
@@ -145,8 +145,8 @@ APPROVE_QUEUED = "✅ Listing #{id} queued for republishing."
 PUBLISHED_ALERT = (
     "✅ **Published — Post {post}**\n"
     + LINE + "\n"
-    "{platform}\n"
-    "Supplier: {source}\n"
+    "🎮 **Platform:** `{platform}`\n"
+    "📡 **Supplier:** {source}\n"
     + LINE + "\n"
 )
 PUBLISHED_POST = "#{n}"
@@ -160,8 +160,9 @@ SKIP_ALERT = "⏭️ Skipped — {reason} — Listing #{id}{source}"
 SKIP_ALERT_SOURCE = " from {source}"
 DUP_BURST = (
     "♻️ **Duplicate burst collapsed**\n"
-    "Kept Listing #{winner} from {source}.\n"
-    "{count} identical dropped: {dropped}"
+    + LINE + "\n"
+    "🌟 **Kept Winner:** `#{winner}` from {source}\n"
+    "🗑️ **Dropped {count} Identical:** {dropped}"
 )
 
 # ═══════════════════════════ SKIPPED LIST ═══════════════════════════

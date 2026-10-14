@@ -10,6 +10,8 @@ deploy.zip
 *.db-shm
 *.sqlite
 *.log
+monitor.log*
+monitor.db*
 captured_messages.jsonl
 test_monitor.db
 __pycache__/

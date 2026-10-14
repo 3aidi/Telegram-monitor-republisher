@@ -83,6 +83,56 @@ def set_dest_channel(channel: str, update_db: bool = True) -> str:
     return clean
 
 # Statuses in which a listing may still be edited / approved / skipped. Once a
+# Event callbacks to notify main workers of actions without polling delay
+_on_approve_callback = None
+_on_forward_callback = None
+_on_supplier_change_callback = None
+
+
+def set_on_approve_callback(cb) -> None:
+    """Register a callback invoked whenever a listing is queued/marked approved."""
+    global _on_approve_callback
+    _on_approve_callback = cb
+
+
+def notify_approved() -> None:
+    """Instantly wake the approved-listings worker."""
+    if _on_approve_callback:
+        try:
+            _on_approve_callback()
+        except Exception:
+            pass
+
+
+def set_on_forward_callback(cb) -> None:
+    """Register a callback invoked whenever destination forwardings are enqueued."""
+    global _on_forward_callback
+    _on_forward_callback = cb
+
+
+def notify_forward() -> None:
+    """Instantly wake the destination-forwarding worker."""
+    if _on_forward_callback:
+        try:
+            _on_forward_callback()
+        except Exception:
+            pass
+
+
+def set_on_supplier_change_callback(cb) -> None:
+    """Register a callback invoked whenever suppliers are added/updated/deleted."""
+    global _on_supplier_change_callback
+    _on_supplier_change_callback = cb
+
+
+def notify_supplier_change() -> None:
+    """Invalidate in-memory supplier cache."""
+    if _on_supplier_change_callback:
+        try:
+            _on_supplier_change_callback()
+        except Exception:
+            pass
+
 # listing leaves this set (published, failed, skipped...) any in-flight admin
 # action (edit wizard, Approve tap) must be refused, not silently applied.
 EDITABLE_LISTING_STATUSES = ("pending_approval", "pending_review")
@@ -196,10 +246,14 @@ async def send_approval_prompt(
     buttons.extend(_channel_view_buttons(listing))
 
     try:
-        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
+        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
         logger.info("Sent approval prompt for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
-        logger.exception("Failed to send approval prompt to admin for listing #%s", listing_id)
+        try:
+            await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
+            logger.info("Sent approval prompt (plain fallback) for listing #%s to admin %s", listing_id, admin_id)
+        except Exception:
+            logger.exception("Failed to send approval prompt to admin for listing #%s", listing_id)
 
 
 async def send_review_notification(
@@ -207,19 +261,91 @@ async def send_review_notification(
     admin_id: int,
     listing: dict,
 ) -> None:
-
+    """Actionable review notification card with 1-tap quick actions."""
     listing_id = listing["id"]
     src = _pretty_source(
         listing.get("supplier_username"), listing.get("supplier_display_name")
     )
-    src_part = texts.REVIEW_NOTICE_SOURCE.format(source=src) if src and src != "?" else ""
-    text = texts.REVIEW_NOTICE.format(id=listing_id, source=src_part)
+    src_disp = src if src and src != "?" else "Unknown"
+    platform = (listing.get("platform_name") or listing.get("game_name") or "—").title()
+
+    raw = (listing.get("clean_text") or listing.get("raw_text") or "").strip()
+    if raw:
+        snippet = " ".join(raw.split())
+        if len(snippet) > 160:
+            snippet = snippet[:157] + "..."
+    else:
+        snippet = "*(No text content)*"
+
+    text = (
+        f"📬 **Review Needed — Listing #{listing_id}**\n"
+        f"{texts.LINE}\n"
+        f"📡 **Source:** {src_disp}\n"
+        f"🎮 **Platform:** `{platform}`\n"
+        f"📝 **Snippet:**\n"
+        f"> {snippet}\n"
+        f"{texts.LINE}\n"
+        f"⚡ Tap an action below or `/pending`:"
+    )
+
+    buttons = [
+        [
+            Button.inline("📬 Open Review", data=f"review_open:{listing_id}"),
+            Button.inline("✅ Quick Approve", data=f"approve:{listing_id}"),
+            Button.inline("⏭️ Skip", data=f"skip:{listing_id}"),
+        ]
+    ]
+    row2 = []
+    src_url = _source_url({
+        "supplier_username": listing.get("supplier_username") or listing.get("channel_username"),
+        "supplier_channel_id": listing.get("supplier_channel_id") or listing.get("channel_id"),
+        "source_message_id": listing.get("source_message_id") or listing.get("message_id"),
+    })
+    if src_url:
+        row2.append(Button.url("🔗 Source", src_url))
+    row2.append(Button.inline("🗑️ Dismiss", data="dismiss_msg"))
+    buttons.append(row2)
 
     try:
-        await bot_client.send_message(admin_id, text, parse_mode=None)
+        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
         logger.info("Sent review notification for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
-        logger.exception("Failed to send review notification for listing #%s", listing_id)
+        try:
+            await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
+            logger.info("Sent review notification (fallback) for listing #%s to admin %s", listing_id, admin_id)
+        except Exception:
+            logger.exception("Failed to send review notification for listing #%s", listing_id)
+
+
+async def send_edit_rejected_alert(
+    bot_client: TelegramClient,
+    admin_id: int,
+    listing: dict,
+    old_text: str,
+    new_text: str,
+    reason: str,
+) -> None:
+    """Alert admin when an edited source message is rejected by gates."""
+    listing_id = listing["id"]
+    post_num = listing.get("post_number") or "?"
+    text = (
+        f"⚠️ **Source Edit Rejected by Auto-Gate**\n"
+        f"**Listing #{listing_id}** (**Post #{post_num}**)\n\n"
+        f"**Old Text:**\n{old_text[:300]}\n\n"
+        f"**Edited Source Text:**\n{new_text[:300]}\n\n"
+        f"**Rejection Reason:** {reason}"
+    )
+    buttons = [
+        [
+            Button.inline("✅ Apply", data=f"apply_edit:{listing_id}"),
+            Button.inline("❌ Ignore", data=f"ignore_edit:{listing_id}"),
+        ]
+    ]
+    try:
+        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
+        logger.info("Sent edit rejected alert for listing #%s to admin %s", listing_id, admin_id)
+    except Exception:
+        logger.exception("Failed to send edit rejected alert for listing #%s", listing_id)
 
 
 async def send_published_alert(
@@ -227,26 +353,48 @@ async def send_published_alert(
     admin_id: int,
     listing: dict,
 ) -> None:
-    """Short DM to the admin after every auto-published post."""
-    listing_id = listing["id"]
+    """Executive alert DM to the admin after every auto-published post."""
+    listing_id = listing.get("id")
     post_number = listing.get("post_number")
     platform = (listing.get("platform_name") or listing.get("game_name") or "")[:60]
     post_disp = texts.PUBLISHED_POST.format(n=post_number) if post_number is not None else texts.PUBLISHED_LISTING.format(id=listing_id)
     platform_disp = platform.title() if platform else texts.PLATFORM_UNKNOWN
+    src = _pretty_source(listing.get("supplier_username"), listing.get("supplier_display_name"))
 
-    text = texts.PUBLISHED_ALERT.format(
-        post=post_disp,
-        platform=platform_disp,
-        source=_pretty_source(listing.get("supplier_username"), listing.get("supplier_display_name")),
+    raw = (listing.get("clean_text") or listing.get("raw_text") or "").strip()
+    if raw:
+        snippet = " ".join(raw.split())
+        if len(snippet) > 140:
+            snippet = snippet[:137] + "..."
+    else:
+        snippet = ""
+    snippet_part = f"📝 **Snippet:**\n> {snippet}\n{texts.LINE}\n" if snippet else ""
+
+    text = (
+        f"✅ **Published — Post {post_disp}**\n"
+        f"{texts.LINE}\n"
+        f"🎮 **Platform:** `{platform_disp}`\n"
+        f"📡 **Supplier:** {src or '?'}\n"
+        f"{texts.LINE}\n"
+        f"{snippet_part}"
     )
 
     buttons = _channel_view_buttons(listing)
+    action_row = []
+    if listing_id:
+        action_row.append(Button.inline("🔴 Mark Sold", data=f"sold:{listing_id}"))
+    action_row.append(Button.inline("🗑️ Dismiss", data="dismiss_msg"))
+    buttons.append(action_row)
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
         logger.info("Sent published alert for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
-        logger.exception("Failed to send published alert to admin for listing #%s", listing_id)
+        try:
+            await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
+            logger.info("Sent published alert (fallback) for listing #%s to admin %s", listing_id, admin_id)
+        except Exception:
+            logger.exception("Failed to send published alert to admin for listing #%s", listing_id)
 
 
 def _format_listing(n: int, l: dict) -> str:
@@ -305,6 +453,8 @@ async def _build_preview_text(listing: dict) -> str:
         post_number=listing.get("post_number"),
         source_text=listing.get("raw_text"),
     )
+    if db.get_setting("user_client_premium") == "0":
+        preview_text += "\n\n_(preview uses fallback glyphs)_"
     return preview_text
 
 
@@ -341,6 +491,18 @@ _SKIP_REASON_LABELS = {
     "admin_skip": "admin_skip",
 }
 
+_HUMAN_SKIP_REASONS = {
+    "not_a_listing": "Off-Topic / Not an Ad",
+    "duplicate": "Duplicate Post",
+    "chatter": "Rule Post / Chat Greeting",
+    "no_content": "Empty / No Content",
+    "payment_proof": "Payment Receipt / Proof",
+    "category_blocked": "Restricted Platform Category",
+    "admin_skip": "Manual Skip by Admin",
+    "self_echo": "Self Echo / Outbound Mirror",
+    "low_quality": "Low Quality / Missing Details",
+}
+
 
 async def send_skipped_alert(
     bot_client: TelegramClient,
@@ -361,7 +523,7 @@ async def send_skipped_alert(
     speaks. The result names the winner and every id folded into it, so a burst
     arrives as a single "kept #1, dropped #2 #3 #4 #5" card instead of five
     separate notifications — which is what made the review queue look flooded.
-    Every other reason alerts individually, one line, as the pipeline intends.
+    Every other reason alerts individually with an executive card layout.
     """
     listing_id = listing.get("id")
     winner_id = listing.get("duplicate_of")
@@ -388,49 +550,63 @@ async def send_skipped_alert(
             suffix="y" if len(dropped) == 1 else "ies",
             dropped=dropped_text,
         )
+        buttons = [[Button.inline("🗑️ Dismiss", data="dismiss_msg")]]
     else:
         label = _SKIP_REASON_LABELS.get(reason, reason)
+        human_desc = _HUMAN_SKIP_REASONS.get(reason, label.replace("_", " ").title())
         src = _pretty_source(
             listing.get("supplier_username"), listing.get("supplier_display_name")
         )
-        src_part = texts.SKIP_ALERT_SOURCE.format(source=src) if src and src != "?" else ""
-        text = texts.SKIP_ALERT.format(reason=label, id=listing_id, source=src_part)
+        src_disp = src if src and src != "?" else "Unknown"
+        lid_disp = f"#{listing_id}" if listing_id else "N/A"
 
-    buttons = None
-    if reason != "duplicate" and listing_id:
-        row_buttons = []
-        try:
-            skips = db.get_skipped_listings(limit=10)
-            for s in skips:
-                if s.get("listing_id") == listing_id or (
-                    s.get("supplier_id") == listing.get("supplier_id")
-                    and s.get("message_id") == listing.get("source_message_id")
-                ):
-                    row_buttons.append(
-                        Button.inline(texts.BTN_REREVIEW, data=f"reskip:{s['skip_id']}")
-                    )
-                    break
-        except Exception:
-            pass
+        raw = (listing.get("raw_text") or listing.get("clean_text") or "").strip()
+        if raw:
+            snippet = " ".join(raw.split())
+            if len(snippet) > 160:
+                snippet = snippet[:157] + "..."
+        else:
+            snippet = "*(No text content)*"
 
+        text = (
+            f"⏭️ **Skipped — {label}**\n"
+            f"{texts.LINE}\n"
+            f"🏷️ **Listing:** `{lid_disp}`\n"
+            f"📡 **Source:** {src_disp}\n"
+            f"⚠️ **Reason:** `{human_desc}`\n"
+            f"📝 **Snippet:**\n"
+            f"> {snippet}"
+        )
+
+        buttons = []
+        if listing_id:
+            buttons.append([
+                Button.inline("🔁 Send to Review", data=f"reskip_lid:{listing_id}"),
+                Button.inline("🚀 Force Approve", data=f"force_approve:{listing_id}"),
+            ])
+
+        row2 = []
         src_url = _source_url({
             "supplier_username": listing.get("supplier_username") or listing.get("channel_username"),
             "supplier_channel_id": listing.get("supplier_channel_id") or listing.get("channel_id"),
-            "source_message_id": listing.get("source_message_id"),
+            "source_message_id": listing.get("source_message_id") or listing.get("message_id"),
         })
         if src_url:
-            row_buttons.append(Button.url(texts.BTN_VIEW_BUYER, src_url))
-        if row_buttons:
-            buttons = [row_buttons]
+            row2.append(Button.url("🔗 Source Post", src_url))
+        row2.append(Button.inline("🗑️ Dismiss", data="dismiss_msg"))
+        buttons.append(row2)
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
     except Exception:
-        logger.exception(
-            "Failed to send skip alert for listing #%s (reason %s)",
-            listing_id,
-            reason,
-        )
+        try:
+            await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
+        except Exception:
+            logger.exception(
+                "Failed to send skip alert for listing #%s (reason %s)",
+                listing_id,
+                reason,
+            )
 
     # Advance the skip digest marker so the background digest does not duplicate this alert
     try:
@@ -664,29 +840,78 @@ def _non_emoji_residue(message, spans: List[Dict[str, object]]) -> str:
     return residue[:60]
 
 
+def _headers_menu_payload(headers: List[dict], prefix_note: str = "") -> Tuple[str, list]:
+    from pipeline.parser import _utf16_len, _make_custom_emoji_entity
+    if not headers:
+        text = (f"{prefix_note}\n\n" if prefix_note else "") + texts.HEADERS_EMPTY.format(n=HEADER_EMOJI_COUNT)
+        return text, []
+
+    s = "s" if len(headers) != 1 else ""
+    header_title = f"🅰️ **Custom Headers Pool** ({len(headers)} header{s} saved)\n{texts.LINE}\n"
+    if prefix_note:
+        full_prefix = f"{prefix_note}\n\n{header_title}"
+    else:
+        full_prefix = header_title
+
+    parts = [full_prefix]
+    entities: list = []
+    cursor = _utf16_len(full_prefix)
+
+    for h in headers:
+        row_prefix = f"• **#{h['id']}** · "
+        parts.append(row_prefix)
+        cursor += _utf16_len(row_prefix)
+
+        emojis = h.get("emoji") or []
+        if emojis and isinstance(emojis, list):
+            for e in emojis:
+                alt = str(e.get("alt") or "")
+                doc_id = int(e.get("doc_id") or 0)
+                if alt and doc_id:
+                    entities.append(_make_custom_emoji_entity(cursor, doc_id, alt))
+                parts.append(alt)
+                cursor += _utf16_len(alt)
+        else:
+            glyph = str(h.get("text") or "?")
+            parts.append(glyph)
+            cursor += _utf16_len(glyph)
+
+        parts.append("\n")
+        cursor += _utf16_len("\n")
+
+    footer = f"{texts.LINE}\n🎲 Picked at random for new published posts.\nTap a button below to delete:"
+    parts.append(footer)
+    return "".join(parts), entities
+
+
 def _headers_menu_text(headers: List[dict]) -> str:
     """Caption for the header list. Empty state points at the Add row below it."""
-    if not headers:
-        return texts.HEADERS_EMPTY.format(n=HEADER_EMOJI_COUNT)
-    s = "s" if len(headers) != 1 else ""
-    return texts.HEADERS_MENU.format(count=len(headers), s=s)
+    text, _ = _headers_menu_payload(headers)
+    return text
 
 
-def _headers_buttons(headers: List[dict]) -> List[List[object]]:
-    """One 🗑 row per header, then Add, then the standard Home row.
-
-    Also the footer for every capture-failure prompt: the Home keyboard no longer
-    carries a Headers button, so without these rows a rejected capture would
-    strand the admin with no way back to the list or to a retry.
-    """
-    buttons: List[List[object]] = []
-    for h in headers:
-        # Label by the header's own text (the alt glyphs, e.g. "WTB") so the row is
-        # recognisable, with the id for the admin to refer to it by.
+def _headers_buttons(headers: List[dict], undo_header_id: Optional[int] = None) -> List[List[object]]:
+    """Compact grid of header delete buttons, prominent Add button, and Home row."""
+    buttons: List[List[object]] = [
+        [Button.inline("➕ Add Header", data="headeradd")]
+    ]
+    if undo_header_id:
         buttons.append([
-            Button.inline(f"🗑 #{h['id']} — {h.get('text') or '?'}", data=f"delheader:{h['id']}")
+            Button.inline(f"↩️ Undo Restore #{undo_header_id}", data=f"undoheader:{undo_header_id}")
         ])
-    buttons.append([Button.inline("➕ Add Header", data="headeradd")])
+
+    if headers:
+        row: List[object] = []
+        for h in headers:
+            row.append(
+                Button.inline(f"🗑 #{h['id']}", data=f"delheader:{h['id']}")
+            )
+            if len(row) == 4:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
     buttons.extend(_home_button_row())
     return buttons
 
@@ -762,6 +987,7 @@ async def _message_delete_send(
     text: str,
     buttons=None,
     parse_mode: str = "markdown",
+    formatting_entities: Optional[list] = None,
 ) -> None:
     """Delete the tapped message and send a fresh one in its place.
 
@@ -775,6 +1001,14 @@ async def _message_delete_send(
     except Exception:
         pass
     try:
+        if formatting_entities:
+            try:
+                await event.client.send_message(
+                    ADMIN_USER_ID, text, buttons=buttons, formatting_entities=formatting_entities
+                )
+                return
+            except Exception:
+                pass
         await event.client.send_message(
             ADMIN_USER_ID, text, buttons=buttons, parse_mode=parse_mode
         )
@@ -808,6 +1042,8 @@ from services.fsm import PersistentDict
 _wizard_state: Dict[int, dict] = PersistentDict(prefix="wiz:")
 # Listing drafts: listing_id -> content lines typed by the admin via ✏️ Edit.
 _drafts: Dict[int, str] = PersistentDict(prefix="draft:")
+# Header undo memory for safe 1-tap recovery
+_last_deleted_header: Optional[dict] = None
 
 
 def _pretty_source(username: Optional[str], display_name: Optional[str] = None) -> str:
@@ -972,6 +1208,7 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
             entity_username or str(channel_id),
             channel_id=channel_id,
         )
+        notify_supplier_change()
         if display:
             await db.run_async(db.set_supplier_display_name, str(channel_id), display)
         await db.run_async(
@@ -1021,6 +1258,7 @@ async def _run_add_supplier_flow(event, text: str, fwd=None) -> None:
             store_username,
             channel_id=entity_id,
         )
+        notify_supplier_change()
         if entity_id and display:
             await db.run_async(db.set_supplier_display_name, str(entity_id), display)
         await db.run_async(
@@ -1510,7 +1748,18 @@ def _home_button_row() -> List[List[object]]:
 
 
 def _home_text() -> str:
-    return texts.HOME_LANDING
+    paused = db.is_paused()
+    state_badge = "⏸️ **Paused**" if paused else "🟢 **Active**"
+    asleep_badge = "💤 Away" if db.is_buyer_asleep() else "☀️ Online"
+    try:
+        stats = db.get_today_stats()
+        pub = stats.get("published", 0)
+        pend = stats.get("pending", 0)
+        skip = stats.get("total_skipped", 0)
+        kpi = f"\n📊 Today: `{pub}` published · `{pend}` pending · `{skip}` skipped"
+    except Exception:
+        kpi = ""
+    return f"⚡ **Control Center** — {state_badge} | {asleep_badge}{kpi}"
 
 
 def _home_inline_keyboard() -> List[List[object]]:
@@ -1577,6 +1826,8 @@ def _status_report_text() -> str:
     )
     if db.is_paused():
         msg = texts.STATUS_PAUSED_BANNER + msg
+    if db.get_setting("user_client_premium") == "0":
+        msg = "⚠️ *User Client is not Telegram Premium* — custom-emoji headers and flags may not render.\n\n" + msg
     return msg
 
 
@@ -1961,9 +2212,17 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if not await check_admin(event):
             return
         headers = db.list_headers()
+        text, entities = _headers_menu_payload(headers)
+        buttons = _headers_buttons(headers)
+        if entities:
+            try:
+                await event.reply(text, buttons=buttons, formatting_entities=entities)
+                return
+            except Exception:
+                pass
         await event.reply(
-            _headers_menu_text(headers),
-            buttons=_headers_buttons(headers),
+            text,
+            buttons=buttons,
             parse_mode="markdown",
         )
 
@@ -2304,10 +2563,159 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         )
         # Validate admin via sender_id (callback queries can't use event.reply)
         if event.sender_id != ADMIN_USER_ID:
-            await event.answer(texts.UNAUTHORIZED, alert=True)
+            await event.answer()
+            await db.run_async(
+                db.record_audit,
+                "unauthorized_callback",
+                None,
+                actor_id=event.sender_id,
+                detail=f"data: {(event.data or b'').decode('utf-8', 'replace')[:100]}",
+            )
             return
 
         data_str = event.data.decode("utf-8")
+
+        # ---- Edit propagation rejected review actions (Task 1) ------------
+        if data_str.startswith("apply_edit:"):
+            try:
+                listing_id = int(data_str.split(":", 1)[1])
+            except ValueError:
+                await event.answer("Invalid listing ID", alert=True)
+                return
+            listing = db.get_listing_by_id(listing_id)
+            if not listing or listing.get("status") != "published" or not listing.get("published_message_id"):
+                await event.answer("Listing not published or not found", alert=True)
+                return
+            pending_raw = db.get_setting(f"pending_edit:{listing_id}") or listing.get("raw_text") or ""
+            # Apply must go through the same sanitizer; it only skips the auto-gate
+            raw_lines = [ln.strip() for ln in pending_raw.splitlines() if ln.strip()]
+            sanitized_lines, body_ok = parser.prepare_body(raw_lines, pending_raw)
+            if not sanitized_lines:
+                sanitized_lines = [pending_raw[:100]]
+
+            header_emoji = await _header_emoji_for_listing(listing_id)
+            updated_text, entities = parser.build_ai_message(
+                content_lines=sanitized_lines,
+                platform=listing.get("platform_name"),
+                contact_username=CONTACT_USERNAME,
+                header_emoji=header_emoji,
+                post_number=listing.get("post_number"),
+                source_text=pending_raw,
+            )
+            published_msg_id = listing["published_message_id"]
+            dest_peer = db.to_peer_reference(DEST_CHANNEL)
+            try:
+                if user_client_ref and user_client_ref.is_connected():
+                    await user_client_ref.edit_message(
+                        dest_peer, published_msg_id, updated_text, formatting_entities=entities
+                    )
+                await db.run_async(db.update_listing_raw_text, listing_id, pending_raw)
+                await db.run_async(db.update_listing_content, listing_id, clean_text="\n".join(sanitized_lines))
+                await db.run_async(db.delete_setting, f"pending_edit:{listing_id}")
+                await db.run_async(
+                    db.record_audit,
+                    "edit_applied_manual",
+                    listing_id,
+                    actor_id=event.sender_id,
+                    detail=f"msg {published_msg_id}",
+                )
+                await event.answer("Edit applied to channel post!")
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.exception("Failed to apply edit for listing #%s: %s", listing_id, exc)
+                await event.answer(f"Failed to edit message: {exc}", alert=True)
+            return
+
+        if data_str.startswith("ignore_edit:"):
+            try:
+                listing_id = int(data_str.split(":", 1)[1])
+            except ValueError:
+                await event.answer("Invalid listing ID", alert=True)
+                return
+            await db.run_async(db.delete_setting, f"pending_edit:{listing_id}")
+            await db.run_async(
+                db.record_audit,
+                "edit_ignored",
+                listing_id,
+                actor_id=event.sender_id,
+            )
+            await event.answer("Edit ignored")
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            return
+
+        # ---- Quick UI dismissal & actions ----------------------------------
+        if data_str == "dismiss_msg":
+            await event.answer("Dismissed")
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            return
+
+        review_open_match = re.match(r"^review_open:(\d+)$", data_str)
+        if review_open_match:
+            lid = int(review_open_match.group(1))
+            listing = db.get_listing_by_id(lid)
+            if not listing:
+                await event.answer(texts.NOT_FOUND_LISTING, alert=True)
+                return
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            await send_approval_prompt(bot, ADMIN_USER_ID, listing)
+            return
+
+        reskip_lid_match = re.match(r"^reskip_lid:(\d+)$", data_str)
+        if reskip_lid_match:
+            lid = int(reskip_lid_match.group(1))
+            listing = db.get_listing_by_id(lid)
+            if not listing:
+                await event.answer(texts.NOT_FOUND_LISTING, alert=True)
+                return
+            await db.run_async(db.update_listing_status, lid, "pending_approval")
+            await db.run_async(
+                db.record_audit,
+                "skipped_sent_to_review",
+                lid,
+                actor_id=event.sender_id,
+            )
+            await event.answer("Moved to review queue! 📬")
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            listing["_review_reason"] = "manual_override"
+            await send_approval_prompt(bot, ADMIN_USER_ID, listing)
+            return
+
+        force_approve_match = re.match(r"^force_approve:(\d+)$", data_str)
+        if force_approve_match:
+            lid = int(force_approve_match.group(1))
+            listing = db.get_listing_by_id(lid)
+            if not listing:
+                await event.answer(texts.NOT_FOUND_LISTING, alert=True)
+                return
+            await db.run_async(db.update_listing_status, lid, "approved")
+            await db.run_async(
+                db.record_audit,
+                "force_approved",
+                lid,
+                actor_id=event.sender_id,
+            )
+            notify_approved()
+            await event.answer("Force Approved! 🚀 Queued for publish.")
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            return
 
         # ---- Skipped re-review ---------------------------------------------
         if data_str.startswith("reskip:"):
@@ -2377,29 +2785,29 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     parse_mode="markdown",
                 )
                 return
+            text, entities = _headers_menu_payload(headers)
             await _message_delete_send(
-                event, _headers_menu_text(headers), buttons=_headers_buttons(headers)
+                event,
+                text,
+                buttons=_headers_buttons(headers),
+                formatting_entities=entities,
             )
-            # Echo each header as real custom emoji so the admin can see it renders.
-            for header in headers:
-                text, entities = parser.build_header_line(
-                    [(p["alt"], p["doc_id"]) for p in header["emoji"]]
-                )
-                try:
-                    await event.client.send_message(
-                        event.chat_id, text, formatting_entities=entities
-                    )
-                except Exception:
-                    logger.exception("Could not echo header #%s", header["id"])
             return
 
         m = re.match(r"^delheader:(\d+)$", data_str)
         if m:
+            global _last_deleted_header
             header_id = int(m.group(1))
             header = db.get_header(header_id)
             if header is None:
                 await event.answer(texts.HEADER_GONE, alert=True)
+                deleted_note = ""
             else:
+                _last_deleted_header = {
+                    "id": header["id"],
+                    "emoji": header.get("emoji") or [],
+                    "text": header.get("text") or "",
+                }
                 await db.run_async(db.delete_header, header_id)
                 logger.info("Deleted header #%s", header_id)
                 await event.answer(texts.HEADER_DELETED_ANSWER.format(id=header_id))
@@ -2410,12 +2818,38 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     actor_id=event.sender_id,
                     detail=f"header #{header_id}",
                 )
+                deleted_note = texts.HEADER_DELETED.format(id=header_id).strip()
+
             headers = db.list_headers()
+            text, entities = _headers_menu_payload(headers, prefix_note=deleted_note)
+            buttons = _headers_buttons(headers, undo_header_id=header_id if header else None)
             await _message_delete_send(
                 event,
-                texts.HEADER_DELETED.format(id=header_id) + _headers_menu_text(headers),
+                text,
+                buttons=buttons,
+                formatting_entities=entities,
+            )
+            return
+
+        undo_m = re.match(r"^undoheader:(\d+)$", data_str)
+        if undo_m:
+            hid = int(undo_m.group(1))
+            if _last_deleted_header and _last_deleted_header.get("id") == hid and _last_deleted_header.get("emoji"):
+                try:
+                    new_id = await db.run_async(db.add_header, _last_deleted_header["emoji"])
+                    _last_deleted_header = None
+                    await event.answer(f"Restored as header #{new_id}! ✅")
+                except Exception:
+                    await event.answer("Could not restore header", alert=True)
+            else:
+                await event.answer("No header to undo", alert=True)
+            headers = db.list_headers()
+            text, entities = _headers_menu_payload(headers)
+            await _message_delete_send(
+                event,
+                text,
                 buttons=_headers_buttons(headers),
-                parse_mode="markdown",
+                formatting_entities=entities,
             )
             return
 
@@ -2598,6 +3032,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await event.answer("Source not found.", alert=True)
                 return
             await db.run_async(db.set_supplier_active, s["channel_username"], not s["active"])
+            notify_supplier_change()
             await db.run_async(
                 db.record_audit,
                 "supplier_toggle",
@@ -2639,6 +3074,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await event.answer(texts.SOURCE_NOT_FOUND, alert=True)
                 return
             await db.run_async(db.delete_supplier, sid)
+            notify_supplier_change()
             await db.run_async(
                 db.record_audit,
                 "supplier_deleted",
@@ -2912,6 +3348,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 username,
                 channel_id=None,
             )
+            notify_supplier_change()
             await db.run_async(
                 db.record_audit,
                 "supplier_added_unresolved",
@@ -3271,6 +3708,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         # Provably not on the destination — release the claim and
                         # re-queue for the worker.
                         await db.run_async(db.release_publish_claim, listing_id, "approved")
+                        notify_approved()
                         await db.run_async(
                             db.record_audit,
                             "approved_queued",
@@ -3308,6 +3746,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     await db.run_async(
                         db.queue_forwarding, listing_id, DEST_CHANNEL, published_msg_id
                     )
+                    notify_forward()
                 except Exception as exc:
                     logger.exception(
                         "Listing #%s WAS published (msg id %s) but bookkeeping failed: %s",
@@ -3324,6 +3763,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         await db.run_async(
                             db.queue_forwarding, listing_id, DEST_CHANNEL, published_msg_id
                         )
+                        notify_forward()
                     except Exception:
                         logger.exception("Could not record published state for listing #%s", listing_id)
 
@@ -3343,6 +3783,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
             else:
                 await db.run_async(db.update_listing_status, listing_id, "approved")
+                notify_approved()
                 await db.run_async(
                     db.record_audit,
                     "approved",
@@ -3438,9 +3879,17 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             detail=f"header #{header_id} ({len(emoji)} emoji)",
         )
         saved = db.list_headers()
+        text, entities = _headers_menu_payload(saved, prefix_note=texts.HEADER_SAVED.format(n=len(saved)))
+        buttons = _headers_buttons(saved)
+        if entities:
+            try:
+                await event.reply(text, buttons=buttons, formatting_entities=entities)
+                return
+            except Exception:
+                pass
         await event.reply(
-            texts.HEADER_SAVED.format(n=len(saved)),
-            buttons=_headers_buttons(saved),
+            text,
+            buttons=buttons,
             parse_mode="markdown",
         )
 

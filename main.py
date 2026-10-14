@@ -5,6 +5,7 @@ keyword blocklist, duplicate detection, and admin approval bot.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import sys
@@ -35,8 +36,11 @@ import filters
 import parser
 import publish_guard
 import texts
+from pipeline import rules
 
 load_dotenv()
+
+logger = logging.getLogger("monitor")
 
 # ---------------------------------------------------------------------------
 # Configuration from .env
@@ -93,6 +97,12 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 # deterministic fallback keeps real listings publishing when every AI path is down.
 PRE_FILTER_CHATTER = os.environ.get("PRE_FILTER_CHATTER", "1").strip().lower() in ("1", "true", "yes")
 DETERMINISTIC_FALLBACK = os.environ.get("DETERMINISTIC_FALLBACK", "1").strip().lower() in ("1", "true", "yes")
+FALLBACK_AUTOPUBLISH = os.environ.get("FALLBACK_AUTOPUBLISH", "0").strip().lower() in ("1", "true", "yes")
+BLOCKED_PLATFORM_CATEGORIES = [
+    c.strip().lower()
+    for c in os.environ.get("BLOCKED_PLATFORM_CATEGORIES", "").split(",")
+    if c.strip()
+]
 AI_CACHE_TTL_HOURS = float(os.environ.get("AI_CACHE_TTL_HOURS", "48") or 48)
 # How long identical content stays blocked as a duplicate: a re-post of the
 # same listing within DEDUP_HOURS is skipped (content fingerprint + price).
@@ -100,11 +110,19 @@ DEDUP_HOURS = int(os.environ.get("DEDUP_HOURS", "8") or 8)
 # RETENTION: rolling window. Every listing (published, skipped, pending review,
 # rejected, ...), skip entry, audit row, forward record and AI cache row older
 # than this is deleted, so the DB and every admin list only hold the last N
-# hours. Clamped to DEDUP_HOURS so the purge can never delete a row the
-# duplicate check still compares against.
-RETENTION_HOURS = max(
-    float(os.environ.get("RETENTION_HOURS", "8") or 8), float(DEDUP_HOURS)
-)
+# hours. Default is 24h, must be >= DEDUP_HOURS + 2.
+_raw_retention = float(os.environ.get("RETENTION_HOURS", "24") or 24)
+if _raw_retention < float(DEDUP_HOURS) + 2:
+    logger.error(
+        "RETENTION_HOURS (%.1f) must be >= DEDUP_HOURS (%d) + 2; raising to %.1f",
+        _raw_retention,
+        DEDUP_HOURS,
+        float(DEDUP_HOURS) + 2,
+    )
+    RETENTION_HOURS = float(DEDUP_HOURS) + 2
+else:
+    RETENTION_HOURS = _raw_retention
+
 RETENTION_SWEEP_MINUTES = max(
     1.0, float(os.environ.get("RETENTION_SWEEP_MINUTES", "10") or 10)
 )
@@ -115,12 +133,10 @@ RETENTION_SWEEP_MINUTES = max(
 # like a publish does — just for a shorter, separate window.
 REJECT_MEMORY_MINUTES = int(os.environ.get("REJECT_MEMORY_MINUTES", "180") or 180)
 # QUARANTINE: nothing is decided on arrival. A listing is inserted as 'held' and
-# the held-listings worker waits this long before evaluating it, so an entire
-# burst of identical re-posts is present in the DB *before* the first decision.
-# Without it the first message of a burst is published before its twins even
-# arrive, which is precisely why they had to be cleaned up by hand. Observed
-# bursts land within ~35s, so 100s carries ~3x margin.
-QUARANTINE_SECONDS = int(os.environ.get("QUARANTINE_SECONDS", "100") or 100)
+# the held-listings worker evaluates it. In fast mode (QUARANTINE_SECONDS=0, default),
+# the listing is immediately due upon arrival (<1ms) and processed in real time.
+# Setting QUARANTINE_SECONDS > 0 restores the hold buffer (e.g. 100s for burst dedup).
+QUARANTINE_SECONDS = int(os.environ.get("QUARANTINE_SECONDS", "0") or 0)
 # Stand-in text stored for a media-only post (no caption). It is a marker, not
 # content: the held-listings worker re-detects media-only posts by this prefix
 # long after the original Telegram event is gone, so it must stay in one place.
@@ -145,13 +161,11 @@ FORWARD_FLOODWAIT_BUDGET_SECONDS = float(
 FORWARD_FLOODWAIT_MAX_DEFERRAL_SECONDS = int(
     os.environ.get("FORWARD_FLOODWAIT_MAX_DEFERRAL_SECONDS", "3600") or 3600
 )
-FORWARD_WORKER_INTERVAL = float(os.environ.get("FORWARD_WORKER_INTERVAL", "3") or 3)
+FORWARD_WORKER_INTERVAL = float(os.environ.get("FORWARD_WORKER_INTERVAL", "0.5") or 0.5)
 # Pause between each destination forward within one drain pass. Keeps a single
 # listing from burst-forwarding to every destination back-to-back, which is what
 # triggers Telegram flood-limits / spam restrictions on the acting account.
-# 2.0s produced ~270 FloodWaits/hour with ~23 destinations; 5.0s is the measured
-# safe default and pushing it higher only delays delivery.
-FORWARD_PACING_SECONDS = float(os.environ.get("FORWARD_PACING_SECONDS", "5.0") or 5.0)
+FORWARD_PACING_SECONDS = float(os.environ.get("FORWARD_PACING_SECONDS", "1.0") or 1.0)
 # Optional dedicated forward-only account (DEST-ROUTE): a second Telethon session
 # that forwards messages to destinations. By default, when active, it forwards to
 # ALL active destinations so newly joined groups are handled automatically without
@@ -179,6 +193,99 @@ PERMANENT_FORWARD_ERRORS = (
     ChannelInvalidError,
     ChannelPrivateError,
 )
+
+# ---------------------------------------------------------------------------
+# Event-driven worker triggers: replaces 3-5s polling with instant wakeups (<1ms)
+# ---------------------------------------------------------------------------
+_wake_held_worker: Optional[asyncio.Event] = None
+_wake_approved_worker: Optional[asyncio.Event] = None
+_wake_forward_worker: Optional[asyncio.Event] = None
+
+
+def get_wake_held_worker() -> asyncio.Event:
+    """Return loop-bound wake event for held_listings_worker."""
+    global _wake_held_worker
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _wake_held_worker is None or getattr(_wake_held_worker, "_loop", None) not in (None, loop):
+        _wake_held_worker = asyncio.Event()
+    return _wake_held_worker
+
+
+def wake_held_worker() -> None:
+    """Instantly wake held_listings_worker to evaluate due quarantine rows."""
+    try:
+        get_wake_held_worker().set()
+    except Exception:
+        pass
+
+
+def get_wake_approved_worker() -> asyncio.Event:
+    """Return loop-bound wake event for approved_listings_worker."""
+    global _wake_approved_worker
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _wake_approved_worker is None or getattr(_wake_approved_worker, "_loop", None) not in (None, loop):
+        _wake_approved_worker = asyncio.Event()
+    return _wake_approved_worker
+
+
+def wake_approved_worker() -> None:
+    """Instantly wake approved_listings_worker to publish approved rows."""
+    try:
+        get_wake_approved_worker().set()
+    except Exception:
+        pass
+
+
+def get_wake_forward_worker() -> asyncio.Event:
+    """Return loop-bound wake event for forwarding_worker."""
+    global _wake_forward_worker
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _wake_forward_worker is None or getattr(_wake_forward_worker, "_loop", None) not in (None, loop):
+        _wake_forward_worker = asyncio.Event()
+    return _wake_forward_worker
+
+
+def wake_forward_worker() -> None:
+    """Instantly wake forwarding_worker to drain pending forwards."""
+    try:
+        get_wake_forward_worker().set()
+    except Exception:
+        pass
+
+
+async def _wait_or_wake(wake_event: asyncio.Event, stop_event: asyncio.Event, timeout: float) -> None:
+    """Wait for wake_event OR stop_event OR timeout seconds. Clears wake_event when triggered."""
+    if stop_event.is_set():
+        return
+    wake_task = asyncio.create_task(wake_event.wait())
+    stop_task = asyncio.create_task(stop_event.wait())
+    try:
+        done, pending = await asyncio.wait(
+            [wake_task, stop_task],
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if wake_task in done:
+            wake_event.clear()
+    except asyncio.CancelledError:
+        wake_task.cancel()
+        stop_task.cancel()
+        await asyncio.gather(wake_task, stop_task, return_exceptions=True)
+        raise
+
 
 # Runtime health (MON-1): process-level state surfaced in the periodic health
 # line so a silently-dead worker / stalled publish path is visible in the logs
@@ -508,23 +615,37 @@ def deterministic_fallback_publish_ok(
     has_payment_proof: Optional[str],
     has_clear_signal: bool,
     body_ok: bool,
+    raw_text: str = "",
+    rendered_body: str = "",
+    platform: Optional[str] = None,
 ) -> bool:
     """Gate the deterministic AI-down fallback auto-publish.
 
-    During an AI outage a concrete listing with a substantive body routes
-    straight to the channel — but only when publishing is not paused via the
-    admin "All Stop" switch. Unpaused, a risky/payment-proof/weak body still
-    falls through to manual review. Paused, EVERY fallback listing routes to
-    manual review instead of auto-publishing.
+    Fallback must NEVER auto-publish by default (FALLBACK_AUTOPUBLISH=0).
+    If FALLBACK_AUTOPUBLISH=1, allow auto-publish ONLY when ALL are true:
+    - explicit buy-intent keywords matched deterministically
+    - no sell-phrase match (WTS, selling, for sale, stock, available, supplier handle)
+    - keyword screen clean
+    - no payment-proof signal
+    - sanitizer clean (body_ok)
+    - platform matched from a known allowlist
+    - buyer framing clean
+    - not paused
     """
-    return (
-        DETERMINISTIC_FALLBACK
-        and not paused
-        and not risky_keyword
-        and not has_payment_proof
-        and has_clear_signal
-        and body_ok
-    )
+    if not FALLBACK_AUTOPUBLISH or not DETERMINISTIC_FALLBACK:
+        return False
+    if paused or risky_keyword or has_payment_proof or not body_ok or not has_clear_signal:
+        return False
+    if not filters.detect_buy_intent(raw_text):
+        return False
+    if filters.detect_sell_intent(raw_text):
+        return False
+    plat = platform or filters.detect_platform_from_text(raw_text)
+    if not plat or plat not in filters.KNOWN_PLATFORMS:
+        return False
+    if not rules.check_buyer_framing(rendered_body or raw_text):
+        return False
+    return True
 
 
 def buy_auto_publish_ok(
@@ -532,19 +653,24 @@ def buy_auto_publish_ok(
     paused: bool,
     body_ok: bool,
     has_payment_proof: Optional[str],
+    rendered_body: Optional[Any] = None,
+    risky_keyword: Optional[str] = None,
+    category_blocked: Optional[str] = None,
 ) -> bool:
     """Gate the buy-intent auto-publish.
 
     A buy demand auto-publishes when it has a substantive sanitized body and no
     payment-proof signal — prices and platforms never factor into the decision.
-    "All Stop" gates it too: while paused, buy signals route to manual approval
-    instead of auto-publishing (the admin's Approve is still honored).
+    Also enforces buyer framing, category blocklist, and pause state.
     """
     return (
         intent == "buy"
         and not paused
         and body_ok
         and not has_payment_proof
+        and not risky_keyword
+        and not category_blocked
+        and (rendered_body is None or rules.check_buyer_framing(rendered_body))
     )
 
 
@@ -724,11 +850,48 @@ async def resolve_chat(client: TelegramClient, supplier: dict):
     return await client.get_entity(supplier["channel_username"])
 
 
+_supplier_cache_by_chat_id: Dict[int, Optional[dict]] = {}
+_supplier_cache_by_username: Dict[str, Optional[dict]] = {}
+_supplier_neg_cache: Dict[int, float] = {}
+
+
+def invalidate_supplier_cache() -> None:
+    """Clear in-memory supplier cache so newly added/updated suppliers are resolved."""
+    _supplier_cache_by_chat_id.clear()
+    _supplier_cache_by_username.clear()
+    _supplier_neg_cache.clear()
+
+
 async def resolve_supplier_for_event(event) -> Optional[dict]:
-    """Find the active supplier matching this message event."""
+    """Find the active supplier matching this message event.
+
+    Optimized for zero-overhead ingest:
+    1. Checks in-memory fast cache first (<0.01ms).
+    2. Uses event.chat_id to query DB without touching event.chat (avoids Telethon RPC).
+    3. Falls back to username lookup only if chat_id didn't match.
+    """
     chat_id = event.chat_id
-    chat_username = getattr(event.chat, "username", None)
-    supplier = db.get_supplier_by_chat(chat_id=chat_id, username=chat_username)
+    now = time.monotonic()
+    if chat_id is not None:
+        cached = _supplier_cache_by_chat_id.get(chat_id)
+        if cached is not None and cached.get("active"):
+            return cached
+        if chat_id in _supplier_neg_cache and (now - _supplier_neg_cache[chat_id] < 30.0):
+            return None
+
+    # Step 1: Query by numeric chat_id first (no Telethon RPC)
+    supplier = None
+    if chat_id is not None:
+        supplier = db.get_supplier_by_chat(chat_id=chat_id)
+
+    # Step 2: If not found, only then access event.chat.username
+    if not supplier:
+        try:
+            chat_username = getattr(event.chat, "username", None)
+        except Exception:
+            chat_username = None
+        if chat_username:
+            supplier = db.get_supplier_by_chat(username=chat_username)
 
     # If supplier was stored without channel_id, update it now
     if supplier and supplier.get("channel_id") is None and chat_id is not None:
@@ -738,7 +901,14 @@ async def resolve_supplier_for_event(event) -> Optional[dict]:
         supplier["channel_id"] = chat_id
 
     if supplier and supplier.get("active"):
+        if chat_id is not None:
+            _supplier_cache_by_chat_id[chat_id] = supplier
+        if supplier.get("channel_username"):
+            _supplier_cache_by_username[supplier["channel_username"].lower()] = supplier
         return supplier
+
+    if chat_id is not None:
+        _supplier_neg_cache[chat_id] = now
     return None
 
 
@@ -942,9 +1112,11 @@ async def enqueue_destination_forwardings(
     """Persist one pending forward for every ACTIVE destination."""
     if not DEST_CHANNEL:
         return 0
-    return await db.run_async(
+    enqueued = await db.run_async(
         db.queue_forwarding, listing_id, DEST_CHANNEL, published_msg_id
     )
+    wake_forward_worker()
+    return enqueued
 
 
 async def _confirm_forward_on_destination(
@@ -1267,11 +1439,9 @@ async def forwarding_worker(
         except Exception:
             logger.exception("Destination forwarding worker crashed (will retry next tick)")
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            await _wait_or_wake(get_wake_forward_worker(), stop_event, timeout=interval)
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1427,15 +1597,17 @@ async def _process_supplier_message(
     source_price, _ = parser.extract_price(raw_text)
     fingerprint = db.make_listing_fingerprint(raw_text, price=source_price)
 
-    # QUARANTINE: the listing is inserted as 'held' and this function returns
-    # immediately. Nothing is filtered, analyzed, or published on arrival —
-    # the held-listings worker evaluates the row once hold_until has passed, by
-    # which time the whole burst of identical re-posts is present. Deciding on
-    # arrival is what let the first copy of a burst publish before its twins
-    # even landed, which is why duplicates had to be cleaned up by hand.
-    hold_until = (
-        datetime.now(timezone.utc) + timedelta(seconds=QUARANTINE_SECONDS)
-    ).isoformat()
+    # QUARANTINE: In fast mode (QUARANTINE_SECONDS=0, default), hold_until is
+    # set to now so the listing is immediately due upon arrival and the held worker
+    # is woken instantly (<1ms). If QUARANTINE_SECONDS > 0, the hold buffer is respected.
+    if QUARANTINE_SECONDS > 0:
+        hold_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=QUARANTINE_SECONDS)
+        ).isoformat()
+    else:
+        hold_until = (
+            datetime.now(timezone.utc) - timedelta(milliseconds=10)
+        ).isoformat()
     try:
         listing_id = await db.run_async(
             db.insert_listing,
@@ -1449,6 +1621,7 @@ async def _process_supplier_message(
             fingerprint=fingerprint,
             hold_until=hold_until,
         )
+        wake_held_worker()
     except Exception as exc:
         # INGEST-1: a failed INSERT leaves no row, so the outer handler's
         # get_listing_by_source() returns None and there is nothing to mark or
@@ -1466,12 +1639,18 @@ async def _process_supplier_message(
             exc,
         )
         raise
-    logger.info(
-        "Listing #%s held for dedup quarantine until %s (%ds).",
-        listing_id,
-        hold_until,
-        QUARANTINE_SECONDS,
-    )
+    if QUARANTINE_SECONDS > 0:
+        logger.info(
+            "Listing #%s held for dedup quarantine until %s (%ds).",
+            listing_id,
+            hold_until,
+            QUARANTINE_SECONDS,
+        )
+    else:
+        logger.info(
+            "Listing #%s held (fast mode, 0s delay); waking held worker immediately.",
+            listing_id,
+        )
     return
 
 
@@ -1560,7 +1739,7 @@ async def _evaluate_listing(
     # path — so it is caught BEFORE the AI and routed to manual review.
     payment_proof = filters.detect_payment_proof(raw_text)
     if payment_proof:
-        await db.run_async(db.update_listing_status, listing_id, "pending_approval")
+        await db.run_async(db.update_listing_status, listing_id, "pending_review")
         await db.run_async(
             db.record_audit,
             "payment_proof_review",
@@ -1596,11 +1775,7 @@ async def _evaluate_listing(
 
         # Deterministic fallback (no AI): keep real listings publishing during
         # an AI outage via the regex/emoji-strip path already used for previews.
-        # Gated HARD (FALLBACK-1): only a message with a concrete listing
-        # signal + a substantive sanitized body + no payment-proof may
-        # auto-publish. Anything weaker routes to manual review below. The
-        # blocked-keyword screen is an additional safety valve — stolen/hacked
-        # content ALWAYS still routes to manual review, never auto-published.
+        # Fallback NEVER auto-publishes unless FALLBACK_AUTOPUBLISH=1 and all checks pass.
         risky_keyword = filters.contains_blocked_keyword(raw_text)
         fb_content_lines = [
             ln.strip()
@@ -1608,79 +1783,88 @@ async def _evaluate_listing(
             if ln.strip()
         ] or ["Available"]
         fb_lines, fb_body_ok = parser.prepare_body(fb_content_lines, raw_text)
+        fb_platform = filters.detect_platform_from_text(raw_text)
+        fb_rendered = "\n".join(fb_lines)
+
         if deterministic_fallback_publish_ok(
             paused=await db.run_async(db.is_paused),
             risky_keyword=risky_keyword,
             has_payment_proof=filters.detect_payment_proof(raw_text),
             has_clear_signal=filters.has_clear_listing_signal(raw_text),
             body_ok=fb_body_ok,
+            raw_text=raw_text,
+            rendered_body=fb_rendered,
+            platform=fb_platform,
         ):
             content_lines = fb_lines
             post_number = await db.run_async(db.next_post_number)
-            out_text, entities = parser.build_ai_message(
-                content_lines=content_lines,
-                platform=None,
-                contact_username=CONTACT_USERNAME,
-                header_emoji=await header_emoji_for_listing(listing_id),
-                post_number=post_number,
-                source_text=raw_text,
+            claimed = await db.run_async(
+                db.claim_listing_for_publish, listing_id, post_number
             )
-            try:
-                published_msg_id = await publish_to_destination(client, out_text, entities)
-                await db.run_async(
-                    db.update_listing_status,
-                    listing_id=listing_id,
-                    status="published",
-                    published_message_id=published_msg_id,
+            if claimed:
+                out_text, entities = parser.build_ai_message(
+                    content_lines=content_lines,
+                    platform=fb_platform,
+                    contact_username=CONTACT_USERNAME,
+                    header_emoji=await header_emoji_for_listing(listing_id),
                     post_number=post_number,
+                    source_text=raw_text,
                 )
-                await db.run_async(
-                    db.record_audit,
-                    "published_deterministic_fallback",
-                    listing_id,
-                    detail=f"AI unavailable (msg_id {published_msg_id})",
-                )
-                await enqueue_destination_forwardings(listing_id, published_msg_id)
-                logger.info(
-                    "Listing #%s published via deterministic fallback (AI down) -> %s (msg_id: %s)",
-                    listing_id,
-                    DEST_CHANNEL,
-                    published_msg_id,
-                )
-                await _alert_admin_on_published(bot_client, supplier, listing_id)
-            except PublishError as exc:
-                await db.run_async(db.mark_listing_failed, listing_id, str(exc))
-                logger.error(
-                    "Listing #%s deterministic fallback exhausted publish retries; "
-                    "moved to failed queue. Last error: %s",
-                    listing_id,
-                    exc,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                await db.run_async(
-                    db.mark_listing_failed,
-                    listing_id,
-                    "unexpected deterministic fallback publish error",
-                )
-                logger.exception(
-                    "Failed to publish listing #%s via deterministic fallback",
-                    listing_id,
-                )
-            return
+                try:
+                    published_msg_id = await publish_to_destination(client, out_text, entities)
+                    await db.run_async(
+                        db.update_listing_status,
+                        listing_id=listing_id,
+                        status="published",
+                        published_message_id=published_msg_id,
+                        post_number=post_number,
+                    )
+                    await db.run_async(
+                        db.record_audit,
+                        "published_deterministic_fallback",
+                        listing_id,
+                        detail=f"AI unavailable (msg_id {published_msg_id})",
+                    )
+                    await enqueue_destination_forwardings(listing_id, published_msg_id)
+                    logger.info(
+                        "Listing #%s published via deterministic fallback (AI down) -> %s (msg_id: %s)",
+                        listing_id,
+                        DEST_CHANNEL,
+                        published_msg_id,
+                    )
+                    await _alert_admin_on_published(bot_client, supplier, listing_id)
+                except PublishError as exc:
+                    await db.run_async(db.mark_listing_failed, listing_id, str(exc))
+                    logger.error(
+                        "Listing #%s deterministic fallback exhausted publish retries; "
+                        "moved to failed queue. Last error: %s",
+                        listing_id,
+                        exc,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await db.run_async(
+                        db.mark_listing_failed,
+                        listing_id,
+                        "unexpected deterministic fallback publish error",
+                    )
+                    logger.exception(
+                        "Failed to publish listing #%s via deterministic fallback",
+                        listing_id,
+                    )
+                return
 
-        # AI is down AND the content is either risky or publishing is paused:
-        # route to admin review instead of dropping the message silently.
+        # AI unavailable / failed: route to pending_approval tagged "AI unavailable"
         reason_detail = (
             f"blocked-keyword screen: {risky_keyword}"
             if risky_keyword
-            else "No AI response; routed for manual review"
+            else "AI unavailable"
         )
-        await db.run_async(db.update_listing_status, listing_id, "pending_review")
+        await db.run_async(db.update_listing_status, listing_id, "pending_approval")
         await db.run_async(db.record_audit, "ai_unavailable", listing_id, detail=reason_detail)
-        logger.warning(
-            "Listing #%s: AI analysis unavailable (%s). Routed to pending_review.",
+        logger.info(
+            "Listing #%s: AI analysis unavailable (%s). Routed to pending_approval.",
             listing_id,
             reason_detail,
         )
@@ -1688,16 +1872,13 @@ async def _evaluate_listing(
             listing_dict = db.get_listing_by_id(listing_id)
             if listing_dict:
                 listing_dict["supplier_username"] = supplier.get("channel_username")
-                listing_dict["_review_reason"] = "ai_unavailable"
+                listing_dict["_review_reason"] = "AI unavailable"
                 await admin_bot.send_review_notification(bot_client, ADMIN_USER_ID, listing_dict)
         return
 
     # Blocklist check (AI-detected illicit / hacked / stolen content).
     # A wrong "blocked" would silently destroy a real listing, so flagged
     # messages go to admin review, not the trash.
-    # INJECT-1: the deterministic keyword screen also overrides a lenient AI
-    # verdict — if the raw source trips a blocked keyword, the listing ALWAYS
-    # routes to manual review, never auto-published, without trusting the model.
     risky_keyword = filters.contains_blocked_keyword(raw_text)
     if analysis.get("blocked") or risky_keyword:
         reason = analysis.get("block_reason") or f"blocked-keyword screen: {risky_keyword}"
@@ -1734,10 +1915,30 @@ async def _evaluate_listing(
     content_lines = analysis.get("content") or []
     ai_clean_text = "\n".join(content_lines) if content_lines else fallback_clean_text
 
+    # Check category blocklist (Task 11)
+    category_blocked = filters.check_category_blocked(raw_text, platform_name, BLOCKED_PLATFORM_CATEGORIES)
+    if category_blocked:
+        await db.run_async(db.update_listing_status, listing_id, "pending_review")
+        await db.run_async(
+            db.record_audit,
+            "category_blocked_review",
+            listing_id,
+            detail=f"category '{category_blocked}' blocked",
+        )
+        logger.warning(
+            "Listing #%s belongs to blocked category '%s' — routed to pending_review.",
+            listing_id,
+            category_blocked,
+        )
+        if bot_client and ADMIN_USER_ID:
+            listing_dict = db.get_listing_by_id(listing_id)
+            if listing_dict:
+                listing_dict["supplier_username"] = supplier.get("channel_username")
+                listing_dict["_review_reason"] = f"category_{category_blocked}"
+                await admin_bot.send_review_notification(bot_client, ADMIN_USER_ID, listing_dict)
+        return
+
     # Persist the AI-rewritten body so the worker / admin preview reuse it as-is.
-    # platform is informational only — it does NOT gate publishing. The header is
-    # the admin's own custom emoji, drawn at random from their pool and pinned to
-    # this listing here, which makes every later render of it reproducible.
     header_id, header_emoji = await resolve_listing_header(listing_id)
     await db.run_async(
         db.update_listing_fields,
@@ -1749,22 +1950,31 @@ async def _evaluate_listing(
     if ai_clean_text:
         await db.run_async(db.update_listing_content, listing_id, clean_text=ai_clean_text)
 
-    # Sanitize the AI body now (strip leaked prices/@handles/DM lines) and gate
-    # the buy auto-publish: a buy demand auto-publishes when it has a
-    # substantive sanitized body and shows no payment-proof signal — prices and
-    # platforms are never part of the decision. Everything else routes to manual
-    # approval.
+    # Sanitize the AI body now and gate the buy auto-publish.
     body_lines, body_ok = parser.prepare_body(content_lines, ai_clean_text or raw_text)
+    temp_rendered = "\n".join(body_lines)
     buy_auto_ok = buy_auto_publish_ok(
         intent=intent,
         paused=await db.run_async(db.is_paused),
         body_ok=body_ok,
         has_payment_proof=filters.detect_payment_proof(raw_text),
+        rendered_body=temp_rendered,
+        risky_keyword=filters.contains_blocked_keyword(raw_text),
+        category_blocked=category_blocked,
     )
 
     if buy_auto_ok:
-        # Buy demand -> rephrase + auto-publish (gated).
         post_number = await db.run_async(db.next_post_number)
+        claimed = await db.run_async(
+            db.claim_listing_for_publish, listing_id, post_number
+        )
+        if not claimed:
+            logger.warning(
+                "Listing #%s could not be claimed for publish (already claimed or published); skipping.",
+                listing_id,
+            )
+            return
+
         our_text, entities = parser.build_ai_message(
             content_lines=body_lines,
             platform=platform_name,
@@ -1831,7 +2041,9 @@ async def _evaluate_listing(
                 await admin_bot.send_review_notification(bot_client, ADMIN_USER_ID, listing_dict)
 
 
-async def process_edited_message(client: TelegramClient, event) -> None:
+async def process_edited_message(
+    client: TelegramClient, event, bot_client: Optional[TelegramClient] = None
+) -> None:
     """Handle edited message in a monitored supplier channel."""
     msg = event.message
     if not msg:
@@ -1846,106 +2058,163 @@ async def process_edited_message(client: TelegramClient, event) -> None:
     raw_text = msg.text or ""
 
     existing = db.get_listing_by_source(supplier_id, source_msg_id)
-    if not existing or existing.get("status") != "published" or not existing.get("published_message_id"):
-        logger.debug("Edit on unindexed or unpublished source message %s; ignoring", source_msg_id)
+    if not existing:
+        logger.debug("Edit on unindexed source message %s; ignoring", source_msg_id)
         return
 
-    # AI analysis + rewriting of the edited content
-    analysis = await ai_rephraser.analyze_message(raw_text)
-
-    if analysis is None:
-        logger.warning(
-            "Edited message %s: AI analysis unavailable. Leaving published post intact.",
-            source_msg_id,
-        )
+    stored_raw = existing.get("raw_text") or ""
+    # Idempotent: ignore edit events whose text hash equals stored raw_text hash
+    if hashlib.sha256(raw_text.encode("utf-8")).hexdigest() == hashlib.sha256(stored_raw.encode("utf-8")).hexdigest():
+        logger.debug("Edit event text hash equals stored raw_text hash for msg %s; ignoring", source_msg_id)
         return
 
-    if analysis.get("blocked"):
-        logger.warning(
-            "Edited message %s now flagged as blocked by AI. Leaving existing published post intact.",
-            source_msg_id,
-        )
-        return
+    listing_id = existing["id"]
+    status = existing.get("status")
 
-    if not analysis.get("is_listing"):
-        logger.info(
-            "Edited message %s no longer qualifies as a valid listing. Leaving published post intact.",
-            source_msg_id,
-        )
-        return
-
-    platform_name = analysis.get("platform")
-    intent = analysis.get("intent") or "neutral"
-    content_lines = analysis.get("content") or []
-    ai_clean_text = "\n".join(content_lines) if content_lines else parser.strip_all_emoji(raw_text)
-
-    # AI-only decision: update the destination post from whatever the analysis
-    # returns (the footer price is always the static "Price DM" line).
-
-    # No-op guard: skip edit if nothing meaningfully changed.
-    if ai_clean_text == existing.get("clean_text"):
-        logger.debug("Edit on source msg %s is a no-op; skipping", source_msg_id)
-        return
-
-    # An edit must not reshuffle the header: the listing's already-pinned header
-    # is reused, so the post keeps the emoji it published with.
-    updated_text, entities = parser.build_ai_message(
-        content_lines=content_lines,
-        platform=platform_name,
-        contact_username=CONTACT_USERNAME,
-        header_emoji=await header_emoji_for_listing(existing["id"]),
-        post_number=existing.get("post_number"),
-        source_text=raw_text,
-    )
-
-    published_msg_id = existing["published_message_id"]
-    dest_peer = db.to_peer_reference(DEST_CHANNEL)
-    try:
-        await client.edit_message(
-            dest_peer, published_msg_id, updated_text,
-            formatting_entities=entities
-        )
-        await db.run_async(
-            db.update_listing_fields,
-            listing_id=existing["id"],
-            platform_name=platform_name,
-            intent=intent,
-        )
-        await db.run_async(
-            db.update_listing_content,
-            listing_id=existing["id"],
-            clean_text=ai_clean_text,
-            rank_tier=None,
-        )
-        # TEL-3: refresh the dedup fingerprint from the edited raw text so a
-        # re-processed/re-delivered version of this message is recognized.
+    # If the listing is still held: update raw_text, recompute fingerprint, keep original hold_until
+    if status == "held":
+        await db.run_async(db.update_listing_raw_text, listing_id, raw_text)
         edit_price, _ = parser.extract_price(raw_text)
         await db.run_async(
             db.set_listing_fingerprint,
-            existing["id"],
+            listing_id,
             raw_text,
             price=edit_price,
         )
+        logger.info("Updated raw_text and fingerprint for held listing #%s; hold_until preserved.", listing_id)
+        return
+
+    # If the listing is received, pending_*, or approved (not yet published):
+    # update raw_text and re-run the full pipeline. Invalidate the ai_cache entry for old fingerprint.
+    if status in ("received", "approved") or (isinstance(status, str) and status.startswith("pending_")):
+        await db.run_async(db.update_listing_raw_text, listing_id, raw_text)
+        old_fp = existing.get("fingerprint")
+        if old_fp:
+            await db.run_async(db.delete_ai_cache, old_fp)
+        edit_price, _ = parser.extract_price(raw_text)
+        await db.run_async(
+            db.set_listing_fingerprint,
+            listing_id,
+            raw_text,
+            price=edit_price,
+        )
+        fresh_listing = db.get_listing_by_id(listing_id)
+        if fresh_listing:
+            fresh_listing["supplier_username"] = supplier.get("channel_username")
+            fresh_listing["supplier_display_name"] = supplier.get("display_name")
+            await _evaluate_listing(client, bot_client, fresh_listing)
+        return
+
+    # If the listing is already published:
+    if status == "published" and existing.get("published_message_id"):
+        old_fp = existing.get("fingerprint")
+        if old_fp:
+            await db.run_async(db.delete_ai_cache, old_fp)
+
+        # Run edited text through filters, AI, and sanitizer into candidate body WITHOUT touching published post
+        risky_keyword = filters.contains_blocked_keyword(raw_text)
+        has_payment_proof = filters.detect_payment_proof(raw_text)
+        cat_blocked = filters.check_category_blocked(raw_text, None, BLOCKED_PLATFORM_CATEGORIES)
+
+        analysis = await ai_rephraser.analyze_message(raw_text)
+
+        content_lines = analysis.get("content") or [] if analysis else []
+        sanitized_lines, body_ok = parser.prepare_body(content_lines, raw_text)
+        rendered_candidate = "\n".join(sanitized_lines)
+        framing_ok = rules.check_buyer_framing(rendered_candidate)
+        is_blocked = bool((analysis and analysis.get("blocked")) or risky_keyword or cat_blocked)
+        intent_buy = bool(analysis and analysis.get("intent") == "buy" and analysis.get("is_listing"))
+        paused = await db.run_async(db.is_paused)
+
+        all_gates_pass = (
+            not is_blocked
+            and not has_payment_proof
+            and intent_buy
+            and body_ok
+            and framing_ok
+            and not paused
+        )
+
+        if all_gates_pass:
+            # Edit the published post
+            platform_name = analysis.get("platform")
+            header_emoji = await header_emoji_for_listing(existing["id"])
+            updated_text, entities = parser.build_ai_message(
+                content_lines=sanitized_lines,
+                platform=platform_name,
+                contact_username=CONTACT_USERNAME,
+                header_emoji=header_emoji,
+                post_number=existing.get("post_number"),
+                source_text=raw_text,
+            )
+            published_msg_id = existing["published_message_id"]
+            dest_peer = db.to_peer_reference(DEST_CHANNEL)
+            try:
+                await client.edit_message(
+                    dest_peer, published_msg_id, updated_text, formatting_entities=entities
+                )
+                await db.run_async(db.update_listing_raw_text, listing_id, raw_text)
+                await db.run_async(
+                    db.update_listing_content,
+                    listing_id=listing_id,
+                    clean_text=rendered_candidate,
+                )
+                edit_price, _ = parser.extract_price(raw_text)
+                await db.run_async(
+                    db.set_listing_fingerprint,
+                    listing_id,
+                    raw_text,
+                    price=edit_price,
+                )
+                await db.run_async(
+                    db.record_audit,
+                    "edited_destination",
+                    listing_id,
+                    detail=f"source {source_msg_id}",
+                )
+                logger.info("Updated destination post %s for edited source msg %s", published_msg_id, source_msg_id)
+            except Exception as exc:
+                logger.exception("Failed to edit destination message %s: %s", published_msg_id, exc)
+            return
+
+        # Otherwise leave published post UNCHANGED, set audit_log edit_rejected_review, and send alert card
+        rejection_reasons = []
+        if is_blocked:
+            rejection_reasons.append("blocked content/keyword")
+        if has_payment_proof:
+            rejection_reasons.append("payment proof")
+        if not intent_buy:
+            rejection_reasons.append("intent not buy / not listing")
+        if not body_ok:
+            rejection_reasons.append("sanitizer failed / link or handle / platform lost")
+        if not framing_ok:
+            rejection_reasons.append("seller framing (WTS/sell)")
+        if paused:
+            rejection_reasons.append("system paused")
+        reason_str = ", ".join(rejection_reasons) or "gate rejected"
+
         await db.run_async(
             db.record_audit,
-            "edited_destination",
-            existing["id"],
-            detail=f"source {source_msg_id}",
+            "edit_rejected_review",
+            listing_id,
+            detail=reason_str,
         )
-        logger.info(
-            "Updated destination post %s in %s for source msg %s",
-            published_msg_id,
-            DEST_CHANNEL,
-            source_msg_id,
+        await db.run_async(db.set_setting, f"pending_edit:{listing_id}", raw_text)
+        logger.warning(
+            "Listing #%s source edit rejected by gates (%s). Published post unchanged. Alerting admin.",
+            listing_id,
+            reason_str,
         )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception(
-            "Failed to edit destination message %s for source %s",
-            published_msg_id,
-            source_msg_id,
-        )
+        if bot_client and ADMIN_USER_ID:
+            await admin_bot.send_edit_rejected_alert(
+                bot_client,
+                ADMIN_USER_ID,
+                existing,
+                stored_raw,
+                raw_text,
+                reason_str,
+            )
+        return
 
 
 async def process_deleted_message(event) -> None:
@@ -2212,10 +2481,18 @@ async def held_listings_worker(
     is already past its hold_until, so the drain query picks it up. The claim is
     idempotent, so re-draining a row that was mid-evaluation is harmless.
     """
+    ticks = 0
     while not stop_event.is_set():
         _mark_worker_heartbeat("held_worker")
+        ticks += 1
         try:
             await drain_held_listings(client, bot_client, 10)
+            if ticks % 6 == 0:
+                # Crash recovery for stale 'received' listings (Task 5)
+                stale_received = await db.run_async(db.claim_stale_received_listing, 120, 5)
+                for stale in stale_received:
+                    logger.info("held_worker: recovering stale received listing #%s", stale["id"])
+                    await _evaluate_listing(client, bot_client, stale)
             _clear_worker_failure("held_worker")
         except asyncio.CancelledError:
             raise
@@ -2231,9 +2508,9 @@ async def held_listings_worker(
             await _alert_stuck_workers(bot_client)
 
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            pass
+            await _wait_or_wake(get_wake_held_worker(), stop_event, timeout=1.0)
+        except asyncio.CancelledError:
+            raise
 
 
 async def approved_listings_worker(
@@ -2402,9 +2679,9 @@ async def approved_listings_worker(
             logger.exception("Error in approved listings worker")
 
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            pass
+            await _wait_or_wake(get_wake_approved_worker(), stop_event, timeout=1.0)
+        except asyncio.CancelledError:
+            raise
 
 
 async def health_check_worker(
@@ -2681,6 +2958,9 @@ async def main() -> None:
         try:
             bot_client = await admin_bot.create_admin_bot_client()
             admin_bot.set_user_client(user_client)
+            admin_bot.set_on_approve_callback(wake_approved_worker)
+            admin_bot.set_on_forward_callback(wake_forward_worker)
+            admin_bot.set_on_supplier_change_callback(invalidate_supplier_cache)
             logger.info("Admin bot integrated successfully.")
         except Exception:
             logger.exception("Failed to start integrated admin bot; continuing with user listener only.")
@@ -2691,13 +2971,12 @@ async def main() -> None:
         @user_client.on(events.NewMessage)
         async def on_new_message(event):
             try:
-                await db.run_async(
-                    db.set_setting, "last_inbound_at", datetime.now(timezone.utc).isoformat()
-                )
-
                 async def _handle_new():
                     supplier = await resolve_supplier_for_event(event)
                     if supplier:
+                        await db.run_async(
+                            db.set_setting, "last_inbound_at", datetime.now(timezone.utc).isoformat()
+                        )
                         await process_supplier_message(user_client, bot_client, supplier, event.message)
 
                 await publish_guard.run_with_floodwait_retry(
@@ -2713,7 +2992,7 @@ async def main() -> None:
         async def on_message_edited(event):
             try:
                 async def _handle_edit():
-                    await process_edited_message(user_client, event)
+                    await process_edited_message(user_client, event, bot_client)
 
                 await publish_guard.run_with_floodwait_retry(
                     _handle_edit,
@@ -2734,6 +3013,32 @@ async def main() -> None:
                 logger.exception("Unhandled error processing deleted message")
 
     await user_client.start()
+
+    # Task 8: Check if user client has Telegram Premium
+    try:
+        me = await user_client.get_me()
+        is_premium = bool(getattr(me, "premium", False))
+        if not is_premium:
+            logger.warning("=" * 65)
+            logger.warning("WARNING: Telethon user client is NOT Telegram Premium!")
+            logger.warning("Custom emoji headers and flags may not render properly.")
+            logger.warning("=" * 65)
+        await db.run_async(db.set_setting, "user_client_premium", "1" if is_premium else "0")
+    except Exception as exc:
+        logger.warning("Could not check user client premium status: %s", exc)
+
+    # Task 7: Lightweight model check against Groq
+    if GROQ_API_KEY:
+        await ai_rephraser.verify_model_available()
+
+    # Task 5: Startup crash recovery sweep for stale 'received' listings
+    try:
+        startup_stale = await db.run_async(db.claim_stale_received_listing, 120, 10)
+        for stale in startup_stale:
+            logger.info("Startup crash recovery for received listing #%s", stale["id"])
+            await _evaluate_listing(user_client, bot_client, stale)
+    except Exception as exc:
+        logger.warning("Startup crash recovery sweep failed: %s", exc)
 
     # Optional dedicated forward-only account (DEST-ROUTE): a second Telethon
     # session whose job is forwarding posts to destination groups.

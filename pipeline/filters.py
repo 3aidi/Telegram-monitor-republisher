@@ -7,8 +7,9 @@ string so the caller can log the exact rule that skipped a message.
 """
 
 import logging
+import os
 import re
-from typing import Optional
+from typing import Optional, Set
 import emoji
 import db
 
@@ -18,6 +19,96 @@ logger = logging.getLogger("filters")
 REASON_DUPLICATE = "duplicate"
 REASON_NO_CONTENT = "no_content"
 REASON_CHATTER = "chatter"
+
+# ---------------------------------------------------------------------------
+# Sanitizer patterns (Task 2): strip URLs, handles, emails, phones, crypto
+# addresses and long hex/base58 strings.
+# ---------------------------------------------------------------------------
+URL_PATTERN = re.compile(
+    r"\b(?:https?://|ftp://|www\.)\S+|(?:^|[\s/])(?:t|telegram)\.me/[a-zA-Z0-9_+/-]+",
+    re.IGNORECASE,
+)
+HANDLE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])@[A-Za-z0-9_]{3,}\b"
+)
+EMAIL_PATTERN = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+PHONE_PATTERN = re.compile(
+    r"(?:\+[0-9]{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b"
+    r"|\+(?:[0-9][ -]?){7,14}[0-9]"
+    r"|\b0\d{2,4}[-.\s]?\d{5,8}\b"
+)
+CRYPTO_ADDRESS_PATTERN = re.compile(
+    r"\b0x[a-fA-F0-9]{40}\b"  # ETH / EVM
+    r"|\b(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z0-9]{38,59})\b"  # BTC
+    r"|\bT[A-Za-z1-9]{33}\b"  # TRX / TRC20
+    r"|\b[1-9A-HJ-NP-Za-km-z]{32,44}\b"  # SOL / Base58 (min 32 chars)
+    r"|\b[0-9a-fA-F]{32,64}\b"  # Long hex
+)
+
+# ---------------------------------------------------------------------------
+# Known Platforms Allowlist & Category Mapping (Task 3 & Task 11)
+# ---------------------------------------------------------------------------
+KNOWN_PLATFORMS: Set[str] = {
+    # Streaming
+    "netflix", "spotify", "youtube", "disney", "disney+", "hulu", "prime", "prime video",
+    "apple tv", "iptv", "deezer", "tidal", "crunchyroll", "paramount+",
+    # Crypto / Exchange
+    "bybit", "binance", "kucoin", "okx", "crypto.com", "coinbase", "kraken", "bitget",
+    "mexc", "gate.io", "huobi", "htx",
+    # Neobanks & Payment
+    "revolut", "wise", "buddybank", "buddypay", "indexo", "paypal", "stripe", "payoneer",
+    "skrill", "neteller", "n26", "chime", "monzo", "cashapp", "venmo", "curve",
+    "norisbank", "postbank", "sparkasse", "ing",
+    # Cloud & VPS
+    "hetzner", "aws", "digitalocean", "ovh", "chatgpt", "openai", "vultr", "linode",
+}
+
+PLATFORM_CATEGORIES = {
+    "kyc": {"sumsub", "veriff", "jumio", "onfido", "shufti", "kyc"},
+    "exchange": {"bybit", "binance", "kucoin", "okx", "crypto.com", "coinbase", "kraken", "bitget", "mexc", "gate.io", "huobi", "htx"},
+    "crypto": {"bybit", "binance", "kucoin", "okx", "crypto.com", "coinbase", "kraken", "bitget", "mexc", "gate.io", "huobi", "htx"},
+    "neobank": {"revolut", "wise", "buddybank", "buddypay", "indexo", "paypal", "stripe", "payoneer", "skrill", "neteller", "n26", "chime", "monzo", "cashapp", "venmo", "curve", "norisbank", "postbank", "sparkasse", "ing"},
+    "bank": {"revolut", "wise", "buddybank", "buddypay", "indexo", "paypal", "stripe", "payoneer", "skrill", "neteller", "n26", "chime", "monzo", "cashapp", "venmo", "curve", "norisbank", "postbank", "sparkasse", "ing"},
+    "streaming": {"netflix", "spotify", "youtube", "disney", "disney+", "hulu", "prime", "prime video", "apple tv", "iptv", "deezer", "tidal", "crunchyroll", "paramount+"},
+    "vps": {"hetzner", "aws", "digitalocean", "ovh", "vultr", "linode"},
+    "cloud": {"hetzner", "aws", "digitalocean", "ovh", "chatgpt", "openai", "vultr", "linode"},
+}
+
+def detect_platform_from_text(text: str) -> Optional[str]:
+    """Extract platform name from text if it matches known platforms."""
+    t = (text or "").lower()
+    for p in sorted(KNOWN_PLATFORMS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(p)}\b", t):
+            return p
+    return None
+
+def check_category_blocked(text: str, platform: Optional[str] = None, blocked_categories: Optional[str] = None) -> Optional[str]:
+    """Check if platform or text belongs to any blocked category in BLOCKED_PLATFORM_CATEGORIES."""
+    raw_cats = blocked_categories if blocked_categories is not None else os.environ.get("BLOCKED_PLATFORM_CATEGORIES", "")
+    if isinstance(raw_cats, (list, set, tuple)):
+        cats = [str(c).strip().lower() for c in raw_cats if str(c).strip()]
+    elif isinstance(raw_cats, str):
+        cats = [c.strip().lower() for c in raw_cats.split(",") if c.strip()]
+    else:
+        cats = []
+    if not cats:
+        return None
+
+    t = (text or "").lower()
+    p = (platform or "").lower() or detect_platform_from_text(t) or ""
+
+    for cat in cats:
+        if cat == "kyc":
+            if re.search(r"\b(?:kyc|verified|verification|verify|identity|document|passport|id card|sumsub|veriff)\b", t):
+                return "kyc"
+        known_in_cat = PLATFORM_CATEGORIES.get(cat, set())
+        if p in known_in_cat:
+            return cat
+        if known_in_cat and any(re.search(rf"\b{re.escape(item)}\b", t) for item in known_in_cat):
+            return cat
+    return None
 
 
 def is_duplicate_listing(
@@ -242,3 +333,15 @@ def has_clear_listing_signal(text: str) -> bool:
         if signal.search(t):
             return True
     return False
+
+
+def detect_buy_intent(text: str) -> bool:
+    """True if text has explicit buy-intent keywords (WTB, want to buy, need, etc.)."""
+    from pipeline.rules import _EXPLICIT_BUY_RE
+    return bool(_EXPLICIT_BUY_RE.search(text or ""))
+
+
+def detect_sell_intent(text: str) -> bool:
+    """True if text has sell-phrase match (WTS, selling, for sale, stock, available, etc.)."""
+    from pipeline.rules import _SELL_PHRASE_RE
+    return bool(_SELL_PHRASE_RE.search(text or ""))

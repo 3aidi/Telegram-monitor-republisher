@@ -47,32 +47,42 @@ _ACTIVE_DEDUP_STATUSES = (
     "approved",
 )
 
-def make_listing_fingerprint(
-    clean_text: str, price: Optional[float] = None
-) -> str:
-    """Hash of the normalized listing content + its price.
+DEDUP_IGNORE_PRICE = os.environ.get("DEDUP_IGNORE_PRICE", "1").strip().lower() in ("1", "true", "yes")
 
-    Dedup must work BEFORE the AI runs (and be indifferent to AI output, which
-    is non-deterministic), so the fingerprint is built from the deterministic
-    source text only â€” not platform/price (DEDUP-2). The price is folded in so
-    the same product re-posted at a different price is NOT treated as a
-    duplicate, and a re-post that arrives with a new Telegram message id IS
-    caught (identity follows the content, not the message id). The 30-char
-prefix truncation is deliberately gone: it caused unrelated long texts to
-    collide.
+def make_listing_fingerprint(
+    clean_text: str,
+    price: Optional[float] = None,
+    platform: Optional[str] = None,
+    ignore_price: Optional[bool] = None,
+) -> str:
+    """Hash of the normalized listing content.
+
+    When DEDUP_IGNORE_PRICE=1 (default), price is omitted and numbers that look
+    like prices are removed so re-posts with changed prices or formatting are
+    recognized as duplicates. When DEDUP_IGNORE_PRICE=0, price is folded in.
     """
+    should_ignore = DEDUP_IGNORE_PRICE if ignore_price is None else ignore_price
     norm = unicodedata.normalize("NFKC", (clean_text or "").strip().lower())
     # DEDUP-FN: collapse the punctuation variants that are visually identical to
     # readers — em/en/2-em dashes and the minus sign become '-', smart quotes
-    # become straight ASCII, non-breaking spaces fold to a space. A re-post with
-    # cosmetic punctuation differences therefore produces the SAME fingerprint
-    # and is caught as a duplicate instead of slipping through.
+    # become straight ASCII, non-breaking spaces fold to a space.
     norm = norm.replace("\u2212", "-").replace("--", "-")
     norm = norm.replace("\u2018", "'").replace("\u2019", "'")
     norm = norm.replace("\u201c", '"').replace("\u201d", '"')
     norm = re.sub(r"[\s\u00a0]+", " ", norm)
-    if price is not None:
-        norm = f"{norm} | {price:g}"
+
+    if should_ignore:
+        # Lowercased, whitespace and punctuation collapsed, numbers that look like prices removed
+        norm = re.sub(r"(?:[\$€£]|usd|usdt|eur)\s*\d+[\d.,]*", "", norm, flags=re.IGNORECASE)
+        norm = re.sub(r"\d+[\d.,]*\s*(?:[\$€£]|usd|usdt|eur)\b", "", norm, flags=re.IGNORECASE)
+        norm = re.sub(r"\b(?:price|rate|cost|budget)\s*[:=]?\s*\d+[\d.,]*", "", norm, flags=re.IGNORECASE)
+        norm = re.sub(r"[^\w\s]", " ", norm)
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if platform:
+            norm = f"{platform.strip().lower()} {norm}"
+    else:
+        if price is not None:
+            norm = f"{norm} | {price:g}"
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()
 
 # ---------------------------------------------------------------------------
@@ -214,14 +224,30 @@ def set_listing_fingerprint(
     listing_id: int,
     clean_text: str,
     price: Optional[float] = None,
+    platform: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> None:
-    """Store the content dedup fingerprint (normalized text + price)."""
-    fingerprint = make_listing_fingerprint(clean_text, price=price)
+    """Store the content dedup fingerprint."""
     with db_session(db_path) as conn:
+        if platform is None:
+            r = conn.execute("SELECT platform_name FROM listings WHERE id = ?", (listing_id,)).fetchone()
+            if r:
+                platform = r["platform_name"]
+        fingerprint = make_listing_fingerprint(clean_text, price=price, platform=platform)
         conn.execute(
             "UPDATE listings SET fingerprint = ? WHERE id = ?",
             (fingerprint, listing_id),
+        )
+
+def update_listing_raw_text(
+    listing_id: int, raw_text: str, db_path: Optional[str] = None
+) -> None:
+    """Update raw_text and updated_at for an edited listing."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        conn.execute(
+            "UPDATE listings SET raw_text = ?, updated_at = ? WHERE id = ?",
+            (raw_text, now_iso, listing_id),
         )
 
 def mark_listing_failed(
@@ -436,7 +462,7 @@ def claim_held_listing(
         cursor = conn.execute(
             f"""
             UPDATE listings
-            SET status = 'claimed', updated_at = ?
+            SET status = 'claimed', updated_at = ?, received_at = ?
             WHERE id = ?
               AND status = 'held'
               AND (
@@ -450,9 +476,28 @@ def claim_held_listing(
                       )
                   )
             """,
-            (now_iso, listing_id, cutoff, *_ACTIVE_DEDUP_STATUSES),
+            (now_iso, now_iso, listing_id, cutoff, *_ACTIVE_DEDUP_STATUSES),
         )
         if cursor.rowcount > 0:
+            # Quarantine guarantee: immediately mark any other concurrent 'held'
+            # rows with the same fingerprint as skipped_duplicate, even if their
+            # hold_until has not expired yet.
+            row_fp = conn.execute(
+                "SELECT fingerprint FROM listings WHERE id = ?", (listing_id,)
+            ).fetchone()
+            if row_fp and row_fp["fingerprint"]:
+                conn.execute(
+                    """
+                    UPDATE listings
+                    SET status = 'skipped_duplicate',
+                        duplicate_of = ?,
+                        updated_at = ?
+                    WHERE fingerprint = ?
+                      AND id != ?
+                      AND status = 'held'
+                    """,
+                    (listing_id, now_iso, row_fp["fingerprint"], listing_id),
+                )
             return listing_id
 
         row = conn.execute(
@@ -807,32 +852,89 @@ def count_published_listings(db_path: Optional[str] = None) -> int:
 def next_post_number(db_path: Optional[str] = None) -> int:
     """Atomically reserve + return the next sequential post number.
 
-    Backed by the 'post_seq' counter in app_settings (seeded by the v4
-    migration with the count of already-published posts). Gaps are acceptable:
-    a number reserved before a send that later fails is simply skipped.
-
-    The counter row is seeded via INSERT ... ON CONFLICT DO NOTHING so two
-    concurrent first-time callers on a fresh database can never both reach an
-    unguarded INSERT (which would have raised a PRIMARY KEY violation on the
-    loser). Each call then runs inside its own write transaction, so SQLite's
-    single-writer rule guarantees every caller sees a distinct value.
+    Backed by the 'post_counter' counter in app_settings (migrated in v13).
+    Incremented atomically in a single transaction; never derived from MAX()
+    on listings and survives all database purges.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
         conn.execute(
-            "INSERT INTO app_settings (key, value, updated_at) VALUES ('post_seq', '0', ?) "
+            "INSERT INTO app_settings (key, value, updated_at) VALUES ('post_counter', '0', ?) "
             "ON CONFLICT(key) DO NOTHING",
             (now_iso,),
         )
+        row_seq = conn.execute("SELECT value FROM app_settings WHERE key = 'post_seq'").fetchone()
+        row_ctr = conn.execute("SELECT value FROM app_settings WHERE key = 'post_counter'").fetchone()
+        if row_seq and row_seq["value"]:
+            try:
+                seq_val = int(row_seq["value"])
+                ctr_val = int(row_ctr["value"]) if row_ctr and row_ctr["value"] else 0
+                if seq_val > ctr_val:
+                    conn.execute("UPDATE app_settings SET value = ? WHERE key = 'post_counter'", (str(seq_val),))
+            except ValueError:
+                pass
         conn.execute(
             "UPDATE app_settings SET value = CAST(value AS INTEGER) + 1, updated_at = ? "
-            "WHERE key = 'post_seq'",
+            "WHERE key = 'post_counter'",
             (now_iso,),
         )
         row = conn.execute(
-            "SELECT value FROM app_settings WHERE key = 'post_seq'"
+            "SELECT value FROM app_settings WHERE key = 'post_counter'"
         ).fetchone()
-        return int(row["value"])
+        val = int(row["value"])
+        conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES ('post_seq', ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?",
+            (str(val), now_iso, str(val), now_iso),
+        )
+        return val
+
+def claim_stale_received_listing(
+    stale_threshold_seconds: int = 120, limit: int = 5, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Find listings in 'received' status older than stale_threshold_seconds and atomically touch them."""
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    cutoff = (now_dt - timedelta(seconds=stale_threshold_seconds)).isoformat()
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM listings
+            WHERE status = 'received'
+              AND (
+                  (received_at IS NOT NULL AND received_at <= ?)
+                  OR (received_at IS NULL AND updated_at <= ?)
+              )
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (cutoff, cutoff, limit),
+        ).fetchall()
+        claimed = []
+        for r in rows:
+            cur = conn.execute(
+                "UPDATE listings SET received_at = ?, updated_at = ? WHERE id = ? AND status = 'received'",
+                (now_iso, now_iso, r["id"]),
+            )
+            if cur.rowcount > 0:
+                claimed.append(dict(r))
+        return claimed
+
+def recompute_active_fingerprints(hours: int = 8, db_path: Optional[str] = None) -> int:
+    """Recompute dedup fingerprints for listings active in the last `hours` window."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, raw_text, clean_text, platform_name FROM listings WHERE created_at >= ?",
+            (cutoff,),
+        ).fetchall()
+        count = 0
+        for r in rows:
+            txt = r["clean_text"] or r["raw_text"] or ""
+            fp = make_listing_fingerprint(txt, platform=r["platform_name"])
+            conn.execute("UPDATE listings SET fingerprint = ? WHERE id = ?", (fp, r["id"]))
+            count += 1
+        return count
 
 # ---------------------------------------------------------------------------
 # Strongly-typed domain model queries (models.py)

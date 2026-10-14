@@ -53,6 +53,31 @@ def record_audit(
             (action, listing_id, actor_id, str(detail or "")[:1000], now_iso),
         )
 
+def get_audit_logs(
+    limit: int = 50,
+    listing_id: Optional[int] = None,
+    action: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Retrieve recent audit log entries, newest first."""
+    query = "SELECT id, action, listing_id, actor_id, detail, created_at FROM audit_log"
+    params: List[Any] = []
+    clauses: List[str] = []
+    if listing_id is not None:
+        clauses.append("listing_id = ?")
+        params.append(listing_id)
+    if action is not None:
+        clauses.append("action = ?")
+        params.append(action)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with db_session(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
 # ---------------------------------------------------------------------------
 # Skip log
 # ---------------------------------------------------------------------------
@@ -419,23 +444,35 @@ def prune_ai_cache(max_age_hours: float = 48, db_path: Optional[str] = None) -> 
         cursor = conn.execute("DELETE FROM ai_cache WHERE created_at < ?", (cutoff,))
         return cursor.rowcount
 
+def delete_ai_cache(fingerprint: str, db_path: Optional[str] = None) -> bool:
+    """Delete an entry from ai_cache by fingerprint."""
+    if not fingerprint:
+        return False
+    with db_session(db_path) as conn:
+        cursor = conn.execute("DELETE FROM ai_cache WHERE fingerprint = ?", (fingerprint,))
+        return cursor.rowcount > 0
+
 # ---------------------------------------------------------------------------
 # RETENTION: rolling time window. Everything message-related older than the
-# window is deleted — published, skipped, pending review, rejected, failed —
+# window is deleted — published, skipped, rejected, failed —
 # so every admin list (Published / Skipped / Pending) only ever shows the last
 # N hours. Configuration is NEVER touched: suppliers, destinations, headers and
-# app_settings (incl. the post_seq counter, so #numbers keep counting up).
+# app_settings (incl. post_counter, so #numbers keep counting up).
 #
-# Only rows that are physically mid-send are spared ('claimed'/'publishing'
-# listings, 'forwarding' forwards): deleting those under a running worker could
-# lose the bookkeeping of a message that is landing right now. They are swept on
-# the next pass once they settle.
-#
-# Dedup compares against listings.created_at within DEDUP_HOURS, so as long as
-# the retention window is >= DEDUP_HOURS (main.py enforces this) the purge can
-# never delete a row the duplicate check still needs.
+# Listings in active/inflight/review states ('publishing', 'held', 'received',
+# 'pending_approval', 'pending_review', 'approved', 'claimed') are NEVER deleted.
 # ---------------------------------------------------------------------------
-_RETENTION_INFLIGHT_LISTING_STATUSES = ("claimed", "publishing")
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "30") or 30)
+
+_RETENTION_INFLIGHT_LISTING_STATUSES = (
+    "publishing",
+    "held",
+    "received",
+    "pending_approval",
+    "pending_review",
+    "approved",
+    "claimed",
+)
 # app_settings key prefix for the per-supplier backfill high-water mark.
 _SOURCE_HWM_PREFIX = "src_hwm:"
 
@@ -444,8 +481,9 @@ def purge_expired_data(
 ) -> Dict[str, int]:
     """Delete all message data older than ``max_age_hours``.
 
-    Returns a per-table count of deleted rows. Runs as ONE transaction so a
-    crash mid-purge leaves the database either untouched or fully purged.
+    Deletes children before parents in one transaction with foreign_keys=ON:
+    blocklist_hits, forwardings, skips, audit_log, then listings.
+    Never deletes a listing in publishing, held, received, pending_*, or approved.
     """
     cutoff = (
         datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
@@ -459,6 +497,7 @@ def purge_expired_data(
     counts: Dict[str, int] = {}
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON;")
         # Save each supplier's highest seen source message id BEFORE deleting,
         # so the backfill sweep keeps resuming after it (see
         # get_last_source_message_id). Only ever moves forward.
@@ -493,19 +532,28 @@ def purge_expired_data(
             """,
             (cutoff, *expired_params),
         ).rowcount
-        counts["audit_log"] = conn.execute(
-            f"""
-            DELETE FROM audit_log
-            WHERE created_at < ? OR listing_id IN ({expired_listings_sql})
-            """,
-            (cutoff, *expired_params),
+        counts["skips"] = conn.execute(
+            "DELETE FROM skips WHERE timestamp < ?", (cutoff,)
         ).rowcount
+        if AUDIT_RETENTION_DAYS > 0:
+            audit_cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=AUDIT_RETENTION_DAYS)
+            ).isoformat()
+            counts["audit_log"] = conn.execute(
+                f"""
+                DELETE FROM audit_log
+                WHERE created_at < ? OR listing_id IN ({expired_listings_sql})
+                """,
+                (audit_cutoff, *expired_params),
+            ).rowcount
+        else:
+            counts["audit_log"] = conn.execute(
+                f"DELETE FROM audit_log WHERE listing_id IN ({expired_listings_sql})",
+                expired_params,
+            ).rowcount
         counts["listings"] = conn.execute(
             f"DELETE FROM listings WHERE id IN ({expired_listings_sql})",
             expired_params,
-        ).rowcount
-        counts["skips"] = conn.execute(
-            "DELETE FROM skips WHERE timestamp < ?", (cutoff,)
         ).rowcount
         counts["ai_cache"] = conn.execute(
             "DELETE FROM ai_cache WHERE created_at < ?", (cutoff,)
