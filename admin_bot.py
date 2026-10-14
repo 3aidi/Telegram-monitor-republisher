@@ -261,7 +261,7 @@ async def send_review_notification(
     admin_id: int,
     listing: dict,
 ) -> None:
-    """Actionable review notification card with 1-tap quick actions."""
+    """Clean review notification with direct action buttons."""
     listing_id = listing["id"]
     src = _pretty_source(
         listing.get("supplier_username"), listing.get("supplier_display_name")
@@ -275,24 +275,19 @@ async def send_review_notification(
         if len(snippet) > 160:
             snippet = snippet[:157] + "..."
     else:
-        snippet = "*(No text content)*"
+        snippet = "(No content)"
 
     text = (
-        f"📬 **Review Needed — Listing #{listing_id}**\n"
-        f"{texts.LINE}\n"
-        f"📡 **Source:** {src_disp}\n"
-        f"🎮 **Platform:** `{platform}`\n"
-        f"📝 **Snippet:**\n"
-        f"> {snippet}\n"
-        f"{texts.LINE}\n"
-        f"⚡ Tap an action below or `/pending`:"
+        f"📬 **Review needed · Listing #{listing_id}**\n"
+        f"Source: {src_disp} | Platform: {platform}\n\n"
+        f"> {snippet}"
     )
 
     buttons = [
         [
-            Button.inline("📬 Open Review", data=f"review_open:{listing_id}"),
-            Button.inline("✅ Quick Approve", data=f"approve:{listing_id}"),
-            Button.inline("⏭️ Skip", data=f"skip:{listing_id}"),
+            Button.inline("Approve", data=f"approve:{listing_id}"),
+            Button.inline("Skip", data=f"skip:{listing_id}"),
+            Button.inline("Edit", data=f"edit:{listing_id}"),
         ]
     ]
     row2 = []
@@ -302,8 +297,8 @@ async def send_review_notification(
         "source_message_id": listing.get("source_message_id") or listing.get("message_id"),
     })
     if src_url:
-        row2.append(Button.url("🔗 Source", src_url))
-    row2.append(Button.inline("🗑️ Dismiss", data="dismiss_msg"))
+        row2.append(Button.url("Source", src_url))
+    row2.append(Button.inline("Dismiss", data="dismiss_msg"))
     buttons.append(row2)
 
     try:
@@ -368,22 +363,19 @@ async def send_published_alert(
             snippet = snippet[:137] + "..."
     else:
         snippet = ""
-    snippet_part = f"📝 **Snippet:**\n> {snippet}\n{texts.LINE}\n" if snippet else ""
+    snippet_part = f"\n\n> {snippet}" if snippet else ""
 
     text = (
         f"✅ **Published — Post {post_disp}**\n"
-        f"{texts.LINE}\n"
-        f"🎮 **Platform:** `{platform_disp}`\n"
-        f"📡 **Supplier:** {src or '?'}\n"
-        f"{texts.LINE}\n"
+        f"Platform: {platform_disp} | Source: {src or '?'}"
         f"{snippet_part}"
     )
 
     buttons = _channel_view_buttons(listing)
     action_row = []
     if listing_id:
-        action_row.append(Button.inline("🔴 Mark Sold", data=f"sold:{listing_id}"))
-    action_row.append(Button.inline("🗑️ Dismiss", data="dismiss_msg"))
+        action_row.append(Button.inline("Sold", data=f"sold:{listing_id}"))
+    action_row.append(Button.inline("Dismiss", data="dismiss_msg"))
     buttons.append(action_row)
 
     try:
@@ -566,23 +558,19 @@ async def send_skipped_alert(
             if len(snippet) > 160:
                 snippet = snippet[:157] + "..."
         else:
-            snippet = "*(No text content)*"
+            snippet = "(No content)"
 
         text = (
-            f"⏭️ **Skipped — {label}**\n"
-            f"{texts.LINE}\n"
-            f"🏷️ **Listing:** `{lid_disp}`\n"
-            f"📡 **Source:** {src_disp}\n"
-            f"⚠️ **Reason:** `{human_desc}`\n"
-            f"📝 **Snippet:**\n"
+            f"⏭️ **Skipped — {label}** · `{lid_disp}`\n"
+            f"Source: {src_disp} | Reason: {human_desc}\n\n"
             f"> {snippet}"
         )
 
         buttons = []
         if listing_id:
             buttons.append([
-                Button.inline("🔁 Send to Review", data=f"reskip_lid:{listing_id}"),
-                Button.inline("🚀 Force Approve", data=f"force_approve:{listing_id}"),
+                Button.inline("Review", data=f"reskip_lid:{listing_id}"),
+                Button.inline("Approve", data=f"force_approve:{listing_id}"),
             ])
 
         row2 = []
@@ -592,8 +580,8 @@ async def send_skipped_alert(
             "source_message_id": listing.get("source_message_id") or listing.get("message_id"),
         })
         if src_url:
-            row2.append(Button.url("🔗 Source Post", src_url))
-        row2.append(Button.inline("🗑️ Dismiss", data="dismiss_msg"))
+            row2.append(Button.url("Source", src_url))
+        row2.append(Button.inline("Dismiss", data="dismiss_msg"))
         buttons.append(row2)
 
     try:
@@ -847,7 +835,7 @@ def _headers_menu_payload(headers: List[dict], prefix_note: str = "") -> Tuple[s
         return text, []
 
     s = "s" if len(headers) != 1 else ""
-    header_title = f"🅰️ **Custom Headers Pool** ({len(headers)} header{s} saved)\n{texts.LINE}\n"
+    header_title = f"**Custom Headers** ({len(headers)} header{s} saved)\n{texts.LINE}\n"
     if prefix_note:
         full_prefix = f"{prefix_note}\n\n{header_title}"
     else:
@@ -858,7 +846,7 @@ def _headers_menu_payload(headers: List[dict], prefix_note: str = "") -> Tuple[s
     cursor = _utf16_len(full_prefix)
 
     for h in headers:
-        row_prefix = f"• **#{h['id']}** · "
+        row_prefix = f"#{h['id']} · "
         parts.append(row_prefix)
         cursor += _utf16_len(row_prefix)
 
@@ -879,7 +867,7 @@ def _headers_menu_payload(headers: List[dict], prefix_note: str = "") -> Tuple[s
         parts.append("\n")
         cursor += _utf16_len("\n")
 
-    footer = f"{texts.LINE}\n🎲 Picked at random for new published posts.\nTap a button below to delete:"
+    footer = f"{texts.LINE}\nTap a number to delete:"
     parts.append(footer)
     return "".join(parts), entities
 
@@ -904,7 +892,7 @@ def _headers_buttons(headers: List[dict], undo_header_id: Optional[int] = None) 
         row: List[object] = []
         for h in headers:
             row.append(
-                Button.inline(f"🗑 #{h['id']}", data=f"delheader:{h['id']}")
+                Button.inline(f"#{h['id']}", data=f"delheader:{h['id']}")
             )
             if len(row) == 4:
                 buttons.append(row)

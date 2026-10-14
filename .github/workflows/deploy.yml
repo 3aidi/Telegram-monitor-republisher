@@ -22,11 +22,15 @@ jobs:
 
             if [ -d venv ]; then
               ./venv/bin/pip install -r requirements.txt
+              ./venv/bin/python -m unittest test_system
             elif [ -d .venv ]; then
               ./.venv/bin/pip install -r requirements.txt
+              ./.venv/bin/python -m unittest test_system
             else
               python3 -m pip install -r requirements.txt
+              python3 -m unittest test_system
             fi
 
             sudo systemctl restart tele-monitor
+            sudo systemctl is-active --quiet tele-monitor
             sudo systemctl status tele-monitor --no-pager
