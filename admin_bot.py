@@ -3364,12 +3364,39 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 "📱 **Add Forwarder Account**\n\n"
                 "Please enter the phone number in international format:\n"
                 "Example: `+1234567890`\n\n"
-                "Telegram will send an official verification code to this account."
+                "💡 **Note:** Telegram sends verification codes to your active Telegram App (chat `777000`) on other devices by default."
             )
             await _message_delete_send(
                 event,
                 text,
                 buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                parse_mode="markdown",
+            )
+            return
+
+        if data_str == "fwd:resend_code":
+            import services.forwarders_manager as fwd_mgr
+            in_flight = fwd_mgr.get_in_flight_login(ADMIN_USER_ID)
+            if not in_flight:
+                await event.answer("No login in progress. Tap 'Add Forwarder' to start.", alert=True)
+                return
+            await event.answer("Requesting code resend from Telegram...", alert=False)
+            ok, msg, _ = await fwd_mgr.resend_login_code(ADMIN_USER_ID)
+            if not ok:
+                await event.answer(f"❌ {msg}", alert=True)
+                return
+            in_flight = fwd_mgr.get_in_flight_login(ADMIN_USER_ID) or {}
+            deliv_lbl = in_flight.get("delivery_label", "SMS")
+            c_phone = in_flight.get("phone", "")
+            _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
+            await event.respond(
+                f"📩 **Code Resent via {deliv_lbl}**\n\n"
+                f"Telegram resent the verification code to `{c_phone}`.\n\n"
+                f"Please reply here with the code separated by spaces or dash (e.g. `1 2 3 4 5`):",
+                buttons=[
+                    [Button.inline("Resend via SMS", data="fwd:resend_code")],
+                    [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
+                ],
                 parse_mode="markdown",
             )
             return
@@ -4130,11 +4157,47 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_phone"}
                 return
             _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
+            in_flight = fwd_mgr.get_in_flight_login(ADMIN_USER_ID) or {}
+            deliv_type = in_flight.get("delivery_type", "app")
+            clean_phone = in_flight.get("phone", text)
+
+            if deliv_type == "sms":
+                body = (
+                    f"📩 **Verification Code Sent via SMS**\n\n"
+                    f"Telegram sent an SMS text message to `{clean_phone}`.\n"
+                    f"Please check your mobile phone's SMS messages.\n\n"
+                    f"⚠️ **Security Notice:**\n"
+                    f"Telegram automatically invalidates plain codes sent to bots.\n"
+                    f"**Please reply with the code separated by spaces or dash:**\n"
+                    f"👉 Example: `1 2 3 4 5` or `12-345`"
+                )
+            elif deliv_type == "call":
+                body = (
+                    f"📞 **Verification via Phone Call**\n\n"
+                    f"Telegram is calling `{clean_phone}` with your verification code.\n\n"
+                    f"Please listen to the code and reply here (e.g. `1 2 3 4 5`):"
+                )
+            else:
+                body = (
+                    f"📩 **Verification Code Sent to Telegram App**\n\n"
+                    f"Telegram sent the verification code inside your **Telegram App** on your other active devices — **NOT via SMS**.\n\n"
+                    f"🔍 **Where to find it:**\n"
+                    f"1. Open the Telegram app on your phone or PC\n"
+                    f"2. Check the chat named **Telegram** (verified service account `777000`)\n"
+                    f"3. Find the message with your login code\n\n"
+                    f"⚠️ **Security Notice:**\n"
+                    f"Telegram automatically invalidates plain codes sent to bots.\n"
+                    f"**Please reply with the code separated by spaces or dash:**\n"
+                    f"👉 Example: `1 2 3 4 5` or `12-345`"
+                )
+
+            buttons = [
+                [Button.inline("Resend via SMS", data="fwd:resend_code")],
+                [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
+            ]
             await wait_msg.edit(
-                f"📩 **Verification Code Sent**\n\n"
-                f"Telegram sent a verification code to `{text}`.\n"
-                f"Please reply here with the code you received:",
-                buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                body,
+                buttons=buttons,
                 parse_mode="markdown",
             )
             return
@@ -4155,8 +4218,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
             if not ok:
                 await wait_msg.edit(
-                    f"❌ {status}\n\nPlease try entering the code again, or tap Cancel:",
-                    buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                    f"❌ {status}\n\n"
+                    f"Please check the code and reply again (e.g. `1 2 3 4 5`), or tap below:",
+                    buttons=[
+                        [Button.inline("Resend via SMS", data="fwd:resend_code")],
+                        [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
+                    ],
                 )
                 _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
                 return

@@ -7837,6 +7837,103 @@ class TestLatencyAndDelaysPerformance(unittest.IsolatedAsyncioTestCase):
         # Cleanup
         admin_bot.set_forward_clients([])
 
+    def test_forwarders_manager_phone_normalization_and_auth(self):
+        import services.forwarders_manager as fwd_mgr
+
+        # 1. Phone normalization
+        ok, _, p1 = fwd_mgr.normalize_phone_number("+1234567890")
+        self.assertTrue(ok)
+        self.assertEqual(p1, "+1234567890")
+
+        ok, _, p2 = fwd_mgr.normalize_phone_number("+1 (234) 567-890")
+        self.assertTrue(ok)
+        self.assertEqual(p2, "+1234567890")
+
+        ok, _, p3 = fwd_mgr.normalize_phone_number("0044123456789")
+        self.assertTrue(ok)
+        self.assertEqual(p3, "+44123456789")
+
+        ok, _, p4 = fwd_mgr.normalize_phone_number("96170123456")
+        self.assertTrue(ok)
+        self.assertEqual(p4, "+96170123456")
+
+        # Local number starting with 0 without country code rejected
+        ok, msg, _ = fwd_mgr.normalize_phone_number("0501234567")
+        self.assertFalse(ok)
+        self.assertIn("country code", msg.lower())
+
+        # Too short rejected
+        ok, msg, _ = fwd_mgr.normalize_phone_number("123")
+        self.assertFalse(ok)
+
+        # 2. Mocked login flow
+        class MockSentCode:
+            def __init__(self, code_type="app"):
+                self.phone_code_hash = "fake_hash_123"
+                self.timeout = 60
+                if code_type == "app":
+                    from telethon.tl.types.auth import SentCodeTypeApp
+                    self.type = SentCodeTypeApp(length=5)
+                else:
+                    from telethon.tl.types.auth import SentCodeTypeSms
+                    self.type = SentCodeTypeSms(length=5)
+
+        class MockTeleClient:
+            def __init__(self, *args, **kwargs):
+                self.signed_in = False
+                self.connected = False
+            async def connect(self):
+                self.connected = True
+            def is_connected(self):
+                return self.connected
+            async def disconnect(self):
+                self.connected = False
+            async def send_code_request(self, phone):
+                return MockSentCode("app")
+            async def __call__(self, request):
+                return MockSentCode("sms")
+            async def sign_in(self, phone=None, code=None, phone_code_hash=None, password=None):
+                self.signed_in = True
+                return self
+            async def get_me(self):
+                class MockMe:
+                    id = 111
+                    username = "fwd_user"
+                    first_name = "Forward"
+                    last_name = "Account"
+                    phone = "+1234567890"
+                return MockMe()
+
+        import tempfile
+        test_dir = tempfile.mkdtemp()
+        with unittest.mock.patch("services.forwarders_manager.TelegramClient", MockTeleClient):
+            admin_id = 999888
+            ok, msg, code_hash = asyncio.run(
+                fwd_mgr.start_login_flow(admin_id, "+1234567890", 1234, "hash", base_dir=test_dir)
+            )
+            self.assertTrue(ok)
+            self.assertEqual(code_hash, "fake_hash_123")
+            in_fl = fwd_mgr.get_in_flight_login(admin_id)
+            self.assertIsNotNone(in_fl)
+            self.assertEqual(in_fl["delivery_type"], "app")
+
+            # Test Resend via SMS
+            ok_resend, resend_msg, _ = asyncio.run(fwd_mgr.resend_login_code(admin_id))
+            self.assertTrue(ok_resend)
+            self.assertIn("SMS", resend_msg)
+            self.assertEqual(in_fl["delivery_type"], "sms")
+
+            # Test Submit Code (with spaces and dashes from user)
+            ok_code, status, cl = asyncio.run(fwd_mgr.submit_login_code(admin_id, "1 2 - 3 4 5"))
+            self.assertTrue(ok_code)
+            self.assertEqual(status, "SUCCESS")
+
+            # Save and activate
+            with unittest.mock.patch("services.forwarders_manager.db", db):
+                acct = asyncio.run(fwd_mgr.save_and_activate_account(admin_id))
+                self.assertIsNotNone(acct)
+                self.assertEqual(acct["username"], "fwd_user")
+
 
 if __name__ == "__main__":
     unittest.main()

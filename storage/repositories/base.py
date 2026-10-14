@@ -39,7 +39,7 @@ DEFAULT_DB_PATH = os.environ.get("DB_PATH", "monitor.db")
 # NOTE: user_version reached 11 in production before SCHEMA_VERSION tracked it, so
 # the marker here is deliberately bumped PAST every version that has ever been
 # written to a real database. Never reuse a number a live DB may already carry.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 14
 
 # Columns added in schema v1 to an existing (v0) listings table.
 V1_LISTING_COLUMNS = {

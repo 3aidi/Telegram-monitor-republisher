@@ -4,10 +4,12 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from telethon import TelegramClient, events
 from telethon.errors import (
+    ApiIdInvalidError,
     ChannelsTooMuchError,
     ChatAdminRequiredError,
     ChatWriteForbiddenError,
@@ -15,11 +17,18 @@ from telethon.errors import (
     InviteHashExpiredError,
     InviteHashInvalidError,
     InviteRequestSentError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberBannedError,
+    PhoneNumberInvalidError,
+    PhoneNumberUnoccupiedError,
+    SendCodeUnavailableError,
     SessionPasswordNeededError,
     UserAlreadyParticipantError,
     UserBannedInChannelError,
     UserKickedError,
 )
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
@@ -30,6 +39,22 @@ logger = logging.getLogger("forwarders_manager")
 
 # In-flight login state for admin: admin_user_id -> dict
 _in_flight_logins: Dict[int, dict] = {}
+
+
+def normalize_phone_number(phone: str) -> Tuple[bool, str, Optional[str]]:
+    """Sanitize and validate an international phone number string."""
+    clean = re.sub(r"[^\d+]", "", (phone or "").strip())
+    if clean.startswith("00"):
+        clean = "+" + clean[2:]
+    elif clean.startswith("0"):
+        return False, "Phone number cannot start with '0'. Please include the international country code (e.g. +1 for USA, +44 for UK, +20 for Egypt, +961 for Lebanon).", None
+    elif not clean.startswith("+"):
+        clean = "+" + clean
+
+    digits = re.sub(r"\D", "", clean)
+    if len(digits) < 7:
+        return False, "Invalid phone number format. Please include country code and at least 7 digits (e.g. +1234567890).", None
+    return True, "OK", clean
 
 
 def get_in_flight_login(admin_user_id: int) -> Optional[dict]:
@@ -56,9 +81,9 @@ async def start_login_flow(
     base_dir: str = ".",
 ) -> Tuple[bool, str, Optional[str]]:
     """Initiate a Telethon client login for a new forwarder account."""
-    clean_phone = re.sub(r"[^\d+]", "", (phone or "").strip())
-    if not clean_phone or len(clean_phone) < 7:
-        return False, "Invalid phone number format. Please use international format (e.g. +1234567890).", None
+    valid, err_msg, clean_phone = normalize_phone_number(phone)
+    if not valid or not clean_phone:
+        return False, err_msg, None
 
     # Clear any previous in-flight login
     clear_in_flight_login(admin_user_id)
@@ -82,15 +107,49 @@ async def start_login_flow(
     try:
         await client.connect()
         code_request = await client.send_code_request(clean_phone)
+
+        deliv_type = "app"
+        deliv_label = "Telegram App"
+        if hasattr(code_request, "type") and code_request.type is not None:
+            t_cls = type(code_request.type).__name__
+            if "Sms" in t_cls:
+                deliv_type = "sms"
+                deliv_label = "SMS"
+            elif "Call" in t_cls:
+                deliv_type = "call"
+                deliv_label = "Phone Call"
+            elif "Email" in t_cls:
+                deliv_type = "email"
+                deliv_label = "Email"
+            elif "App" in t_cls:
+                deliv_type = "app"
+                deliv_label = "Telegram App"
+
         _in_flight_logins[admin_user_id] = {
             "client": client,
             "phone": clean_phone,
             "phone_code_hash": code_request.phone_code_hash,
             "session_name": session_name,
             "session_path": session_path,
+            "delivery_type": deliv_type,
+            "delivery_label": deliv_label,
+            "timeout": getattr(code_request, "timeout", None) or 60,
+            "request_time": time.time(),
         }
-        logger.info("Sent login code to %s (session: %s)", clean_phone, session_name)
-        return True, "Code sent", code_request.phone_code_hash
+        logger.info("Sent login code to %s via %s (session: %s)", clean_phone, deliv_label, session_name)
+        return True, f"Code sent to {deliv_label}", code_request.phone_code_hash
+    except PhoneNumberInvalidError:
+        return False, "Telegram reported this phone number is invalid. Please double check the country code and digits.", None
+    except PhoneNumberBannedError:
+        return False, "This phone number has been banned by Telegram.", None
+    except PhoneNumberUnoccupiedError:
+        return False, "No Telegram account exists with this phone number. Please create the account in Telegram first.", None
+    except FloodWaitError as exc:
+        return False, f"Telegram rate limit: please wait {exc.seconds} seconds before requesting a code again.", None
+    except SendCodeUnavailableError:
+        return False, "Telegram is unable to deliver SMS/codes to this number right now. Try logging in on the official Telegram app first.", None
+    except ApiIdInvalidError:
+        return False, "Invalid API_ID or API_HASH in your .env configuration.", None
     except Exception as exc:
         logger.exception("Failed to send login code to %s", clean_phone)
         try:
@@ -98,6 +157,47 @@ async def start_login_flow(
         except Exception:
             pass
         return False, f"Failed to send code: {exc}", None
+
+
+async def resend_login_code(
+    admin_user_id: int,
+) -> Tuple[bool, str, Optional[str]]:
+    """Request Telegram to resend verification code (e.g. via SMS or call)."""
+    entry = _in_flight_logins.get(admin_user_id)
+    if not entry:
+        return False, "No login in progress. Please start by adding an account.", None
+
+    client: TelegramClient = entry["client"]
+    phone = entry["phone"]
+    phone_code_hash = entry["phone_code_hash"]
+
+    try:
+        sent_code = await client(ResendCodeRequest(phone_number=phone, phone_code_hash=phone_code_hash))
+        entry["phone_code_hash"] = sent_code.phone_code_hash
+        deliv_type = "sms"
+        deliv_label = "SMS"
+        if hasattr(sent_code, "type") and sent_code.type is not None:
+            t_cls = type(sent_code.type).__name__
+            if "Sms" in t_cls:
+                deliv_type = "sms"
+                deliv_label = "SMS"
+            elif "Call" in t_cls:
+                deliv_type = "call"
+                deliv_label = "Phone Call"
+            elif "App" in t_cls:
+                deliv_type = "app"
+                deliv_label = "Telegram App"
+        entry["delivery_type"] = deliv_type
+        entry["delivery_label"] = deliv_label
+        entry["timeout"] = getattr(sent_code, "timeout", None) or 60
+        entry["request_time"] = time.time()
+        logger.info("Resent login code to %s via %s", phone, deliv_label)
+        return True, f"Code resent via {deliv_label}", sent_code.phone_code_hash
+    except FloodWaitError as exc:
+        return False, f"Telegram rate limit: please wait {exc.seconds}s before requesting code again.", None
+    except Exception as exc:
+        logger.warning("Failed to resend code for %s: %s", phone, exc)
+        return False, f"Could not resend code: {exc}", None
 
 
 async def submit_login_code(
@@ -110,6 +210,9 @@ async def submit_login_code(
         return False, "No login in progress. Please start by adding an account.", None
 
     clean_code = re.sub(r"\D", "", code.strip())
+    if not clean_code or len(clean_code) < 4:
+        return False, "Invalid code format. Please reply with the 5-digit verification code (e.g. 1 2 3 4 5).", None
+
     client: TelegramClient = entry["client"]
     phone = entry["phone"]
     phone_code_hash = entry["phone_code_hash"]
@@ -121,6 +224,12 @@ async def submit_login_code(
     except SessionPasswordNeededError:
         logger.info("2FA password required for account %s", phone)
         return False, "2FA_REQUIRED", client
+    except PhoneCodeExpiredError:
+        return False, "The code has expired or was invalidated by Telegram. Please tap 'Resend via SMS' or enter your phone again.", None
+    except PhoneCodeInvalidError:
+        return False, "Incorrect verification code. Please check and reply again (e.g. 1 2 3 4 5).", None
+    except FloodWaitError as exc:
+        return False, f"Too many attempts: please wait {exc.seconds}s.", None
     except Exception as exc:
         logger.warning("Code verification failed for %s: %s", phone, exc)
         return False, f"Verification failed: {exc}", None
