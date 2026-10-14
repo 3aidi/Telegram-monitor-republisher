@@ -2968,6 +2968,15 @@ def attach_forward_client_listeners(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+async def _prewarm_dialogs_cache(client: TelegramClient, limit: int, label: str) -> None:
+    """Pre-warm dialogs/entities cache in the background without blocking startup."""
+    try:
+        await client.get_dialogs(limit=limit)
+        logger.debug("Warmed up %s dialogs cache.", label)
+    except Exception:
+        logger.debug("Could not pre-warm %s dialogs cache.", label)
+
+
 async def main() -> None:
     _validate_config()
     # MIGRATION-1: init_db is the only startup step that is not individually
@@ -3043,16 +3052,6 @@ async def main() -> None:
 
     # Optional admin bot client
     bot_client: Optional[TelegramClient] = None
-    if BOT_TOKEN:
-        try:
-            bot_client = await admin_bot.create_admin_bot_client()
-            admin_bot.set_user_client(user_client)
-            admin_bot.set_on_approve_callback(wake_approved_worker)
-            admin_bot.set_on_forward_callback(wake_forward_worker)
-            admin_bot.set_on_supplier_change_callback(invalidate_supplier_cache)
-            logger.info("Admin bot integrated successfully.")
-        except Exception:
-            logger.exception("Failed to start integrated admin bot; continuing with user listener only.")
 
     # Register user client event handlers — skipped entirely in manual mode,
     # where ingestion / auto-publish must not run (the admin publishes only).
@@ -3101,24 +3100,44 @@ async def main() -> None:
             except Exception:
                 logger.exception("Unhandled error processing deleted message")
 
-    await user_client.start()
+    async def _start_admin_bot() -> None:
+        nonlocal bot_client
+        if BOT_TOKEN:
+            try:
+                bot_client = await admin_bot.create_admin_bot_client()
+                admin_bot.set_user_client(user_client)
+                admin_bot.set_on_approve_callback(wake_approved_worker)
+                admin_bot.set_on_forward_callback(wake_forward_worker)
+                admin_bot.set_on_supplier_change_callback(invalidate_supplier_cache)
+                logger.info("Admin bot integrated successfully.")
+            except Exception:
+                logger.exception("Failed to start integrated admin bot; continuing with user listener only.")
 
-    # Task 8: Check if user client has Telegram Premium
-    try:
-        me = await user_client.get_me()
-        is_premium = bool(getattr(me, "premium", False))
-        if not is_premium:
-            logger.warning("=" * 65)
-            logger.warning("WARNING: Telethon user client is NOT Telegram Premium!")
-            logger.warning("Custom emoji headers and flags may not render properly.")
-            logger.warning("=" * 65)
-        await db.run_async(db.set_setting, "user_client_premium", "1" if is_premium else "0")
-    except Exception as exc:
-        logger.warning("Could not check user client premium status: %s", exc)
+    # Start bot and user clients concurrently for instant connection
+    await asyncio.gather(_start_admin_bot(), user_client.start())
 
-    # Task 7: Lightweight model check against Groq
-    if GROQ_API_KEY:
-        await ai_rephraser.verify_model_available()
+    # Task 8 & 7: Concurrent checks (Telegram Premium + Groq model)
+    async def _check_user_premium() -> None:
+        try:
+            me = await user_client.get_me()
+            is_premium = bool(getattr(me, "premium", False))
+            if not is_premium:
+                logger.warning("=" * 65)
+                logger.warning("WARNING: Telethon user client is NOT Telegram Premium!")
+                logger.warning("Custom emoji headers and flags may not render properly.")
+                logger.warning("=" * 65)
+            await db.run_async(db.set_setting, "user_client_premium", "1" if is_premium else "0")
+        except Exception as exc:
+            logger.warning("Could not check user client premium status: %s", exc)
+
+    async def _check_groq_model() -> None:
+        if GROQ_API_KEY:
+            try:
+                await ai_rephraser.verify_model_available()
+            except Exception as exc:
+                logger.warning("Groq model check failed: %s", exc)
+
+    await asyncio.gather(_check_user_premium(), _check_groq_model())
 
     # Task 5: Startup crash recovery sweep for stale 'received' listings
     try:
@@ -3153,19 +3172,24 @@ async def main() -> None:
                 pass
 
     forward_client: Optional[TelegramClient] = None
-    for s_name in active_sessions:
+
+    async def _init_forward_client(s_name: str) -> Optional[TelegramClient]:
         try:
             fc = TelegramClient(s_name, API_ID, API_HASH)
             await fc.start()
-            try:
-                await fc.get_dialogs(limit=200)
-            except Exception:
-                logger.debug("Could not pre-warm forward-client dialogs cache for %s", s_name)
+            asyncio.create_task(_prewarm_dialogs_cache(fc, 200, f"forward-client {s_name}"))
             attach_forward_client_listeners(fc, bot_client)
-            forward_clients_pool.append(fc)
             logger.info("Forward-dedicated client connected (%s); added to cascading pool.", s_name)
+            return fc
         except Exception:
             logger.exception("Could not start forward-dedicated client %s", s_name)
+            return None
+
+    if active_sessions:
+        started_fcs = await asyncio.gather(*[_init_forward_client(s) for s in active_sessions])
+        for fc in started_fcs:
+            if fc is not None:
+                forward_clients_pool.append(fc)
 
     if forward_clients_pool:
         forward_client = forward_clients_pool[0]
@@ -3173,11 +3197,9 @@ async def main() -> None:
     else:
         admin_bot.set_forward_clients([])
 
-    try:
-        await user_client.get_dialogs(limit=50)
-        logger.debug("Warmed up user client dialogs cache.")
-    except Exception:
-        logger.debug("Could not pre-warm user client dialogs cache.")
+    # Pre-warm user client dialogs in the background to avoid stalling startup
+    asyncio.create_task(_prewarm_dialogs_cache(user_client, 50, "user client"))
+
     if MANUAL_MODE:
         # Manual mode: no supplier resolution, no ingestion, no auto-publish —
         # just the user client + admin bot ready for approval work.
@@ -3195,11 +3217,22 @@ async def main() -> None:
             except Exception:
                 logger.exception("Could not send manual-mode notice")
     else:
-        startup_resolved = await resolve_supplier_entities(user_client)
-        active_total = len(db.list_suppliers(active_only=True, db_path=db.DEFAULT_DB_PATH))
+        # Fast startup resolution: resolve only suppliers lacking a numeric channel_id.
+        # Known channels already stored with a channel_id are verified instantly from SQLite,
+        # avoiding dozens of sequential MTProto RPC calls that stall restarts for 30+ seconds.
+        unresolved_suppliers = db.get_unresolved_suppliers(active_only=True)
+        if unresolved_suppliers:
+            await resolve_supplier_entities(user_client, only_unresolved=True)
+
+        active_suppliers = db.list_suppliers(active_only=True, db_path=db.DEFAULT_DB_PATH)
+        active_total = len(active_suppliers)
+        resolved_ok = sum(1 for s in active_suppliers if s.get("channel_id") is not None)
         await _warn_if_zero_suppliers_resolved(
-            bot_client, active_total, len(startup_resolved)
+            bot_client, active_total, resolved_ok
         )
+
+        # In background, lazily refresh display names and validate all suppliers
+        asyncio.create_task(resolve_supplier_entities(user_client, only_unresolved=False))
 
         try:
             dedupe_result = await asyncio.get_running_loop().run_in_executor(
