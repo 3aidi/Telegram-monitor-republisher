@@ -3359,46 +3359,93 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         if data_str == "fwdadd:start":
-            _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_phone"}
-            text = (
-                "📱 **Add Forwarder Account**\n\n"
-                "Please enter the phone number in international format:\n"
-                "Example: `+1234567890`\n\n"
-                "💡 **Note:** Telegram sends verification codes to your active Telegram App (chat `777000`) on other devices by default."
-            )
+            text = "Add Forwarder:"
+            buttons = [
+                [Button.inline("QR Code", data="fwdadd:qr"), Button.inline("Phone", data="fwdadd:phone")],
+                [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
+            ]
             await _message_delete_send(
                 event,
                 text,
-                buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                buttons=buttons,
                 parse_mode="markdown",
             )
             return
 
-        if data_str == "fwd:resend_code":
-            import services.forwarders_manager as fwd_mgr
-            in_flight = fwd_mgr.get_in_flight_login(ADMIN_USER_ID)
-            if not in_flight:
-                await event.answer("No login in progress. Tap 'Add Forwarder' to start.", alert=True)
-                return
-            await event.answer("Requesting code resend from Telegram...", alert=False)
-            ok, msg, _ = await fwd_mgr.resend_login_code(ADMIN_USER_ID)
-            if not ok:
-                await event.answer(f"❌ {msg}", alert=True)
-                return
-            in_flight = fwd_mgr.get_in_flight_login(ADMIN_USER_ID) or {}
-            deliv_lbl = in_flight.get("delivery_label", "SMS")
-            c_phone = in_flight.get("phone", "")
-            _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
-            await event.respond(
-                f"📩 **Code Resent via {deliv_lbl}**\n\n"
-                f"Telegram resent the verification code to `{c_phone}`.\n\n"
-                f"Please reply here with the code separated by spaces or dash (e.g. `1 2 3 4 5`):",
-                buttons=[
-                    [Button.inline("Resend via SMS", data="fwd:resend_code")],
-                    [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
-                ],
-                parse_mode="markdown",
+        if data_str == "fwdadd:phone":
+            _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_phone"}
+            text = "Enter phone number (+1234567890):"
+            await _message_delete_send(
+                event,
+                text,
+                buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
             )
+            return
+
+        if data_str == "fwdadd:qr":
+            import io
+            import services.forwarders_manager as fwd_mgr
+            await event.answer("Generating QR...", alert=False)
+            ok, msg, png_bytes = await fwd_mgr.start_qr_login_flow(ADMIN_USER_ID, API_ID, API_HASH)
+            if not ok or not png_bytes:
+                await event.respond(f"❌ {msg}", buttons=_home_keyboard())
+                return
+
+            buf = io.BytesIO(png_bytes)
+            buf.name = "qr_login.png"
+            qr_msg = await event.client.send_file(
+                ADMIN_USER_ID,
+                buf,
+                caption="Scan in Telegram:\nSettings > Devices > Link Desktop",
+                buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+            )
+
+            async def _watch_qr():
+                ok_qr, status_qr, cl_qr = await fwd_mgr.wait_for_qr_login(ADMIN_USER_ID, timeout=120.0)
+                try:
+                    await qr_msg.delete()
+                except Exception:
+                    pass
+                if status_qr == "2FA_REQUIRED":
+                    _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_password"}
+                    await event.client.send_message(
+                        ADMIN_USER_ID,
+                        "Enter 2FA password:",
+                        buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                    )
+                    return
+                if not ok_qr:
+                    if status_qr == "EXPIRED":
+                        await event.client.send_message(
+                            ADMIN_USER_ID,
+                            "QR expired.",
+                            buttons=[
+                                [Button.inline("Retry QR", data="fwdadd:qr")],
+                                [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
+                            ],
+                        )
+                    return
+                acct = await fwd_mgr.save_and_activate_account(ADMIN_USER_ID)
+                if acct:
+                    new_cl = acct["client"]
+                    add_forward_client(new_cl)
+                    import main as main_mod
+                    if hasattr(main_mod, "forward_clients_pool") and new_cl not in main_mod.forward_clients_pool:
+                        main_mod.forward_clients_pool.append(new_cl)
+                    if hasattr(main_mod, "attach_forward_client_listeners"):
+                        main_mod.attach_forward_client_listeners(new_cl, bot)
+                    disp = acct.get("display_name") or acct.get("phone")
+                    await event.client.send_message(
+                        ADMIN_USER_ID,
+                        f"✅ Added forwarder: **{disp}**",
+                        buttons=_home_keyboard(),
+                        parse_mode="markdown",
+                    )
+                    asyncio.create_task(
+                        fwd_mgr.auto_join_destinations_for_client(new_cl, bot_client=bot, admin_user_id=ADMIN_USER_ID)
+                    )
+
+            asyncio.create_task(_watch_qr())
             return
 
         if data_str == "fwdjoin:all":
@@ -4145,85 +4192,40 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         if state["step"] == "add_fwd_phone":
             import services.forwarders_manager as fwd_mgr
-            wait_msg = await event.reply("⏳ Connecting to Telegram...")
+            wait_msg = await event.reply("Connecting...")
             ok, msg, code_hash = await fwd_mgr.start_login_flow(
                 ADMIN_USER_ID, text, API_ID, API_HASH
             )
             if not ok:
                 await wait_msg.edit(
-                    f"❌ {msg}\n\nPlease check the number and try again, or tap Cancel:",
+                    f"❌ {msg}\n\nEnter phone number (+1234567890):",
                     buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
                 )
                 _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_phone"}
                 return
+
             _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
-            in_flight = fwd_mgr.get_in_flight_login(ADMIN_USER_ID) or {}
-            deliv_type = in_flight.get("delivery_type", "app")
-            clean_phone = in_flight.get("phone", text)
-
-            if deliv_type == "sms":
-                body = (
-                    f"📩 **Verification Code Sent via SMS**\n\n"
-                    f"Telegram sent an SMS text message to `{clean_phone}`.\n"
-                    f"Please check your mobile phone's SMS messages.\n\n"
-                    f"⚠️ **Security Notice:**\n"
-                    f"Telegram automatically invalidates plain codes sent to bots.\n"
-                    f"**Please reply with the code separated by spaces or dash:**\n"
-                    f"👉 Example: `1 2 3 4 5` or `12-345`"
-                )
-            elif deliv_type == "call":
-                body = (
-                    f"📞 **Verification via Phone Call**\n\n"
-                    f"Telegram is calling `{clean_phone}` with your verification code.\n\n"
-                    f"Please listen to the code and reply here (e.g. `1 2 3 4 5`):"
-                )
-            else:
-                body = (
-                    f"📩 **Verification Code Sent to Telegram App**\n\n"
-                    f"Telegram sent the verification code inside your **Telegram App** on your other active devices — **NOT via SMS**.\n\n"
-                    f"🔍 **Where to find it:**\n"
-                    f"1. Open the Telegram app on your phone or PC\n"
-                    f"2. Check the chat named **Telegram** (verified service account `777000`)\n"
-                    f"3. Find the message with your login code\n\n"
-                    f"⚠️ **Security Notice:**\n"
-                    f"Telegram automatically invalidates plain codes sent to bots.\n"
-                    f"**Please reply with the code separated by spaces or dash:**\n"
-                    f"👉 Example: `1 2 3 4 5` or `12-345`"
-                )
-
-            buttons = [
-                [Button.inline("Resend via SMS", data="fwd:resend_code")],
-                [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
-            ]
             await wait_msg.edit(
-                body,
-                buttons=buttons,
-                parse_mode="markdown",
+                "Enter code sent to Telegram:\n(Example: 1 2 3 4 5)",
+                buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
             )
             return
 
         if state["step"] == "add_fwd_code":
             import services.forwarders_manager as fwd_mgr
-            wait_msg = await event.reply("⏳ Verifying code...")
+            wait_msg = await event.reply("Verifying...")
             ok, status, client = await fwd_mgr.submit_login_code(ADMIN_USER_ID, text)
             if status == "2FA_REQUIRED":
                 _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_password"}
                 await wait_msg.edit(
-                    "🔒 **Two-Step Verification (2FA) Required**\n\n"
-                    "This account has cloud password enabled.\n"
-                    "Please reply with your 2FA password:",
+                    "Enter 2FA password:",
                     buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
-                    parse_mode="markdown",
                 )
                 return
             if not ok:
                 await wait_msg.edit(
-                    f"❌ {status}\n\n"
-                    f"Please check the code and reply again (e.g. `1 2 3 4 5`), or tap below:",
-                    buttons=[
-                        [Button.inline("Resend via SMS", data="fwd:resend_code")],
-                        [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
-                    ],
+                    f"❌ {status}\n\nEnter code sent to Telegram:",
+                    buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
                 )
                 _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
                 return
@@ -4239,9 +4241,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     main_mod.attach_forward_client_listeners(new_cl, bot)
                 disp = acct_data.get("display_name") or acct_data.get("phone")
                 await wait_msg.edit(
-                    f"✅ **Account Added Successfully!**\n\n"
-                    f"Account **{disp}** is now active in the forwarder pool.\n\n"
-                    f"🔄 Auto-joining all destination groups in the background...",
+                    f"✅ Added forwarder: **{disp}**",
+                    buttons=_home_keyboard(),
                     parse_mode="markdown",
                 )
                 asyncio.create_task(
@@ -4253,11 +4254,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         if state["step"] == "add_fwd_password":
             import services.forwarders_manager as fwd_mgr
-            wait_msg = await event.reply("⏳ Authenticating password...")
+            wait_msg = await event.reply("Verifying...")
             ok, status, client = await fwd_mgr.submit_login_2fa(ADMIN_USER_ID, text)
             if not ok:
                 await wait_msg.edit(
-                    f"❌ {status}\n\nPlease re-enter your 2FA password, or tap Cancel:",
+                    f"❌ {status}\n\nEnter 2FA password:",
                     buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
                 )
                 _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_password"}
@@ -4274,9 +4275,8 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     main_mod.attach_forward_client_listeners(new_cl, bot)
                 disp = acct_data.get("display_name") or acct_data.get("phone")
                 await wait_msg.edit(
-                    f"✅ **Account Added Successfully!**\n\n"
-                    f"Account **{disp}** is now active in the forwarder pool.\n\n"
-                    f"🔄 Auto-joining all destination groups in the background...",
+                    f"✅ Added forwarder: **{disp}**",
+                    buttons=_home_keyboard(),
                     parse_mode="markdown",
                 )
                 asyncio.create_task(

@@ -7906,7 +7906,7 @@ class TestLatencyAndDelaysPerformance(unittest.IsolatedAsyncioTestCase):
 
         import tempfile
         test_dir = tempfile.mkdtemp()
-        with unittest.mock.patch("services.forwarders_manager.TelegramClient", MockTeleClient):
+        with unittest.mock.patch("services.forwarders_manager.create_forwarder_client", lambda *args, **kwargs: MockTeleClient()):
             admin_id = 999888
             ok, msg, code_hash = asyncio.run(
                 fwd_mgr.start_login_flow(admin_id, "+1234567890", 1234, "hash", base_dir=test_dir)
@@ -7915,13 +7915,6 @@ class TestLatencyAndDelaysPerformance(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(code_hash, "fake_hash_123")
             in_fl = fwd_mgr.get_in_flight_login(admin_id)
             self.assertIsNotNone(in_fl)
-            self.assertEqual(in_fl["delivery_type"], "app")
-
-            # Test Resend via SMS
-            ok_resend, resend_msg, _ = asyncio.run(fwd_mgr.resend_login_code(admin_id))
-            self.assertTrue(ok_resend)
-            self.assertIn("SMS", resend_msg)
-            self.assertEqual(in_fl["delivery_type"], "sms")
 
             # Test Submit Code (with spaces and dashes from user)
             ok_code, status, cl = asyncio.run(fwd_mgr.submit_login_code(admin_id, "1 2 - 3 4 5"))
@@ -7933,6 +7926,29 @@ class TestLatencyAndDelaysPerformance(unittest.IsolatedAsyncioTestCase):
                 acct = asyncio.run(fwd_mgr.save_and_activate_account(admin_id))
                 self.assertIsNotNone(acct)
                 self.assertEqual(acct["username"], "fwd_user")
+
+            # Test QR login flow
+            class MockQR:
+                url = "tg://login?token=mock_token_123"
+                async def wait(self, timeout=120.0):
+                    return MockTeleClient()
+
+            mock_cl = MockTeleClient()
+            mock_cl.qr_login = unittest.mock.AsyncMock(return_value=MockQR())
+
+            with unittest.mock.patch("services.forwarders_manager.create_forwarder_client", return_value=mock_cl):
+                ok_qr, msg_qr, png_bytes = asyncio.run(
+                    fwd_mgr.start_qr_login_flow(admin_id, 1234, "hash", base_dir=test_dir)
+                )
+                self.assertTrue(ok_qr)
+                self.assertIsNotNone(png_bytes)
+                self.assertGreater(len(png_bytes), 100)
+
+                ok_wait, status_wait, cl_wait = asyncio.run(
+                    fwd_mgr.wait_for_qr_login(admin_id)
+                )
+                self.assertTrue(ok_wait)
+                self.assertEqual(status_wait, "SUCCESS")
 
 
 if __name__ == "__main__":

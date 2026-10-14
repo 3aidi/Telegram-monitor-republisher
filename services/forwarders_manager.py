@@ -72,6 +72,23 @@ def clear_in_flight_login(admin_user_id: int) -> None:
             pass
 
 
+def create_forwarder_client(session_path: str, api_id: int, api_hash: str) -> TelegramClient:
+    """Create a Telethon TelegramClient configured with official desktop client headers.
+
+    Official client parameters prevent Telegram server-side silent drops of auth codes.
+    """
+    return TelegramClient(
+        session_path,
+        api_id,
+        api_hash,
+        device_model="Desktop",
+        system_version="Windows 10",
+        app_version="5.10.3 x64",
+        lang_code="en",
+        system_lang_code="en",
+    )
+
+
 async def start_login_flow(
     admin_user_id: int,
     phone: str,
@@ -103,27 +120,10 @@ async def start_login_flow(
         session_name = f"{session_prefix}_{counter}"
 
     session_path = os.path.join(base_dir, session_name)
-    client = TelegramClient(session_path, api_id, api_hash)
+    client = create_forwarder_client(session_path, api_id, api_hash)
     try:
         await client.connect()
         code_request = await client.send_code_request(clean_phone)
-
-        deliv_type = "app"
-        deliv_label = "Telegram App"
-        if hasattr(code_request, "type") and code_request.type is not None:
-            t_cls = type(code_request.type).__name__
-            if "Sms" in t_cls:
-                deliv_type = "sms"
-                deliv_label = "SMS"
-            elif "Call" in t_cls:
-                deliv_type = "call"
-                deliv_label = "Phone Call"
-            elif "Email" in t_cls:
-                deliv_type = "email"
-                deliv_label = "Email"
-            elif "App" in t_cls:
-                deliv_type = "app"
-                deliv_label = "Telegram App"
 
         _in_flight_logins[admin_user_id] = {
             "client": client,
@@ -131,25 +131,22 @@ async def start_login_flow(
             "phone_code_hash": code_request.phone_code_hash,
             "session_name": session_name,
             "session_path": session_path,
-            "delivery_type": deliv_type,
-            "delivery_label": deliv_label,
-            "timeout": getattr(code_request, "timeout", None) or 60,
-            "request_time": time.time(),
+            "login_type": "phone",
         }
-        logger.info("Sent login code to %s via %s (session: %s)", clean_phone, deliv_label, session_name)
-        return True, f"Code sent to {deliv_label}", code_request.phone_code_hash
+        logger.info("Sent login code to %s (session: %s)", clean_phone, session_name)
+        return True, "Code sent", code_request.phone_code_hash
     except PhoneNumberInvalidError:
-        return False, "Telegram reported this phone number is invalid. Please double check the country code and digits.", None
+        return False, "Invalid phone number. Check the country code and digits.", None
     except PhoneNumberBannedError:
-        return False, "This phone number has been banned by Telegram.", None
+        return False, "This phone number is banned by Telegram.", None
     except PhoneNumberUnoccupiedError:
-        return False, "No Telegram account exists with this phone number. Please create the account in Telegram first.", None
+        return False, "No Telegram account exists with this number.", None
     except FloodWaitError as exc:
-        return False, f"Telegram rate limit: please wait {exc.seconds} seconds before requesting a code again.", None
+        return False, f"Telegram rate limit: please wait {exc.seconds}s.", None
     except SendCodeUnavailableError:
-        return False, "Telegram is unable to deliver SMS/codes to this number right now. Try logging in on the official Telegram app first.", None
+        return False, "Telegram cannot deliver code to this number right now.", None
     except ApiIdInvalidError:
-        return False, "Invalid API_ID or API_HASH in your .env configuration.", None
+        return False, "Invalid API_ID or API_HASH in your configuration.", None
     except Exception as exc:
         logger.exception("Failed to send login code to %s", clean_phone)
         try:
@@ -159,45 +156,87 @@ async def start_login_flow(
         return False, f"Failed to send code: {exc}", None
 
 
-async def resend_login_code(
+async def start_qr_login_flow(
     admin_user_id: int,
-) -> Tuple[bool, str, Optional[str]]:
-    """Request Telegram to resend verification code (e.g. via SMS or call)."""
-    entry = _in_flight_logins.get(admin_user_id)
-    if not entry:
-        return False, "No login in progress. Please start by adding an account.", None
+    api_id: int,
+    api_hash: str,
+    session_prefix: str = "forward_session",
+    base_dir: str = ".",
+) -> Tuple[bool, str, Optional[bytes]]:
+    """Initiate a QR code login for a new forwarder account."""
+    import io
+    import qrcode
 
-    client: TelegramClient = entry["client"]
-    phone = entry["phone"]
-    phone_code_hash = entry["phone_code_hash"]
+    clear_in_flight_login(admin_user_id)
+
+    existing_accounts = db.list_forward_accounts()
+    existing_sessions = {a["session_name"] for a in existing_accounts}
+
+    counter = 1
+    session_name = f"{session_prefix}_{counter}"
+    while (
+        session_name in existing_sessions
+        or os.path.exists(os.path.join(base_dir, f"{session_name}.session"))
+    ):
+        counter += 1
+        session_name = f"{session_prefix}_{counter}"
+
+    session_path = os.path.join(base_dir, session_name)
+    client = create_forwarder_client(session_path, api_id, api_hash)
 
     try:
-        sent_code = await client(ResendCodeRequest(phone_number=phone, phone_code_hash=phone_code_hash))
-        entry["phone_code_hash"] = sent_code.phone_code_hash
-        deliv_type = "sms"
-        deliv_label = "SMS"
-        if hasattr(sent_code, "type") and sent_code.type is not None:
-            t_cls = type(sent_code.type).__name__
-            if "Sms" in t_cls:
-                deliv_type = "sms"
-                deliv_label = "SMS"
-            elif "Call" in t_cls:
-                deliv_type = "call"
-                deliv_label = "Phone Call"
-            elif "App" in t_cls:
-                deliv_type = "app"
-                deliv_label = "Telegram App"
-        entry["delivery_type"] = deliv_type
-        entry["delivery_label"] = deliv_label
-        entry["timeout"] = getattr(sent_code, "timeout", None) or 60
-        entry["request_time"] = time.time()
-        logger.info("Resent login code to %s via %s", phone, deliv_label)
-        return True, f"Code resent via {deliv_label}", sent_code.phone_code_hash
-    except FloodWaitError as exc:
-        return False, f"Telegram rate limit: please wait {exc.seconds}s before requesting code again.", None
+        await client.connect()
+        qr_login = await client.qr_login()
+        img = qrcode.make(qr_login.url)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+
+        _in_flight_logins[admin_user_id] = {
+            "client": client,
+            "qr_login": qr_login,
+            "session_name": session_name,
+            "session_path": session_path,
+            "login_type": "qr",
+        }
+        logger.info("Generated QR login for session: %s", session_name)
+        return True, "QR generated", png_bytes
     except Exception as exc:
-        logger.warning("Failed to resend code for %s: %s", phone, exc)
-        return False, f"Could not resend code: {exc}", None
+        logger.exception("Failed to initiate QR login")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return False, f"QR login failed: {exc}", None
+
+
+async def wait_for_qr_login(
+    admin_user_id: int,
+    timeout: float = 120.0,
+) -> Tuple[bool, str, Optional[TelegramClient]]:
+    """Wait for admin to scan the QR code in their mobile Telegram app."""
+    entry = _in_flight_logins.get(admin_user_id)
+    if not entry or "qr_login" not in entry:
+        return False, "NO_LOGIN", None
+
+    qr_login = entry["qr_login"]
+    client: TelegramClient = entry["client"]
+
+    try:
+        await qr_login.wait(timeout=timeout)
+        logger.info("QR login scanned and approved successfully")
+        return True, "SUCCESS", client
+    except SessionPasswordNeededError:
+        logger.info("2FA password required after QR scan")
+        return False, "2FA_REQUIRED", client
+    except asyncio.TimeoutError:
+        logger.info("QR login timed out")
+        clear_in_flight_login(admin_user_id)
+        return False, "EXPIRED", None
+    except Exception as exc:
+        logger.warning("QR login failed: %s", exc)
+        clear_in_flight_login(admin_user_id)
+        return False, f"Failed: {exc}", None
 
 
 async def submit_login_code(
@@ -211,11 +250,11 @@ async def submit_login_code(
 
     clean_code = re.sub(r"\D", "", code.strip())
     if not clean_code or len(clean_code) < 4:
-        return False, "Invalid code format. Please reply with the 5-digit verification code (e.g. 1 2 3 4 5).", None
+        return False, "Invalid code format. Enter the verification code (e.g. 1 2 3 4 5).", None
 
     client: TelegramClient = entry["client"]
-    phone = entry["phone"]
-    phone_code_hash = entry["phone_code_hash"]
+    phone = entry.get("phone")
+    phone_code_hash = entry.get("phone_code_hash")
 
     try:
         await client.sign_in(phone=phone, code=clean_code, phone_code_hash=phone_code_hash)
@@ -225,9 +264,9 @@ async def submit_login_code(
         logger.info("2FA password required for account %s", phone)
         return False, "2FA_REQUIRED", client
     except PhoneCodeExpiredError:
-        return False, "The code has expired or was invalidated by Telegram. Please tap 'Resend via SMS' or enter your phone again.", None
+        return False, "The code has expired. Please try again.", None
     except PhoneCodeInvalidError:
-        return False, "Incorrect verification code. Please check and reply again (e.g. 1 2 3 4 5).", None
+        return False, "Incorrect code. Please try again.", None
     except FloodWaitError as exc:
         return False, f"Too many attempts: please wait {exc.seconds}s.", None
     except Exception as exc:
@@ -247,10 +286,10 @@ async def submit_login_2fa(
     client: TelegramClient = entry["client"]
     try:
         await client.sign_in(password=password.strip())
-        logger.info("Successfully authenticated 2FA for %s", entry["phone"])
+        logger.info("Successfully authenticated 2FA for %s", entry.get("phone", "account"))
         return True, "SUCCESS", client
     except Exception as exc:
-        logger.warning("2FA authentication failed for %s: %s", entry["phone"], exc)
+        logger.warning("2FA authentication failed: %s", exc)
         return False, f"Password incorrect: {exc}", None
 
 
@@ -264,10 +303,10 @@ async def save_and_activate_account(
 
     client: TelegramClient = entry["client"]
     session_name = entry["session_name"]
-    phone = entry["phone"]
+    phone = entry.get("phone")
 
     username = None
-    display_name = phone
+    display_name = phone or session_name
     try:
         me = await client.get_me()
         if me:
@@ -275,9 +314,9 @@ async def save_and_activate_account(
             first_name = getattr(me, "first_name", "") or ""
             last_name = getattr(me, "last_name", "") or ""
             full_name = f"{first_name} {last_name}".strip()
-            display_name = full_name or (f"@{username}" if username else phone)
             if getattr(me, "phone", None):
                 phone = me.phone
+            display_name = full_name or (f"@{username}" if username else phone or session_name)
     except Exception:
         pass
 
