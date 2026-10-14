@@ -157,7 +157,7 @@ _skip_digest_task: Optional[asyncio.Task] = None
 # Inbox review session: the card currently on screen shows its position as
 # "1/4", "2/4", … where the total is snapshotted when the inbox opens (/pending)
 # and "done" counts cards already shown. Falls back to "N remaining" when a new
-# listing arrives mid-session or no inbox session is active.
+# listing arrives mid-session or no inbox session is active
 _review_session_total: Optional[int] = None
 _review_session_done: int = 0
 
