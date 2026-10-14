@@ -32,6 +32,8 @@ CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "")
 def sync_dest_channel_to_env(channel: str, env_path: Optional[str] = None) -> bool:
     """Update or append DEST_CHANNEL in .env file if it exists."""
     if env_path is None:
+        if getattr(db, "DEFAULT_DB_PATH", "monitor.db") != "monitor.db":
+            return False
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     try:
         if not os.path.isfile(env_path):
