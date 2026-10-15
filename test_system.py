@@ -2067,17 +2067,17 @@ class TestMonitorSystem(unittest.TestCase):
             for i in range(1, 21)
         ]
         b0 = admin_bot._destinations_buttons(dests, 0)
-        self.assertEqual(len(b0), 17, "15 destinations + Back/Next row + Add row")
+        self.assertEqual(len(b0), 18, "15 destinations + Back/Next row + 2 Action rows")
         self.assertEqual([x.text for x in b0[15]], ["Back", "Next"])
         self.assertEqual([x.data.decode() for x in b0[15]], ["menu:home", "dest:page:1"])
         self.assertEqual(b0[16][0].data.decode(), "destadd")
 
         b1 = admin_bot._destinations_buttons(dests, 1)
-        self.assertEqual(len(b1), 7, "5 destinations + Back row + Add row")
+        self.assertEqual(len(b1), 8, "5 destinations + Back row + 2 Action rows")
         self.assertEqual([x.text for x in b1[5]], ["Back"])
 
         small = admin_bot._destinations_buttons(dests[:5], 0)
-        self.assertEqual(len(small), 7, "5 rows + Back row + Add row")
+        self.assertEqual(len(small), 8, "5 rows + Back row + 2 Action rows")
         self.assertEqual(small[5][0].text, "Back")
         self.assertEqual(small[6][0].data.decode(), "destadd")
 

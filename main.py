@@ -883,20 +883,32 @@ async def resolve_supplier_for_event(event) -> Optional[dict]:
         cached = _supplier_cache_by_chat_id.get(chat_id)
         if cached is not None and cached.get("active"):
             return cached
-        if chat_id in _supplier_neg_cache and (now - _supplier_neg_cache[chat_id] < 30.0):
+        if chat_id in _supplier_neg_cache and (now - _supplier_neg_cache[chat_id] < 5.0):
             return None
 
     # Step 1: Query by numeric chat_id first (no Telethon RPC)
     supplier = None
     if chat_id is not None:
         supplier = db.get_supplier_by_chat(chat_id=chat_id)
+        if not supplier:
+            norm = db.normalize_channel_id(chat_id)
+            if norm is not None and norm != chat_id:
+                supplier = db.get_supplier_by_chat(chat_id=norm)
 
-    # Step 2: If not found, only then access event.chat.username
+    # Step 2: If not found, access chat username
     if not supplier:
+        chat_username = None
         try:
-            chat_username = getattr(event.chat, "username", None)
+            chat = getattr(event, "chat", None)
+            chat_username = getattr(chat, "username", None)
         except Exception:
             chat_username = None
+        if not chat_username and hasattr(event, "get_chat"):
+            try:
+                c = await event.get_chat()
+                chat_username = getattr(c, "username", None)
+            except Exception:
+                chat_username = None
         if chat_username:
             supplier = db.get_supplier_by_chat(username=chat_username)
 
@@ -910,6 +922,7 @@ async def resolve_supplier_for_event(event) -> Optional[dict]:
     if supplier and supplier.get("active"):
         if chat_id is not None:
             _supplier_cache_by_chat_id[chat_id] = supplier
+            _supplier_neg_cache.pop(chat_id, None)
         if supplier.get("channel_username"):
             _supplier_cache_by_username[supplier["channel_username"].lower()] = supplier
         return supplier
@@ -3059,18 +3072,12 @@ async def main() -> None:
         @user_client.on(events.NewMessage)
         async def on_new_message(event):
             try:
-                async def _handle_new():
-                    supplier = await resolve_supplier_for_event(event)
-                    if supplier:
-                        await db.run_async(
-                            db.set_setting, "last_inbound_at", datetime.now(timezone.utc).isoformat()
-                        )
-                        await process_supplier_message(user_client, bot_client, supplier, event.message)
-
-                await publish_guard.run_with_floodwait_retry(
-                    _handle_new,
-                    f"new message {getattr(event.message, 'id', None)}",
-                )
+                supplier = await resolve_supplier_for_event(event)
+                if supplier:
+                    await db.run_async(
+                        db.set_setting, "last_inbound_at", datetime.now(timezone.utc).isoformat()
+                    )
+                    await process_supplier_message(user_client, bot_client, supplier, event.message)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -3079,13 +3086,7 @@ async def main() -> None:
         @user_client.on(events.MessageEdited)
         async def on_message_edited(event):
             try:
-                async def _handle_edit():
-                    await process_edited_message(user_client, event, bot_client)
-
-                await publish_guard.run_with_floodwait_retry(
-                    _handle_edit,
-                    f"edited message {getattr(event.message, 'id', None)}",
-                )
+                await process_edited_message(user_client, event, bot_client)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -3176,7 +3177,11 @@ async def main() -> None:
     async def _init_forward_client(s_name: str) -> Optional[TelegramClient]:
         try:
             fc = TelegramClient(s_name, API_ID, API_HASH)
-            await fc.start()
+            await fc.connect()
+            if not await fc.is_user_authorized():
+                logger.warning("Forward client session %s is not authorized; skipping.", s_name)
+                await fc.disconnect()
+                return None
             asyncio.create_task(_prewarm_dialogs_cache(fc, 200, f"forward-client {s_name}"))
             attach_forward_client_listeners(fc, bot_client)
             logger.info("Forward-dedicated client connected (%s); added to cascading pool.", s_name)
@@ -3197,8 +3202,12 @@ async def main() -> None:
     else:
         admin_bot.set_forward_clients([])
 
-    # Pre-warm user client dialogs in the background to avoid stalling startup
-    asyncio.create_task(_prewarm_dialogs_cache(user_client, 50, "user client"))
+    # Ensure user client dialogs/pts are synchronized before message ingestion
+    try:
+        await user_client.get_dialogs(limit=100)
+        logger.info("Warmed up user client dialogs cache.")
+    except Exception as exc:
+        logger.warning("Could not pre-warm user client dialogs cache: %s", exc)
 
     if MANUAL_MODE:
         # Manual mode: no supplier resolution, no ingestion, no auto-publish —
@@ -3217,6 +3226,19 @@ async def main() -> None:
             except Exception:
                 logger.exception("Could not send manual-mode notice")
     else:
+        # Pre-populate fast supplier lookup cache from SQLite
+        active_suppliers = db.list_suppliers(active_only=True, db_path=db.DEFAULT_DB_PATH)
+        for s in active_suppliers:
+            cid = s.get("channel_id")
+            if cid is not None:
+                _supplier_cache_by_chat_id[cid] = s
+                norm = db.normalize_channel_id(cid)
+                if norm is not None:
+                    _supplier_cache_by_chat_id[norm] = s
+            uname = s.get("channel_username")
+            if uname and not db.is_numeric_identifier(uname):
+                _supplier_cache_by_username[uname.strip().lstrip("@").lower()] = s
+
         # Fast startup resolution: resolve only suppliers lacking a numeric channel_id.
         # Known channels already stored with a channel_id are verified instantly from SQLite,
         # avoiding dozens of sequential MTProto RPC calls that stall restarts for 30+ seconds.
@@ -3224,7 +3246,6 @@ async def main() -> None:
         if unresolved_suppliers:
             await resolve_supplier_entities(user_client, only_unresolved=True)
 
-        active_suppliers = db.list_suppliers(active_only=True, db_path=db.DEFAULT_DB_PATH)
         active_total = len(active_suppliers)
         resolved_ok = sum(1 for s in active_suppliers if s.get("channel_id") is not None)
         await _warn_if_zero_suppliers_resolved(

@@ -1450,9 +1450,16 @@ def _destinations_menu_text(destinations: List[dict], page: int = 0) -> str:
         return texts.DESTS_EMPTY
     _, _, page_count, _, _ = _page_window(len(destinations), page, page_size=_DEST_PAGE_SIZE)
     footer = _page_footer(page, page_count)
-    msg = texts.DESTS_MENU
+    active_count = sum(1 for d in destinations if d.get("active"))
+    chan = get_dest_channel() or "(None)"
+    msg = (
+        f"📫 **Destinations Overview**\n"
+        f"• Configured: **{len(destinations)}** ({active_count} active)\n"
+        f"• Main Channel: `{chan}`\n"
+    )
     if footer:
-        msg += footer + "\n"
+        msg += f"• {footer}\n"
+    msg += f"\nTap a destination below to manage settings:\n"
     return msg
 
 
@@ -1471,8 +1478,10 @@ def _destinations_buttons(destinations: List[dict], page: int = 0) -> List[List[
     buttons.append([
         Button.inline(texts.BTN_ADD_DEST, data="destadd"),
         Button.inline(texts.BTN_MAIN_CHANNEL, data="mainchan:view"),
-        Button.inline("Health", data="desthealth:view"),
-        Button.inline("Forwarders", data="forwarders:view"),
+    ])
+    buttons.append([
+        Button.inline("📊 Health", data="desthealth:view"),
+        Button.inline("👥 Forwarders", data="forwarders:view"),
     ])
     return buttons
 
@@ -2588,6 +2597,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         rows = await db.run_async(db.get_destination_health)
         text = format_destination_health_report(rows)
         dead = [r for r in rows if r.get("is_dead")]
+        health_btns = [
+            [Button.inline("📋 View Destinations", data="menu:destinations")],
+            [Button.inline("🔄 Refresh", data="desthealth:view"), Button.inline("👥 Forwarders", data="forwarders:view")],
+            [Button.inline(texts.BTN_HOME, data="menu:home")],
+        ]
         if not text:
             total_active = len([r for r in rows if r.get("active")])
             await event.reply(
@@ -2596,7 +2610,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 f"• Total configured: {len(rows)}\n"
                 f"• Active: {total_active}\n"
                 f"• Delivering without persistent errors.",
-                buttons=[[Button.inline("Destinations", data="menu:destinations")]],
+                buttons=health_btns,
                 parse_mode="html",
             )
             return
@@ -2604,7 +2618,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         buttons = []
         if dead:
             buttons.append([Button.inline(f"Delete All Dead ({len(dead)})", data="destdel:all_dead")])
-        buttons.append([Button.inline("Destinations", data="menu:destinations")])
+        buttons.extend(health_btns)
         await event.reply(text, buttons=buttons, parse_mode="html")
 
     @bot.on(events.NewMessage(pattern=r"^/preview(?:[ \t]+(\d+))?"))
@@ -3335,6 +3349,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             rows = await db.run_async(db.get_destination_health)
             text = format_destination_health_report(rows)
             dead = [r for r in rows if r.get("is_dead")]
+            health_btns = [
+                [Button.inline("📋 View Destinations", data="menu:destinations")],
+                [Button.inline("🔄 Refresh", data="desthealth:view"), Button.inline("👥 Forwarders", data="forwarders:view")],
+                [Button.inline(texts.BTN_HOME, data="menu:home")],
+            ]
             if not text:
                 total_active = len([r for r in rows if r.get("active")])
                 await _message_delete_send(
@@ -3344,14 +3363,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     f"• Total configured: {len(rows)}\n"
                     f"• Active: {total_active}\n"
                     f"• Delivering without persistent errors.",
-                    buttons=[[Button.inline("Destinations", data="menu:destinations")]],
+                    buttons=health_btns,
                     parse_mode="html",
                 )
                 return
             buttons = []
             if dead:
                 buttons.append([Button.inline(f"Delete All Dead ({len(dead)})", data="destdel:all_dead")])
-            buttons.append([Button.inline("Destinations", data="menu:destinations")])
+            buttons.extend(health_btns)
             await _message_delete_send(event, text, buttons=buttons, parse_mode="html")
             return
 
@@ -3372,6 +3391,15 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 buttons=buttons,
                 parse_mode="markdown",
             )
+            return
+
+        if data_str == "fwdadd:resendsms":
+            import services.forwarders_manager as fwd_mgr
+            ok, res_msg = await fwd_mgr.resend_login_code(ADMIN_USER_ID)
+            if ok:
+                await event.answer("📩 Code requested via SMS!", alert=True)
+            else:
+                await event.answer(f"⚠️ {res_msg}", alert=True)
             return
 
         if data_str == "fwdadd:phone":
@@ -3444,7 +3472,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         parse_mode="markdown",
                     )
                     asyncio.create_task(
-                        fwd_mgr.auto_join_destinations_for_client(new_cl, bot_client=bot, admin_user_id=ADMIN_USER_ID)
+                        fwd_mgr.auto_join_destinations_for_client(
+                            new_cl, bot_client=bot, admin_user_id=ADMIN_USER_ID, user_client=user_client_ref
+                        )
                     )
 
             asyncio.create_task(_watch_qr())
@@ -3465,7 +3495,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 if fc and hasattr(fc, "is_connected") and fc.is_connected():
                     asyncio.create_task(
                         fwd_mgr.auto_join_destinations_for_client(
-                            fc, bot_client=event.client, admin_user_id=ADMIN_USER_ID, status_message=status_msg
+                            fc,
+                            bot_client=event.client,
+                            admin_user_id=ADMIN_USER_ID,
+                            status_message=status_msg,
+                            user_client=user_client_ref,
                         )
                     )
             return
@@ -4207,9 +4241,20 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
 
             _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
+            if msg == "APP":
+                dest_text = "📲 Telegram sent a verification code to your **Telegram app** (look in the chat from official 'Telegram')."
+            elif msg == "SMS":
+                dest_text = "📩 Telegram sent a verification code via **SMS** to your phone."
+            else:
+                dest_text = "📞 Telegram is delivering your verification code."
+
             await wait_msg.edit(
-                "Enter code sent to Telegram:\n(Example: 1 2 3 4 5)",
-                buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                f"{dest_text}\n\nEnter code sent to Telegram:\n(Example: 1 2 3 4 5)",
+                buttons=[
+                    [Button.inline("📩 Resend via SMS", data="fwdadd:resendsms")],
+                    [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
+                ],
+                parse_mode="markdown",
             )
             return
 
@@ -4227,7 +4272,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             if not ok:
                 await wait_msg.edit(
                     f"❌ {status}\n\nEnter code sent to Telegram:",
-                    buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                    buttons=[
+                        [Button.inline("📩 Resend via SMS", data="fwdadd:resendsms")],
+                        [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
+                    ],
                 )
                 _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
                 return
@@ -4249,7 +4297,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 )
                 asyncio.create_task(
                     fwd_mgr.auto_join_destinations_for_client(
-                        new_cl, bot_client=bot, admin_user_id=ADMIN_USER_ID
+                        new_cl, bot_client=bot, admin_user_id=ADMIN_USER_ID, user_client=user_client_ref
                     )
                 )
             return
@@ -4283,7 +4331,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 )
                 asyncio.create_task(
                     fwd_mgr.auto_join_destinations_for_client(
-                        new_cl, bot_client=bot, admin_user_id=ADMIN_USER_ID
+                        new_cl, bot_client=bot, admin_user_id=ADMIN_USER_ID, user_client=user_client_ref
                     )
                 )
             return

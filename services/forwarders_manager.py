@@ -73,20 +73,8 @@ def clear_in_flight_login(admin_user_id: int) -> None:
 
 
 def create_forwarder_client(session_path: str, api_id: int, api_hash: str) -> TelegramClient:
-    """Create a Telethon TelegramClient configured with official desktop client headers.
-
-    Official client parameters prevent Telegram server-side silent drops of auth codes.
-    """
-    return TelegramClient(
-        session_path,
-        api_id,
-        api_hash,
-        device_model="Desktop",
-        system_version="Windows 10",
-        app_version="5.10.3 x64",
-        lang_code="en",
-        system_lang_code="en",
-    )
+    """Create a Telethon TelegramClient for forwarder accounts."""
+    return TelegramClient(session_path, api_id, api_hash)
 
 
 async def start_login_flow(
@@ -125,6 +113,13 @@ async def start_login_flow(
         await client.connect()
         code_request = await client.send_code_request(clean_phone)
 
+        delivery_type = "app"
+        type_obj = getattr(code_request, "type", None)
+        if type_obj and "sms" in type_obj.__class__.__name__.lower():
+            delivery_type = "sms"
+        elif type_obj and "call" in type_obj.__class__.__name__.lower():
+            delivery_type = "call"
+
         _in_flight_logins[admin_user_id] = {
             "client": client,
             "phone": clean_phone,
@@ -132,9 +127,11 @@ async def start_login_flow(
             "session_name": session_name,
             "session_path": session_path,
             "login_type": "phone",
+            "delivery_type": delivery_type,
         }
-        logger.info("Sent login code to %s (session: %s)", clean_phone, session_name)
-        return True, "Code sent", code_request.phone_code_hash
+        msg = "APP" if delivery_type == "app" else ("SMS" if delivery_type == "sms" else "CALL")
+        logger.info("Sent login code to %s (%s, session: %s)", clean_phone, msg, session_name)
+        return True, msg, code_request.phone_code_hash
     except PhoneNumberInvalidError:
         return False, "Invalid phone number. Check the country code and digits.", None
     except PhoneNumberBannedError:
@@ -154,6 +151,29 @@ async def start_login_flow(
         except Exception:
             pass
         return False, f"Failed to send code: {exc}", None
+
+
+async def resend_login_code(admin_user_id: int) -> Tuple[bool, str]:
+    """Request code resend (preferring SMS) for an in-flight phone login."""
+    entry = _in_flight_logins.get(admin_user_id)
+    if not entry or "client" not in entry:
+        return False, "No login in progress."
+    client: TelegramClient = entry["client"]
+    phone = entry.get("phone")
+    phone_code_hash = entry.get("phone_code_hash")
+    if not phone or not phone_code_hash:
+        return False, "Login session expired or invalid."
+    try:
+        req = await client(ResendCodeRequest(phone_number=phone, phone_code_hash=phone_code_hash))
+        entry["phone_code_hash"] = req.phone_code_hash
+        return True, "Code resent via SMS/Telegram."
+    except FloodWaitError as fwe:
+        return False, f"Telegram rate limit: wait {fwe.seconds}s before resending."
+    except SendCodeUnavailableError:
+        return False, "SMS resend is not available for this number right now."
+    except Exception as exc:
+        return False, f"Resend failed: {exc}"
+
 
 
 async def start_qr_login_flow(
@@ -347,12 +367,13 @@ async def auto_join_destinations_for_client(
     client: TelegramClient,
     bot_client: Optional[TelegramClient] = None,
     admin_user_id: Optional[int] = None,
-    delay_seconds: float = 10.0,
+    delay_seconds: float = 12.0,
     status_message: Optional[Any] = None,
+    user_client: Optional[TelegramClient] = None,
 ) -> Dict[str, Any]:
     """Auto-join a forwarder client to all active destination groups in the database.
     
-    Safe anti-ban pacing: sleeps between joins and handles FloodWait gracefully.
+    Safe anti-ban pacing: sleeps between joins and handles FloodWait gracefully with resumption.
     """
     results = {
         "joined": 0,
@@ -393,6 +414,7 @@ async def auto_join_destinations_for_client(
     total = len(dest_rows)
     logger.info("Starting auto-join to %s destinations for %s", total, acct_label)
 
+    stopped_early = False
     for idx, d in enumerate(dest_rows, start=1):
         chat_ref = str(d.get("chat_id") or "").strip()
         title = d.get("title") or chat_ref
@@ -424,10 +446,35 @@ async def auto_join_destinations_for_client(
                 # Numeric ID without public handle: try resolving entity if visible
                 try:
                     peer = int(chat_ref)
-                    ent = await client.get_entity(peer)
+                    ent = None
+                    try:
+                        ent = await client.get_entity(peer)
+                    except Exception:
+                        ent = None
                     if ent:
                         await client(JoinChannelRequest(ent))
                         success = True
+                    elif user_client and hasattr(user_client, "is_connected") and user_client.is_connected():
+                        # Main account fallback: export invite link from main account
+                        try:
+                            main_ent = await user_client.get_entity(peer)
+                            main_uname = getattr(main_ent, "username", None)
+                            if main_uname:
+                                await client(JoinChannelRequest(f"@{main_uname}"))
+                                success = True
+                            else:
+                                from telethon.tl.functions.messages import ExportChatInviteRequest
+                                inv = await user_client(ExportChatInviteRequest(main_ent))
+                                inv_link = getattr(inv, "link", None)
+                                if inv_link:
+                                    inv_hash = parse_invite_hash(inv_link)
+                                    if inv_hash:
+                                        await client(ImportChatInviteRequest(inv_hash))
+                                        success = True
+                        except Exception as exp_err:
+                            results["failed"] += 1
+                            results["details"].append((title, f"private_invite_error: {exp_err}"))
+                            continue
                 except Exception as ent_err:
                     results["failed"] += 1
                     results["details"].append((title, f"unresolvable_id: {ent_err}"))
@@ -453,25 +500,41 @@ async def auto_join_destinations_for_client(
                     )
                 except Exception:
                     pass
+            stopped_early = True
             break
         except FloodWaitError as fwe:
             wait_s = int(getattr(fwe, "seconds", 60) or 60)
             logger.warning("FloodWait of %ss while joining %s for %s", wait_s, title, acct_label)
             results["failed"] += 1
             results["details"].append((title, f"floodwait_{wait_s}s"))
-            if wait_s > 180:
-                # Long flood wait: stop auto-joining to prevent bans
+            if wait_s <= 3600:
+                rem = total - idx
                 if bot_client and admin_user_id:
                     try:
                         await bot_client.send_message(
                             admin_user_id,
-                            f"⏸️ **Auto-join paused**: Telegram rate-limited {acct_label} for {wait_s}s.",
+                            f"⏸️ **Auto-join rate-limited**: Telegram rate-limited {acct_label} for {wait_s}s ({round(wait_s/60, 1)}m).\n"
+                            f"Progress: **{results['joined']} joined**, **{results['failed']} failed** of **{total}**.\n"
+                            f"Sleeping {wait_s}s, then resuming remaining **{rem}** groups automatically...",
                             parse_mode="markdown",
                         )
                     except Exception:
                         pass
+                await asyncio.sleep(wait_s + 2)
+                continue
+            else:
+                if bot_client and admin_user_id:
+                    try:
+                        await bot_client.send_message(
+                            admin_user_id,
+                            f"⚠️ **Auto-join paused**: Telegram rate limit ({wait_s}s) is too long for {acct_label}.\n"
+                            f"Completed {results['joined']} of {total} groups.",
+                            parse_mode="markdown",
+                        )
+                    except Exception:
+                        pass
+                stopped_early = True
                 break
-            await asyncio.sleep(wait_s)
         except (InviteHashExpiredError, InviteHashInvalidError) as inv_err:
             results["failed"] += 1
             results["details"].append((title, f"invite_expired: {inv_err}"))
@@ -486,12 +549,22 @@ async def auto_join_destinations_for_client(
 
     # Progress / completion summary to admin
     if bot_client and admin_user_id:
-        summary_text = (
-            f"✅ **Auto-Join Complete for {acct_label}**\n\n"
-            f"• 🟢 Joined: **{results['joined']}**\n"
-            f"• ℹ️ Already Member: **{results['already_member']}**\n"
-            f"• 🔴 Failed / Private: **{results['failed']}**"
-        )
+        if stopped_early:
+            summary_text = (
+                f"⏸️ **Auto-Join Paused for {acct_label}**\n\n"
+                f"• 🟢 Joined: **{results['joined']}**\n"
+                f"• ℹ️ Already Member: **{results['already_member']}**\n"
+                f"• 🔴 Failed / Private: **{results['failed']}**\n"
+                f"• ⏳ Processed {results['joined'] + results['already_member'] + results['failed']} of {total} groups."
+            )
+        else:
+            summary_text = (
+                f"✅ **Auto-Join Complete for {acct_label}**\n\n"
+                f"• 🟢 Joined: **{results['joined']}**\n"
+                f"• ℹ️ Already Member: **{results['already_member']}**\n"
+                f"• 🔴 Failed / Private: **{results['failed']}**\n"
+                f"• 📊 Total Verified: **{total}** groups"
+            )
         try:
             if status_message:
                 await status_message.edit(summary_text, parse_mode="markdown")
