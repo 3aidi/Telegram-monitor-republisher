@@ -33,6 +33,11 @@ _RECEIVED_DEDUP_MINUTES = 30
 # it can be tuned without a code change; main.py owns the live value.
 _REJECT_MEMORY_MINUTES = int(os.environ.get("REJECT_MEMORY_MINUTES", "180") or 180)
 
+# PENDING-MAX-AGE: Maximum lifetime for pending approval / review listings (in hours).
+# Listings older than this threshold are auto-expired to 'skipped_expired' so they
+# do not linger in the review queue indefinitely.
+PENDING_MAX_AGE_HOURS: float = float(os.environ.get("PENDING_MAX_AGE_HOURS", "4") or 4)
+
 # QUARANTINE: statuses that represent a listing the system is actively holding
 # or has decided about. A held listing blocks nothing on its own — only the
 # atomic claim turns 'held' into a decision — but it must be in this set so a
@@ -640,31 +645,156 @@ def get_earlier_duplicate_twin(
         ).fetchone()
         return twin["id"] if twin else None
 
+def expire_stale_pending_listings(
+    max_age_hours: Optional[float] = None,
+    db_path: Optional[str] = None,
+) -> int:
+    """Transition pending listings older than max_age_hours to 'skipped_expired'.
+
+    Records skip logs (reason='expired') and audit log entries.
+    Returns the number of listings expired.
+    """
+    hours = PENDING_MAX_AGE_HOURS if max_age_hours is None else float(max_age_hours)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT l.id,
+                   CASE WHEN s.id IS NOT NULL THEN l.supplier_id ELSE NULL END AS supplier_id,
+                   l.source_message_id, l.raw_text, l.clean_text
+            FROM listings l
+            LEFT JOIN suppliers s ON l.supplier_id = s.id
+            WHERE l.status IN ('pending_approval', 'pending_review')
+              AND l.created_at < ?
+            """,
+            (cutoff,),
+        ).fetchall()
+        if not rows:
+            return 0
+
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE listings
+            SET status = 'skipped_expired',
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (now_iso, *ids),
+        )
+        for row in rows:
+            raw_text = (row["raw_text"] or row["clean_text"] or "")[:4000]
+            conn.execute(
+                """
+                INSERT INTO skips (supplier_id, message_id, reason, raw_text, timestamp)
+                VALUES (?, ?, 'expired', ?, ?)
+                """,
+                (row["supplier_id"], row["source_message_id"], raw_text, now_iso),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_log (action, listing_id, actor_id, detail, created_at)
+                VALUES ('pending_expired', ?, NULL, ?, ?)
+                """,
+                (row["id"], f"expired after {hours}h", now_iso),
+            )
+        return len(ids)
+
+def skip_all_pending_listings(
+    actor_id: Optional[int] = None,
+    db_path: Optional[str] = None,
+) -> int:
+    """Transition ALL currently pending listings to 'skipped_admin'.
+
+    Records audit logs and skips table entries for every listing skipped.
+    Returns the number of listings skipped.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT l.id,
+                   CASE WHEN s.id IS NOT NULL THEN l.supplier_id ELSE NULL END AS supplier_id,
+                   l.source_message_id, l.raw_text, l.clean_text
+            FROM listings l
+            LEFT JOIN suppliers s ON l.supplier_id = s.id
+            WHERE l.status IN ('pending_approval', 'pending_review')
+            """
+        ).fetchall()
+        if not rows:
+            return 0
+
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE listings
+            SET status = 'skipped_admin',
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (now_iso, *ids),
+        )
+        for row in rows:
+            raw_text = (row["raw_text"] or row["clean_text"] or "")[:4000]
+            conn.execute(
+                """
+                INSERT INTO skips (supplier_id, message_id, reason, raw_text, timestamp)
+                VALUES (?, ?, 'admin_skip', ?, ?)
+                """,
+                (row["supplier_id"], row["source_message_id"], raw_text, now_iso),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_log (action, listing_id, actor_id, detail, created_at)
+                VALUES ('skipped_admin', ?, ?, 'skip_all_pending', ?)
+                """,
+                (row["id"], actor_id, now_iso),
+            )
+        return len(ids)
+
 def get_pending_listings(
-    limit: int = 10, offset: int = 0, db_path: Optional[str] = None
+    limit: int = 10,
+    offset: int = 0,
+    db_path: Optional[str] = None,
+    max_age_hours: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Retrieve listings pending admin approval."""
+    """Retrieve listings pending admin approval (auto-expires listings > max_age_hours old)."""
+    hours = PENDING_MAX_AGE_HOURS if max_age_hours is None else float(max_age_hours)
+    expire_stale_pending_listings(hours, db_path=db_path)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     query = """
         SELECT l.*, s.channel_username as supplier_username,
                s.display_name as supplier_display_name
         FROM listings l
         LEFT JOIN suppliers s ON l.supplier_id = s.id
         WHERE l.status IN ('pending_approval', 'pending_review')
+          AND l.created_at >= ?
         ORDER BY l.id ASC
         LIMIT ? OFFSET ?
     """
     with db_session(db_path) as conn:
-        rows = conn.execute(query, (limit, offset)).fetchall()
+        rows = conn.execute(query, (cutoff, limit, offset)).fetchall()
         return [dict(row) for row in rows]
 
-def count_pending_listings(db_path: Optional[str] = None) -> int:
-    """Total listings pending approval (same filter as get_pending_listings)."""
+def count_pending_listings(
+    db_path: Optional[str] = None,
+    max_age_hours: Optional[float] = None,
+) -> int:
+    """Total listings pending approval (auto-expires listings > max_age_hours old)."""
+    hours = PENDING_MAX_AGE_HOURS if max_age_hours is None else float(max_age_hours)
+    expire_stale_pending_listings(hours, db_path=db_path)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     with db_session(db_path) as conn:
         row = conn.execute(
             """
             SELECT COUNT(*) AS c FROM listings
             WHERE status IN ('pending_approval', 'pending_review')
-            """
+              AND created_at >= ?
+            """,
+            (cutoff,),
         ).fetchone()
         return int(row["c"])
 

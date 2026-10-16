@@ -105,6 +105,10 @@ BTN_PREVIEW = "Preview"
 BTN_EDIT = "Edit"
 BTN_APPROVE = "Approve"
 BTN_SKIP = "Skip"
+BTN_SKIP_ALL = "⏭️ Skip All Pending"
+BTN_SKIP_ALL_YES = "⚠️ Yes, Skip All"
+SKIP_ALL_CONFIRM = "⚠️ **Skip all {count} pending listing(s)?**\n\nAll current pending items will be moved to skipped."
+SKIP_ALL_DONE = "⏭️ **Skipped {count} pending listing(s).**\nReview queue finished."
 BTN_VIEW_BUYER = "Source"
 BTN_VIEW_DEST = "Post"
 
@@ -454,6 +458,7 @@ BOT_MENU = [
     ("status", "System telemetry"),
     ("health", "System health check"),
     ("pending", "Review queue"),
+    ("skipall", "Skip all pending listings"),
     ("skipped", "Skipped logs"),
     ("sources", "Monitored sources"),
     ("published", "Published posts"),

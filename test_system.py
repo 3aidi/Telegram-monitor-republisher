@@ -4454,6 +4454,16 @@ class _P5FakeEvent:
         if self.bot is not None:
             self.bot.log.append(("reply", text))
 
+    async def edit(self, text, buttons=None, parse_mode=None):
+        self._replies.append({
+            "text": text, "buttons": buttons or [], "parse_mode": parse_mode,
+        })
+        if self.bot is not None:
+            self.bot.log.append(("edit", text))
+
+    async def respond(self, text, buttons=None, parse_mode=None):
+        return await self.reply(text, buttons=buttons, parse_mode=parse_mode)
+
 
 async def _dispatch_callback(bot, data, sender_id):
     """Run the real CallbackQuery handler with an event carrying `data`."""
@@ -8085,5 +8095,491 @@ class TestPhase2Verification(unittest.TestCase):
         wiz_reloaded2.clear()
 
 
+class TestSkipAllAndPendingExpiration(unittest.TestCase):
+    """Unit tests for Skip All Pending button and 4-hour pending message expiration."""
+
+    def setUp(self):
+        self._test_db = f"test_skipall_{int(time.time() * 1000)}_{os.getpid()}.db"
+        db.init_db(self._test_db)
+        self._old_db = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = self._test_db
+        self.supplier_id = db.add_supplier("@test_supp_skipall", channel_id=-10012345678, db_path=self._test_db)
+
+    def tearDown(self):
+        db.DEFAULT_DB_PATH = self._old_db
+        for suffix in ("", "-wal", "-shm"):
+            path = self._test_db + suffix
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+    def test_expire_stale_pending_listings_moves_old_rows_to_skipped_expired(self):
+        """Listings older than 4 hours are moved to skipped_expired with audit and skip log."""
+        # 1. Old listing (5 hours ago)
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        lid_old = db.insert_listing(
+            self.supplier_id, 101, "Old post", None, "pending_approval",
+            "Old post raw", "Old post clean", db_path=self._test_db
+        )
+        with db.db_session(self._test_db) as conn:
+            conn.execute("UPDATE listings SET created_at = ? WHERE id = ?", (old_time, lid_old))
+
+        # 2. Fresh listing (1 hour ago)
+        fresh_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        lid_fresh = db.insert_listing(
+            self.supplier_id, 102, "Fresh post", None, "pending_review",
+            "Fresh post raw", "Fresh post clean", db_path=self._test_db
+        )
+        with db.db_session(self._test_db) as conn:
+            conn.execute("UPDATE listings SET created_at = ? WHERE id = ?", (fresh_time, lid_fresh))
+
+        # Run expiration with 4.0 hours
+        expired_count = db.expire_stale_pending_listings(max_age_hours=4.0, db_path=self._test_db)
+        self.assertEqual(expired_count, 1)
+
+        # Check statuses
+        row_old = db.get_listing_by_id(lid_old, db_path=self._test_db)
+        self.assertEqual(row_old["status"], "skipped_expired")
+
+        row_fresh = db.get_listing_by_id(lid_fresh, db_path=self._test_db)
+        self.assertEqual(row_fresh["status"], "pending_review")
+
+        # Check skips log for reason='expired'
+        with db.db_session(self._test_db) as conn:
+            skip_row = conn.execute(
+                "SELECT * FROM skips WHERE message_id = 101 AND reason = 'expired'"
+            ).fetchone()
+            self.assertIsNotNone(skip_row)
+            self.assertEqual(skip_row["supplier_id"], self.supplier_id)
+
+            # Check audit log
+            audit_row = conn.execute(
+                "SELECT * FROM audit_log WHERE listing_id = ? AND action = 'pending_expired'",
+                (lid_old,),
+            ).fetchone()
+            self.assertIsNotNone(audit_row)
+
+        # Reopen skipped_expired test
+        reopened = db.reopen_skipped(skip_row["id"], db_path=self._test_db)
+        self.assertIsNotNone(reopened)
+        self.assertEqual(reopened["status"], "pending_approval")
+
+    def test_get_and_count_pending_listings_auto_expire(self):
+        """get_pending_listings and count_pending_listings automatically filter and expire stale items."""
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+        lid_old = db.insert_listing(
+            self.supplier_id, 201, "Stale post", None, "pending_approval",
+            "Stale post", "Stale post", db_path=self._test_db
+        )
+        with db.db_session(self._test_db) as conn:
+            conn.execute("UPDATE listings SET created_at = ? WHERE id = ?", (old_time, lid_old))
+
+        lid_fresh = db.insert_listing(
+            self.supplier_id, 202, "Fresh post", None, "pending_approval",
+            "Fresh post", "Fresh post", db_path=self._test_db
+        )
+
+        # count_pending_listings should only see fresh (1 item) and expire the stale one
+        count = db.count_pending_listings(db_path=self._test_db)
+        self.assertEqual(count, 1)
+
+        pending = db.get_pending_listings(db_path=self._test_db)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["id"], lid_fresh)
+
+        # Stale row is now skipped_expired
+        row_old = db.get_listing_by_id(lid_old, db_path=self._test_db)
+        self.assertEqual(row_old["status"], "skipped_expired")
+
+    def test_skip_all_pending_listings(self):
+        """skip_all_pending_listings transitions all pending items to skipped_admin and logs audits."""
+        lid1 = db.insert_listing(
+            self.supplier_id, 301, "Post 1", None, "pending_approval",
+            "Post 1", "Post 1", db_path=self._test_db
+        )
+        lid2 = db.insert_listing(
+            self.supplier_id, 302, "Post 2", None, "pending_review",
+            "Post 2", "Post 2", db_path=self._test_db
+        )
+
+        skipped = db.skip_all_pending_listings(actor_id=777888, db_path=self._test_db)
+        self.assertEqual(skipped, 2)
+
+        self.assertEqual(db.get_listing_by_id(lid1, db_path=self._test_db)["status"], "skipped_admin")
+        self.assertEqual(db.get_listing_by_id(lid2, db_path=self._test_db)["status"], "skipped_admin")
+        self.assertEqual(db.count_pending_listings(db_path=self._test_db), 0)
+
+        with db.db_session(self._test_db) as conn:
+            skips = conn.execute("SELECT * FROM skips WHERE reason = 'admin_skip'").fetchall()
+            self.assertEqual(len(skips), 2)
+            audits = conn.execute("SELECT * FROM audit_log WHERE action = 'skipped_admin'").fetchall()
+            self.assertEqual(len(audits), 2)
+            for a in audits:
+                self.assertEqual(a["actor_id"], 777888)
+
+    def test_review_card_buttons_include_skip_all(self):
+        """Review cards include the Skip All Pending button."""
+        import admin_bot
+        from core import texts
+
+        listing = {
+            "id": 999,
+            "status": "pending_approval",
+            "platform_name": "Fortnite",
+            "clean_text": "Account for sale",
+            "raw_text": "Account for sale",
+        }
+        buttons = admin_bot._listing_action_buttons(listing)
+        flat_data = [
+            getattr(b, "data", None).decode() if isinstance(getattr(b, "data", None), bytes) else getattr(b, "data", None)
+            for row in buttons for b in row
+        ]
+        self.assertIn("skip_all_pending", flat_data)
+        flat_text = [getattr(b, "text", "") for row in buttons for b in row]
+        self.assertIn(texts.BTN_SKIP_ALL, flat_text)
+
+    def test_bot_menu_contains_skipall(self):
+        """BOT_MENU contains skipall command."""
+        import admin_bot
+        menu = [c for c, _ in admin_bot.BOT_MENU]
+        self.assertIn("skipall", menu)
+
+    def test_admin_skip_all_pending_callback_flow(self):
+        """Tapping skip_all_pending shows confirmation, confirm_skip_all_pending bulk skips, cancel restores."""
+        import admin_bot
+        from core import texts
+
+        async def _run():
+            old_admin = admin_bot.ADMIN_USER_ID
+            admin_bot.ADMIN_USER_ID = 777001
+            try:
+                bot = _P5FakeBot()
+                admin_bot.setup_admin_handlers(bot)
+
+                # Case A: When no pending listings exist
+                ev_empty = await _dispatch_callback(bot, "skip_all_pending", 777001)
+                self.assertIn(texts.NO_PENDING, ev_empty.answers)
+
+                # Case B: When pending listings exist
+                lid1 = db.insert_listing(self.supplier_id, 401, "P1", None, "pending_approval", "r1", "c1", db_path=self._test_db)
+                lid2 = db.insert_listing(self.supplier_id, 402, "P2", None, "pending_review", "r2", "c2", db_path=self._test_db)
+                self.assertEqual(db.count_pending_listings(db_path=self._test_db), 2)
+
+                # Tap skip_all_pending -> must receive confirmation prompt
+                ev_prompt = await _dispatch_callback(bot, "skip_all_pending", 777001)
+                self.assertTrue(any(texts.SKIP_ALL_CONFIRM.format(count=2) in r["text"] for r in ev_prompt.replies))
+
+                # Cancel first
+                ev_cancel = await _dispatch_callback(bot, "cancel_skip_all", 777001)
+                self.assertIn(texts.CANCELLED, ev_cancel.answers)
+                self.assertEqual(db.count_pending_listings(db_path=self._test_db), 2)
+
+                # Now confirm
+                ev_confirm = await _dispatch_callback(bot, "confirm_skip_all_pending", 777001)
+                self.assertEqual(db.count_pending_listings(db_path=self._test_db), 0)
+                self.assertEqual(db.get_listing_by_id(lid1, db_path=self._test_db)["status"], "skipped_admin")
+                self.assertEqual(db.get_listing_by_id(lid2, db_path=self._test_db)["status"], "skipped_admin")
+            finally:
+                admin_bot.ADMIN_USER_ID = old_admin
+
+        asyncio.run(_run())
+
+    def test_admin_skipall_command(self):
+        """Command /skipall shows confirmation and /skipall confirm bulk skips."""
+        import admin_bot
+        from core import texts
+
+        async def _run():
+            old_admin = admin_bot.ADMIN_USER_ID
+            admin_bot.ADMIN_USER_ID = 777001
+            try:
+                bot = _P5FakeBot()
+                admin_bot.setup_admin_handlers(bot)
+
+                # Empty queue
+                ev_empty = await _dispatch_message(bot, "/skipall", sender_id=777001)
+                self.assertEqual(ev_empty.replies[-1]["text"], texts.NO_PENDING_PAGE)
+
+                # Add 2 pending listings
+                lid1 = db.insert_listing(self.supplier_id, 501, "P1", None, "pending_approval", "r1", "c1", db_path=self._test_db)
+                lid2 = db.insert_listing(self.supplier_id, 502, "P2", None, "pending_review", "r2", "c2", db_path=self._test_db)
+
+                # /skipall prompts
+                ev_cmd = await _dispatch_message(bot, "/skipall", sender_id=777001)
+                self.assertIn(texts.SKIP_ALL_CONFIRM.format(count=2), ev_cmd.replies[-1]["text"])
+
+                # /skipall confirm executes
+                ev_exec = await _dispatch_message(bot, "/skipall confirm", sender_id=777001)
+                self.assertIn(texts.SKIP_ALL_DONE.format(count=2), ev_exec.replies[-1]["text"])
+                self.assertEqual(db.count_pending_listings(db_path=self._test_db), 0)
+            finally:
+                admin_bot.ADMIN_USER_ID = old_admin
+
+        asyncio.run(_run())
+
+
+
+class TestJoinedDestinationGroupMultiAccount(unittest.TestCase):
+    """Unit tests for multi-account auto-joining and write-check on destination groups."""
+
+    def setUp(self):
+        self._test_db = f"test_joined_dest_{int(time.time() * 1000)}_{os.getpid()}.db"
+        db.init_db(self._test_db)
+        self._old_db = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = self._test_db
+
+    def tearDown(self):
+        db.DEFAULT_DB_PATH = self._old_db
+        for suffix in ("", "-wal", "-shm"):
+            path = self._test_db + suffix
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def test_multi_account_join_and_write_check_success(self):
+        """When an account joins a public group, other accounts join too.
+        If at least one can write, group is added to destinations, unwritable accounts leave,
+        and admin is notified."""
+        import main
+        from telethon.tl.functions.channels import JoinChannelRequest
+        import types
+
+        async def _run():
+            old_admin = main.ADMIN_USER_ID
+            old_pool = main.forward_clients_pool
+            main.ADMIN_USER_ID = 999888
+
+            chat = types.SimpleNamespace(
+                id=-1001234567890,
+                title="Public Trading Group",
+                username="public_trade_group",
+                megagroup=True,
+                broadcast=False,
+            )
+
+            calls_client_b = []
+            left_client_b = []
+
+            class FakeClientA:
+                def is_connected(self):
+                    return True
+                async def __call__(self, req):
+                    return None
+                async def get_permissions(self, entity, user):
+                    return types.SimpleNamespace(send_messages=True)
+
+            class FakeClientB:
+                def is_connected(self):
+                    return True
+                async def __call__(self, req):
+                    calls_client_b.append(req)
+                    return None
+                async def get_permissions(self, entity, user):
+                    return types.SimpleNamespace(send_messages=False)
+                async def delete_dialog(self, entity):
+                    left_client_b.append(entity)
+                    return True
+
+            client_a = FakeClientA()
+            client_b = FakeClientB()
+            main.forward_clients_pool = [client_a, client_b]
+            bot = _P5FakeBot()
+
+            try:
+                added = await main.handle_joined_destination_group(client_a, chat, bot)
+                self.assertTrue(added)
+
+                # Client B should have joined via JoinChannelRequest
+                self.assertTrue(any(isinstance(r, JoinChannelRequest) for r in calls_client_b))
+
+                # Destination should be added to db
+                dests = db.list_destinations(db_path=self._test_db)
+                dest_ids = [str(d["chat_id"]) for d in dests]
+                self.assertIn("@public_trade_group", dest_ids)
+
+                # Client B cannot write, so it must leave
+                self.assertTrue(len(left_client_b) > 0)
+
+                # Admin should receive DEST_AUTO_DETECTED notification
+                self.assertTrue(len(bot.sent) > 0)
+                self.assertEqual(bot.sent[0]["peer"], 999888)
+                self.assertIn("Public Trading Group", bot.sent[0]["text"])
+                self.assertIn("1/2 forwarder accounts", bot.sent[0]["text"])
+            finally:
+                main.ADMIN_USER_ID = old_admin
+                main.forward_clients_pool = old_pool
+
+        asyncio.run(_run())
+
+    def test_private_group_join_via_invite_hash(self):
+        """When an account joins a private group without username, primary client exports
+        invite link and other accounts join via ImportChatInviteRequest."""
+        import main
+        from telethon.tl.functions.messages import ExportChatInviteRequest, ImportChatInviteRequest
+        import types
+
+        async def _run():
+            old_admin = main.ADMIN_USER_ID
+            old_pool = main.forward_clients_pool
+            main.ADMIN_USER_ID = 999888
+
+            chat = types.SimpleNamespace(
+                id=-1009876543210,
+                title="Private Group",
+                username=None,
+                megagroup=True,
+                broadcast=False,
+            )
+
+            calls_client_a = []
+            calls_client_b = []
+
+            class FakeClientA:
+                def is_connected(self):
+                    return True
+                async def __call__(self, req):
+                    calls_client_a.append(req)
+                    if isinstance(req, ExportChatInviteRequest):
+                        return types.SimpleNamespace(link="https://t.me/+SecretHash123")
+                    return None
+                async def get_permissions(self, entity, user):
+                    return types.SimpleNamespace(send_messages=True)
+
+            class FakeClientB:
+                def is_connected(self):
+                    return True
+                async def __call__(self, req):
+                    calls_client_b.append(req)
+                    return None
+                async def get_permissions(self, entity, user):
+                    return types.SimpleNamespace(send_messages=True)
+
+            client_a = FakeClientA()
+            client_b = FakeClientB()
+            main.forward_clients_pool = [client_a, client_b]
+            bot = _P5FakeBot()
+
+            try:
+                added = await main.handle_joined_destination_group(client_a, chat, bot)
+                self.assertTrue(added)
+
+                # Client A should have exported chat invite
+                self.assertTrue(any(isinstance(r, ExportChatInviteRequest) for r in calls_client_a))
+
+                # Client B should have joined via ImportChatInviteRequest with hash 'SecretHash123'
+                import_reqs = [r for r in calls_client_b if isinstance(r, ImportChatInviteRequest)]
+                self.assertEqual(len(import_reqs), 1)
+                self.assertEqual(import_reqs[0].hash, "SecretHash123")
+
+                # Destination should be added to db
+                dests = db.list_destinations(db_path=self._test_db)
+                dest_ids = [str(d["chat_id"]) for d in dests]
+                self.assertIn("-1009876543210", dest_ids)
+            finally:
+                main.ADMIN_USER_ID = old_admin
+                main.forward_clients_pool = old_pool
+
+        asyncio.run(_run())
+
+    def test_none_writable_leaves_all_accounts_and_alerts_admin(self):
+        """When neither account can write to the group, both leave and destination is NOT added."""
+        import main
+        from core import texts
+        import types
+
+        async def _run():
+            old_admin = main.ADMIN_USER_ID
+            old_pool = main.forward_clients_pool
+            main.ADMIN_USER_ID = 999888
+
+            chat = types.SimpleNamespace(
+                id=-1005555555555,
+                title="ReadOnly Group",
+                username="readonly_group",
+                megagroup=True,
+                broadcast=False,
+            )
+
+            left_a = []
+            left_b = []
+
+            class FakeClientA:
+                def is_connected(self):
+                    return True
+                async def __call__(self, req):
+                    return None
+                async def get_permissions(self, entity, user):
+                    return types.SimpleNamespace(send_messages=False)
+                async def delete_dialog(self, entity):
+                    left_a.append(entity)
+                    return True
+
+            class FakeClientB:
+                def is_connected(self):
+                    return True
+                async def __call__(self, req):
+                    return None
+                async def get_permissions(self, entity, user):
+                    return types.SimpleNamespace(send_messages=False)
+                async def delete_dialog(self, entity):
+                    left_b.append(entity)
+                    return True
+
+            client_a = FakeClientA()
+            client_b = FakeClientB()
+            main.forward_clients_pool = [client_a, client_b]
+            bot = _P5FakeBot()
+
+            try:
+                added = await main.handle_joined_destination_group(client_a, chat, bot)
+                self.assertFalse(added)
+
+                # Destination should NOT be in db
+                dests = db.list_destinations(db_path=self._test_db)
+                self.assertEqual(len(dests), 0)
+
+                # Both accounts must leave
+                self.assertTrue(len(left_a) > 0)
+                self.assertTrue(len(left_b) > 0)
+
+                # Admin notified with cannot write alert
+                self.assertTrue(len(bot.sent) > 0)
+                self.assertIn("Left unwritable group", bot.sent[0]["text"])
+                self.assertIn("ReadOnly Group", bot.sent[0]["text"])
+            finally:
+                main.ADMIN_USER_ID = old_admin
+                main.forward_clients_pool = old_pool
+
+        asyncio.run(_run())
+
+    def test_broadcast_channel_ignored(self):
+        """Broadcast channels (not groups) are ignored and return False immediately."""
+        import main
+        import types
+
+        async def _run():
+            chat = types.SimpleNamespace(
+                id=-1003333333333,
+                title="Broadcast Channel",
+                username="broadcast_chan",
+                megagroup=False,
+                broadcast=True,
+            )
+            client = types.SimpleNamespace(is_connected=lambda: True)
+            bot = _P5FakeBot()
+
+            added = await main.handle_joined_destination_group(client, chat, bot)
+            self.assertFalse(added)
+            dests = db.list_destinations(db_path=self._test_db)
+            self.assertEqual(len(dests), 0)
+
+        asyncio.run(_run())
+
+
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main()
+

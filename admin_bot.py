@@ -272,7 +272,10 @@ async def send_approval_prompt(
             Button.inline(texts.BTN_EDIT,    data=f"edit:{listing_id}"),
             Button.inline(texts.BTN_APPROVE, data=f"approve:{listing_id}"),
             Button.inline(texts.BTN_SKIP,    data=f"skip:{listing_id}"),
-        ]
+        ],
+        [
+            Button.inline(texts.BTN_SKIP_ALL, data="skip_all_pending"),
+        ],
     ]
     buttons.extend(_channel_view_buttons(listing))
 
@@ -743,6 +746,7 @@ HEADER_EMOJI_COUNT = 3
 BOT_MENU = [
     ("status", " Today's stats report"),
     ("pending", "Pending approval listings"),
+    ("skipall", "Skip all pending listings"),
     ("skipped", "Recently skipped messages"),
     ("sources", " Manage monitored sources"),
     ("published", "Published posts & channel links"),
@@ -1029,6 +1033,17 @@ def _listing_action_buttons(listing: dict) -> List[List[object]]:
     status = listing["status"]
     if status in ("failed", "error"):
         buttons = []
+    elif status in ("pending_approval", "pending_review"):
+        buttons = [
+            [
+                Button.inline(texts.BTN_EDIT, data=f"edit:{listing_id}"),
+                Button.inline(texts.BTN_APPROVE, data=f"approve:{listing_id}"),
+                Button.inline(texts.BTN_SKIP, data=f"skip:{listing_id}"),
+            ],
+            [
+                Button.inline(texts.BTN_SKIP_ALL, data="skip_all_pending"),
+            ],
+        ]
     else:
         buttons = [
             [
@@ -2512,6 +2527,40 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         await _send_pending_page(event, bot, 0)
 
+    @bot.on(events.NewMessage(pattern=r"^/(?:skipall|skipallpending)(?:\s+(confirm))?$"))
+    async def handle_skip_all(event):
+        if not await check_admin(event):
+            return
+        arg = (event.pattern_match.group(1) or "").strip().lower()
+        count = db.count_pending_listings()
+        if count == 0:
+            await event.reply(texts.NO_PENDING_PAGE)
+            return
+        if arg == "confirm":
+            skipped_count = await db.run_async(
+                db.skip_all_pending_listings, actor_id=event.sender_id
+            )
+            _drafts.clear()
+            global _review_session_total, _review_session_done
+            _review_session_total = 0
+            _review_session_done = 0
+            await event.reply(
+                texts.SKIP_ALL_DONE.format(count=skipped_count),
+                parse_mode="markdown",
+            )
+            return
+        confirm_buttons = [
+            [
+                Button.inline(texts.BTN_SKIP_ALL_YES, data="confirm_skip_all_pending"),
+                Button.inline(texts.BTN_CANCEL, data="cancel_skip_all"),
+            ]
+        ]
+        await event.reply(
+            texts.SKIP_ALL_CONFIRM.format(count=count),
+            buttons=confirm_buttons,
+            parse_mode="markdown",
+        )
+
     @bot.on(events.NewMessage(pattern=r"^(?:/skipped|🚫 Skipped)"))
     async def handle_skipped(event):
         if not await check_admin(event):
@@ -3778,6 +3827,69 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         if data_str.startswith("sold_info:"):
             await event.answer("This post is already marked as SOLD.", alert=True)
+            return
+
+        if data_str == "skip_all_pending":
+            count = db.count_pending_listings()
+            if count == 0:
+                await event.answer(texts.NO_PENDING, alert=True)
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                await _advance_review(bot)
+                return
+            await event.answer()
+            confirm_buttons = [
+                [
+                    Button.inline(texts.BTN_SKIP_ALL_YES, data="confirm_skip_all_pending"),
+                    Button.inline(texts.BTN_CANCEL, data="cancel_skip_all"),
+                ]
+            ]
+            try:
+                await event.edit(
+                    texts.SKIP_ALL_CONFIRM.format(count=count),
+                    buttons=confirm_buttons,
+                    parse_mode="markdown",
+                )
+            except Exception:
+                await event.respond(
+                    texts.SKIP_ALL_CONFIRM.format(count=count),
+                    buttons=confirm_buttons,
+                    parse_mode="markdown",
+                )
+            return
+
+        if data_str == "confirm_skip_all_pending":
+            skipped_count = await db.run_async(
+                db.skip_all_pending_listings, actor_id=event.sender_id
+            )
+            _drafts.clear()
+            global _review_session_total, _review_session_done
+            _review_session_total = 0
+            _review_session_done = 0
+            await event.answer(f"Skipped {skipped_count} listing(s)")
+            try:
+                await event.edit(
+                    texts.SKIP_ALL_DONE.format(count=skipped_count),
+                    buttons=None,
+                    parse_mode="markdown",
+                )
+            except Exception:
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                await event.client.send_message(
+                    ADMIN_USER_ID,
+                    texts.SKIP_ALL_DONE.format(count=skipped_count),
+                    parse_mode="markdown",
+                )
+            return
+
+        if data_str == "cancel_skip_all":
+            await event.answer(texts.CANCELLED)
+            await _send_pending_page(event, bot)
             return
 
         match = re.match(r"^(approve|skip):(\d+)$", data_str)

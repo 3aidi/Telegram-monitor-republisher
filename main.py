@@ -92,7 +92,6 @@ PUBLISH_MAX_RETRIES = int(os.environ.get("PUBLISH_MAX_RETRIES", "4"))
 PUBLISH_CLAIM_GRACE_SECONDS = int(
     os.environ.get("PUBLISH_CLAIM_GRACE_SECONDS", "300") or 300
 )
-BACKFILL_ON_START = os.environ.get("BACKFILL_ON_START", "1").strip().lower() in ("1", "true", "yes")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 # Free-tier reliability toggles: the chatter pre-filter saves AI quota, and the
 # deterministic fallback keeps real listings publishing when every AI path is down.
@@ -127,6 +126,8 @@ else:
 RETENTION_SWEEP_MINUTES = max(
     1.0, float(os.environ.get("RETENTION_SWEEP_MINUTES", "10") or 10)
 )
+# PENDING-MAX-AGE: Maximum lifetime for pending approval/review listings (4 hours default).
+PENDING_MAX_AGE_HOURS = float(os.environ.get("PENDING_MAX_AGE_HOURS", "4") or 4)
 # REJECT-MEM: how long an admin REJECTION keeps blocking the same content.
 # Rejecting a post used to erase it from dedup memory entirely, so the very next
 # identical copy (the "two buyers, same minute, both published" case) walked
@@ -849,7 +850,6 @@ async def supplier_resolution_worker(
             resolved = await resolve_supplier_entities(client, only_unresolved=True)
             fresh = [s for s in resolved if s.get("channel_id") is not None]
             for s in fresh:
-                asyncio.create_task(run_backfill(client, bot_client, suppliers=[s]))
                 if not (bot_client and ADMIN_USER_ID):
                     break
                 try:
@@ -1384,6 +1384,155 @@ async def _drain_forward_queue(
             await asyncio.sleep(FORWARD_PACING_SECONDS)
 
 
+_in_flight_group_joins: set = set()
+
+
+async def handle_joined_destination_group(
+    primary_client: TelegramClient,
+    chat: Any,
+    bot_client: Optional[TelegramClient] = None,
+) -> bool:
+    """When any forward account joins a group:
+    1. Try joining the group from all other connected forward accounts in the pool.
+    2. Check write permissions across all pool accounts.
+    3. If writable from AT LEAST ONE account, register as an active destination.
+    4. If no account can write, leave the group.
+    """
+    if not is_group_chat(chat):
+        return False
+
+    chat_id = db.normalize_channel_id(chat)
+    if not chat_id:
+        return False
+
+    if chat_id in _in_flight_group_joins:
+        return False
+    _in_flight_group_joins.add(chat_id)
+
+    try:
+        username = getattr(chat, "username", None)
+        store_ref = f"@{username.lower()}" if username else str(chat_id)
+        title = (getattr(chat, "title", None) or username or f"chat {chat_id}")[:100]
+
+        existing_rows = await db.run_async(db.list_destinations)
+        existing_refs = {str(d["chat_id"]) for d in existing_rows}
+        if store_ref in existing_refs or str(chat_id) in existing_refs:
+            return False
+
+        # Gather all connected forward accounts in the pool
+        global forward_clients_pool
+        pool = [c for c in forward_clients_pool if c and (not hasattr(c, "is_connected") or c.is_connected())]
+        if primary_client not in pool:
+            pool.append(primary_client)
+
+        other_clients = [c for c in pool if c != primary_client]
+
+        # 1. Try to join from all other forward accounts
+        if other_clients:
+            if username:
+                from telethon.tl.functions.channels import JoinChannelRequest
+                from telethon.errors import UserAlreadyParticipantError
+                for cl in other_clients:
+                    try:
+                        await cl(JoinChannelRequest(f"@{username}"))
+                        logger.info("Forward account joined %s (@%s)", title, username)
+                    except UserAlreadyParticipantError:
+                        pass
+                    except Exception as join_err:
+                        logger.warning("Forward account could not join %s (@%s): %s", title, username, join_err)
+            else:
+                invite_hash = None
+                try:
+                    from telethon.tl.functions.messages import ExportChatInviteRequest
+                    inv = await primary_client(ExportChatInviteRequest(chat))
+                    link = getattr(inv, "link", None)
+                    if link:
+                        from services.forwarders_manager import parse_invite_hash
+                        invite_hash = parse_invite_hash(link)
+                except Exception:
+                    pass
+
+                if invite_hash:
+                    from telethon.tl.functions.messages import ImportChatInviteRequest
+                    from telethon.errors import UserAlreadyParticipantError
+                    for cl in other_clients:
+                        try:
+                            await cl(ImportChatInviteRequest(invite_hash))
+                            logger.info("Forward account joined private group %s via invite hash", title)
+                        except UserAlreadyParticipantError:
+                            pass
+                        except Exception as join_err:
+                            logger.warning("Forward account could not join private group %s: %s", title, join_err)
+
+        # 2. Check if writable from at least one account
+        writable_accounts = []
+        unwritable_accounts = []
+        for cl in pool:
+            try:
+                can_write, reason = await check_can_write_to_destination(cl, chat)
+                if can_write:
+                    writable_accounts.append(cl)
+                else:
+                    unwritable_accounts.append((cl, reason))
+            except Exception as chk_err:
+                unwritable_accounts.append((cl, str(chk_err)))
+
+        # 3. Decision: Writable from AT LEAST ONE account
+        if writable_accounts:
+            await db.run_async(db.add_destination, store_ref, title, True)
+            logger.info(
+                "Auto-registered new destination %s (%s): %d/%d forward account(s) can write",
+                title, store_ref, len(writable_accounts), len(pool),
+            )
+            # Accounts that cannot write leave the group to save dialog quota
+            for cl, _ in unwritable_accounts:
+                try:
+                    await leave_destination_chat(cl, chat)
+                except Exception:
+                    pass
+
+            if bot_client and ADMIN_USER_ID:
+                try:
+                    w_cnt = len(writable_accounts)
+                    tot_cnt = len(pool)
+                    if w_cnt == tot_cnt or tot_cnt <= 1:
+                        msg = texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref)
+                    else:
+                        msg = (
+                            f"{texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref)}\n"
+                            f"_(Writable by {w_cnt}/{tot_cnt} forwarder accounts)_"
+                        )
+                    await bot_client.send_message(ADMIN_USER_ID, msg, parse_mode="markdown")
+                except Exception:
+                    pass
+            return True
+        else:
+            # None of the accounts can write -> leave from all
+            logger.warning(
+                "Joined group %s (%s) but no forward account has write permission; leaving group",
+                title, store_ref,
+            )
+            for cl in pool:
+                try:
+                    await leave_destination_chat(cl, chat)
+                except Exception:
+                    pass
+
+            if bot_client and ADMIN_USER_ID:
+                try:
+                    first_reason = unwritable_accounts[0][1] if unwritable_accounts else "write forbidden"
+                    await bot_client.send_message(
+                        ADMIN_USER_ID,
+                        texts.DEST_CANNOT_WRITE.format(title=title, ref=store_ref, reason=first_reason),
+                        parse_mode="markdown",
+                    )
+                except Exception:
+                    pass
+            return False
+    finally:
+        _in_flight_group_joins.discard(chat_id)
+
+
 async def sync_destinations_from_forward_client(
     forward_client: TelegramClient, bot_client: Optional[TelegramClient] = None
 ) -> int:
@@ -1412,32 +1561,11 @@ async def sync_destinations_from_forward_client(
             if store_ref in existing or str(chat_id) in existing:
                 continue
 
-            title = (getattr(entity, "title", None) or username or f"chat {chat_id}")[:100]
-
-            # Verify that the account can actually write/post in this group
-            can_write, reason = await check_can_write_to_destination(forward_client, entity)
-            if not can_write:
-                logger.warning(
-                    "Skipping destination candidate %s (%s): %s; leaving group",
-                    title, store_ref, reason,
-                )
-                await leave_destination_chat(forward_client, entity)
-                if bot_client and ADMIN_USER_ID:
-                    try:
-                        await bot_client.send_message(
-                            ADMIN_USER_ID,
-                            texts.DEST_CANNOT_WRITE.format(title=title, ref=store_ref, reason=reason),
-                            parse_mode="markdown",
-                        )
-                    except Exception:
-                        pass
-                continue
-
-            await db.run_async(db.add_destination, store_ref, title, True)
-            existing[store_ref] = {"chat_id": store_ref}
-            existing[str(chat_id)] = {"chat_id": str(chat_id)}
-            newly_added += 1
-            logger.info("Auto-synced destination from forward account: %s (%s)", title, store_ref)
+            added = await handle_joined_destination_group(forward_client, entity, bot_client)
+            if added:
+                existing[store_ref] = {"chat_id": store_ref}
+                existing[str(chat_id)] = {"chat_id": str(chat_id)}
+                newly_added += 1
 
         if newly_added and bot_client and ADMIN_USER_ID:
             try:
@@ -1450,33 +1578,6 @@ async def sync_destinations_from_forward_client(
     except Exception:
         logger.exception("Error syncing destinations from forward client dialogs")
     return newly_added
-
-
-async def destination_sync_worker(
-    forward_client: TelegramClient,
-    stop_event: asyncio.Event,
-    bot_client: Optional[TelegramClient] = None,
-    interval: float = 45.0,
-) -> None:
-    """Continuously poll forward account dialogs to auto-register newly joined groups."""
-    while not stop_event.is_set():
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
-        except asyncio.CancelledError:
-            raise
-
-        if stop_event.is_set():
-            break
-
-        try:
-            if forward_client and forward_client.is_connected():
-                await sync_destinations_from_forward_client(forward_client, bot_client)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Error in destination sync worker")
 
 
 async def forwarding_worker(
@@ -2872,6 +2973,15 @@ async def retention_worker(stop_event: asyncio.Event) -> None:
     )
     while not stop_event.is_set():
         try:
+            expired_pending = await db.run_async(
+                db.expire_stale_pending_listings, PENDING_MAX_AGE_HOURS
+            )
+            if expired_pending > 0:
+                logger.info(
+                    "Expired %d stale pending listing(s) older than %.1fh",
+                    expired_pending,
+                    PENDING_MAX_AGE_HOURS,
+                )
             counts = await db.run_async(db.purge_expired_data, RETENTION_HOURS)
             _mark_worker_heartbeat("retention")
             if any(counts.values()):
@@ -2889,115 +2999,6 @@ async def retention_worker(stop_event: asyncio.Event) -> None:
                 stop_event.wait(), timeout=RETENTION_SWEEP_MINUTES * 60
             )
         except asyncio.TimeoutError:
-            pass
-
-
-async def backfill_supplier(
-    client: TelegramClient,
-    bot_client: Optional[TelegramClient],
-    supplier: dict,
-    limit: int = 100,
-) -> int:
-    """Fetch missed or initial messages for a single supplier."""
-    try:
-        entity = await resolve_chat(client, supplier)
-        last_id = db.get_last_source_message_id(supplier["id"])
-        count = 0
-        if last_id > 0:
-            async for msg in client.iter_messages(
-                entity, min_id=last_id, reverse=True, limit=500
-            ):
-                await process_supplier_message(client, bot_client, supplier, msg)
-                count += 1
-        else:
-            # First time seeing this supplier: fetch recent history (up to 100 recent messages)
-            recent_msgs = []
-            async for msg in client.iter_messages(entity, limit=limit):
-                recent_msgs.append(msg)
-            for msg in reversed(recent_msgs):
-                await process_supplier_message(client, bot_client, supplier, msg)
-                count += 1
-
-        if count > 0:
-            logger.info(
-                "Backfill done for supplier %s: %s new message(s) processed.",
-                _supplier_label(supplier),
-                count,
-            )
-        return count
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception(
-            "Backfill failed for supplier %s",
-            _supplier_label(supplier),
-        )
-        return 0
-
-
-async def run_backfill(
-    client: TelegramClient,
-    bot_client: Optional[TelegramClient],
-    suppliers: Optional[List[dict]] = None,
-) -> None:
-    """
-    Catch-up sweep. Runs concurrently across all suppliers for instant fetching.
-    """
-    if not BACKFILL_ON_START and suppliers is None:
-        return
-
-    active_suppliers = suppliers if suppliers is not None else db.list_suppliers(active_only=True)
-    if not active_suppliers:
-        return
-
-    logger.info("Sweeping %d source channel(s) concurrently for new/missed messages...", len(active_suppliers))
-    await asyncio.gather(
-        *[backfill_supplier(client, bot_client, s) for s in active_suppliers],
-        return_exceptions=True,
-    )
-    logger.info("Backfill sweep finished.")
-
-
-async def inbound_catchup_worker(
-    client: TelegramClient,
-    bot_client: Optional[TelegramClient],
-    stop_event: asyncio.Event,
-    interval: int = 30,
-) -> None:
-    """Periodic catch-up worker ensuring no messages are missed if MTProto push updates drop."""
-    await asyncio.sleep(2)
-    while not stop_event.is_set():
-        try:
-            suppliers = db.list_suppliers(active_only=True)
-            async def _catchup_one(supplier):
-                try:
-                    last_id = db.get_last_source_message_id(supplier["id"])
-                    entity = await resolve_chat(client, supplier)
-                    if last_id > 0:
-                        async for msg in client.iter_messages(
-                            entity, min_id=last_id, reverse=True, limit=50
-                        ):
-                            await process_supplier_message(client, bot_client, supplier, msg)
-                    else:
-                        async for msg in client.iter_messages(entity, limit=30):
-                            await process_supplier_message(client, bot_client, supplier, msg)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
-
-            if suppliers:
-                await asyncio.gather(
-                    *[_catchup_one(s) for s in suppliers],
-                    return_exceptions=True,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Error in inbound catch-up worker")
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
 
@@ -3075,54 +3076,7 @@ def attach_forward_client_listeners(
                 user_ids = [getattr(u, "id", None) for u in users] if users else []
                 if event.user_id == me.id or me.id in user_ids:
                     chat = await event.get_chat()
-
-                    # Destinations must ONLY be groups, NEVER broadcast channels
-                    if not is_group_chat(chat):
-                        return
-
-                    chat_id = db.normalize_channel_id(chat)
-                    if chat_id:
-                        username = getattr(chat, "username", None)
-                        store_ref = f"@{username.lower()}" if username else str(chat_id)
-                        title = (getattr(chat, "title", None) or username or f"chat {chat_id}")[:100]
-                        existing_rows = await db.run_async(db.list_destinations)
-                        existing_refs = {str(d["chat_id"]) for d in existing_rows}
-                        is_new = store_ref not in existing_refs and str(chat_id) not in existing_refs
-                        if not is_new:
-                            return
-
-                        # Check write permissions before adding
-                        can_write, reason = await check_can_write_to_destination(forward_client, chat)
-                        if not can_write:
-                            logger.warning(
-                                "Joined group %s (%s) but cannot send messages (%s); leaving group",
-                                title, store_ref, reason,
-                            )
-                            await leave_destination_chat(forward_client, chat)
-                            if bot_client and ADMIN_USER_ID:
-                                try:
-                                    await bot_client.send_message(
-                                        ADMIN_USER_ID,
-                                        texts.DEST_CANNOT_WRITE.format(title=title, ref=store_ref, reason=reason),
-                                        parse_mode="markdown",
-                                    )
-                                except Exception:
-                                    pass
-                            return
-
-                        await db.run_async(db.add_destination, store_ref, title, True)
-                        logger.info(
-                            "Auto-registered new destination from forward account join: %s (%s)",
-                            title, store_ref,
-                        )
-                        if bot_client and ADMIN_USER_ID:
-                            try:
-                                await bot_client.send_message(
-                                    ADMIN_USER_ID,
-                                    texts.DEST_AUTO_DETECTED.format(title=title, ref=store_ref),
-                                )
-                            except Exception:
-                                pass
+                    await handle_joined_destination_group(forward_client, chat, bot_client)
         except Exception:
             logger.exception("Error handling chat action on forward client")
 
@@ -3256,11 +3210,6 @@ async def main() -> None:
             try:
                 def _on_supplier_changed() -> None:
                     invalidate_supplier_cache()
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(run_backfill(user_client, bot_client))
-                    except Exception:
-                        pass
 
                 bot_client = await admin_bot.create_admin_bot_client()
                 admin_bot.set_user_client(user_client)
@@ -3459,25 +3408,15 @@ async def main() -> None:
         forwarding_worker(user_client, stop_event, forward_client=forward_clients_pool or forward_client)
     )
     retention_task = asyncio.create_task(retention_worker(stop_event))
-    dest_sync_task = None
-    # Periodic background dialog scanning disabled:
-    # destinations are only auto-added when the forwarding account joins a new group in real time.
     health_task = None
     resolve_task = None
     rephrase_task = None
-    catchup_task = None
-    backfill_task = None
     if not MANUAL_MODE:
         health_task = asyncio.create_task(health_check_worker(stop_event, bot_client))
         resolve_task = asyncio.create_task(
             supplier_resolution_worker(user_client, bot_client, stop_event)
         )
         rephrase_task = asyncio.create_task(rephrase_unpublished())
-        catchup_task = asyncio.create_task(
-            inbound_catchup_worker(user_client, bot_client, stop_event)
-        )
-        if BACKFILL_ON_START:
-            backfill_task = asyncio.create_task(run_backfill(user_client, bot_client))
 
     # Reconnect loop with capped backoff
     backoff = 10
@@ -3502,23 +3441,15 @@ async def main() -> None:
         worker_task.cancel()
         forward_task.cancel()
         retention_task.cancel()
-        if dest_sync_task is not None:
-            dest_sync_task.cancel()
-        for task in (health_task, resolve_task, rephrase_task, catchup_task):
+        for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 task.cancel()
-        if backfill_task:
-            backfill_task.cancel()
         # SHUT-1: actually await the cancelled tasks so their finally-blocks and
         # DB connection check-ins complete instead of leaking as orphans.
         pending_tasks = [held_task, worker_task, forward_task, retention_task]
-        if dest_sync_task is not None:
-            pending_tasks.append(dest_sync_task)
-        for task in (health_task, resolve_task, rephrase_task, catchup_task):
+        for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 pending_tasks.append(task)
-        if backfill_task:
-            pending_tasks.append(backfill_task)
         try:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
         except Exception:

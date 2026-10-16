@@ -306,6 +306,8 @@ async def check_can_write_to_destination(client: Any, entity: Any) -> Tuple[bool
                 perms = None
 
             if perms:
+                if getattr(perms, "send_messages", None) is False or getattr(perms, "can_send_messages", None) is False:
+                    return False, "Account is restricted from sending messages in this group"
                 if getattr(perms, "is_banned", False):
                     return False, "Account is banned or muted in this group"
                 if getattr(perms, "has_left", False):
