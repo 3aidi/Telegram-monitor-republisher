@@ -7298,6 +7298,30 @@ class TestHardenTasks(unittest.TestCase):
         self.assertFalse(self.rules.check_buyer_framing("Accounts available for sale now"))
         self.assertFalse(self.rules.check_buyer_framing("Stock available: 50 accounts"))
 
+    def test_fallback_auto_publishes_buy_intent_and_never_tags_ai_unavailable(self):
+        """When AI is down/None, buy listings auto-publish if clean, and unpublishable listings never get tagged ai_unavailable."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        # Clean buy message: deterministic fallback should be OK
+        ok = self.main_mod.deterministic_fallback_publish_ok(
+            paused=False,
+            risky_keyword=None,
+            has_payment_proof=None,
+            has_clear_signal=True,
+            body_ok=True,
+            raw_text="WTB Bybit KYC account USA dm me",
+            rendered_body="Bybit KYC account USA",
+            platform="bybit",
+        )
+        self.assertTrue(ok)
+
+        # Texts reasons check: ai_unavailable must NOT exist
+        from core import texts
+        self.assertNotIn("ai_unavailable", texts.REASONS)
+        self.assertIn("unknown_platform", texts.REASONS)
+        self.assertIn("manual_review", texts.REASONS)
+
     # -------------------------------------------------------------
     # TASK 4: Retention and data integrity
     # -------------------------------------------------------------

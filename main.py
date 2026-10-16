@@ -98,7 +98,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 # deterministic fallback keeps real listings publishing when every AI path is down.
 PRE_FILTER_CHATTER = os.environ.get("PRE_FILTER_CHATTER", "1").strip().lower() in ("1", "true", "yes")
 DETERMINISTIC_FALLBACK = os.environ.get("DETERMINISTIC_FALLBACK", "1").strip().lower() in ("1", "true", "yes")
-FALLBACK_AUTOPUBLISH = os.environ.get("FALLBACK_AUTOPUBLISH", "0").strip().lower() in ("1", "true", "yes")
+FALLBACK_AUTOPUBLISH = os.environ.get("FALLBACK_AUTOPUBLISH", "1").strip().lower() in ("1", "true", "yes")
 BLOCKED_PLATFORM_CATEGORIES = [
     c.strip().lower()
     for c in os.environ.get("BLOCKED_PLATFORM_CATEGORIES", "").split(",")
@@ -839,22 +839,17 @@ async def supplier_resolution_worker(
     client: TelegramClient,
     bot_client: Optional[TelegramClient],
     stop_event: asyncio.Event,
-    interval: int = 300,
+    interval: int = 30,
 ) -> None:
     """
     Periodic self-healing for suppliers that could not be resolved yet.
-
-    A private channel added by username while the account has not joined it stays
-    unresolved (no channel_id); the sources menu shows a ⚠️ so it is never silently
-    ignored. This loop retries the resolve every `interval` seconds and DMs the
-    admin the moment a source finally resolves, so nobody quietly depends on a
-    dead source.
     """
     while not stop_event.is_set():
         try:
             resolved = await resolve_supplier_entities(client, only_unresolved=True)
             fresh = [s for s in resolved if s.get("channel_id") is not None]
             for s in fresh:
+                asyncio.create_task(run_backfill(client, bot_client, suppliers=[s]))
                 if not (bot_client and ADMIN_USER_ID):
                     break
                 try:
@@ -1922,16 +1917,21 @@ async def _evaluate_listing(
                     )
                 return
 
-        # AI unavailable / failed: route to pending_approval tagged "AI unavailable"
+        # Fallback could not auto-publish: route to pending_approval with proper category
+        review_reason = (
+            "blocked_keyword"
+            if risky_keyword
+            else ("unknown_platform" if not fb_platform else "manual_review")
+        )
         reason_detail = (
             f"blocked-keyword screen: {risky_keyword}"
             if risky_keyword
-            else "AI unavailable"
+            else f"manual review: {review_reason}"
         )
         await db.run_async(db.update_listing_status, listing_id, "pending_approval")
-        await db.run_async(db.record_audit, "ai_unavailable", listing_id, detail=reason_detail)
+        await db.run_async(db.record_audit, review_reason, listing_id, detail=reason_detail)
         logger.info(
-            "Listing #%s: AI analysis unavailable (%s). Routed to pending_approval.",
+            "Listing #%s routed to pending_approval (%s).",
             listing_id,
             reason_detail,
         )
@@ -1939,7 +1939,7 @@ async def _evaluate_listing(
             listing_dict = db.get_listing_by_id(listing_id)
             if listing_dict:
                 listing_dict["supplier_username"] = supplier.get("channel_username")
-                listing_dict["_review_reason"] = "AI unavailable"
+                listing_dict["_review_reason"] = review_reason
                 await admin_bot.send_review_notification(bot_client, ADMIN_USER_ID, listing_dict)
         return
 
@@ -2468,6 +2468,7 @@ async def drain_held_listings(
     drained = 0
     # winner_id -> a representative loser, filled as twins lose their claim.
     burst_losers: dict = {}
+    winners = []
     for listing in due:
         listing_id = listing["id"]
         try:
@@ -2475,7 +2476,7 @@ async def drain_held_listings(
                 db.claim_held_listing, listing_id, DEDUP_HOURS
             )
             if won_id == listing_id:
-                await _evaluate_listing(client, bot_client, listing)
+                winners.append(listing)
                 drained += 1
                 continue
 
@@ -2508,27 +2509,47 @@ async def drain_held_listings(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # A failure evaluating one listing must not stall the queue: fail
-            # that row loudly and keep draining the rest.
+            # A failure claiming one listing must not stall the queue
             try:
                 await db.run_async(
                     db.mark_listing_failed,
                     listing_id,
+                    f"quarantine claim error: {str(exc)[:500]}",
+                )
+            except Exception:
+                pass
+            logger.exception("Error claiming quarantined listing #%s", listing_id)
+            _record_failure("drain_held_listings.claim", str(exc))
+
+    async def _safe_eval(l: dict) -> None:
+        lid = l["id"]
+        try:
+            await _evaluate_listing(client, bot_client, l)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                await db.run_async(
+                    db.mark_listing_failed,
+                    lid,
                     f"quarantine evaluation error: {str(exc)[:500]}",
                 )
                 await db.run_async(
                     db.record_audit,
                     "quarantine_error_failed",
-                    listing_id,
+                    lid,
                     detail=str(exc)[:500],
                 )
             except Exception:
                 logger.exception(
                     "Could not mark listing #%s failed after quarantine error",
-                    listing_id,
+                    lid,
                 )
-            logger.exception("Error evaluating quarantined listing #%s", listing_id)
+            logger.exception("Error evaluating quarantined listing #%s", lid)
             _record_failure("drain_held_listings", str(exc))
+
+    if winners:
+        await asyncio.gather(*[_safe_eval(w) for w in winners])
 
     # One grouped card per burst, emitted only after every twin in this batch has
     # been marked, so the card can name the complete set of dropped ids.
@@ -2871,48 +2892,69 @@ async def retention_worker(stop_event: asyncio.Event) -> None:
             pass
 
 
-async def run_backfill(client: TelegramClient, bot_client: Optional[TelegramClient]) -> None:
+async def backfill_supplier(
+    client: TelegramClient,
+    bot_client: Optional[TelegramClient],
+    supplier: dict,
+    limit: int = 100,
+) -> int:
+    """Fetch missed or initial messages for a single supplier."""
+    try:
+        entity = await resolve_chat(client, supplier)
+        last_id = db.get_last_source_message_id(supplier["id"])
+        count = 0
+        if last_id > 0:
+            async for msg in client.iter_messages(
+                entity, min_id=last_id, reverse=True, limit=500
+            ):
+                await process_supplier_message(client, bot_client, supplier, msg)
+                count += 1
+        else:
+            # First time seeing this supplier: fetch recent history (up to 100 recent messages)
+            recent_msgs = []
+            async for msg in client.iter_messages(entity, limit=limit):
+                recent_msgs.append(msg)
+            for msg in reversed(recent_msgs):
+                await process_supplier_message(client, bot_client, supplier, msg)
+                count += 1
+
+        if count > 0:
+            logger.info(
+                "Backfill done for supplier %s: %s new message(s) processed.",
+                _supplier_label(supplier),
+                count,
+            )
+        return count
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Backfill failed for supplier %s",
+            _supplier_label(supplier),
+        )
+        return 0
+
+
+async def run_backfill(
+    client: TelegramClient,
+    bot_client: Optional[TelegramClient],
+    suppliers: Optional[List[dict]] = None,
+) -> None:
     """
-    Catch-up sweep. When BACKFILL_ON_START=1, iterate supplier channels
-    and re-process any messages newer than the last one we already recorded.
+    Catch-up sweep. Runs concurrently across all suppliers for instant fetching.
     """
-    if not BACKFILL_ON_START:
+    if not BACKFILL_ON_START and suppliers is None:
         return
 
-    logger.info("Sweeping source channels for new/missed messages...")
-    for supplier in db.list_suppliers(active_only=True):
-        try:
-            entity = await resolve_chat(client, supplier)
-            last_id = db.get_last_source_message_id(supplier["id"])
-            count = 0
-            if last_id > 0:
-                async for msg in client.iter_messages(
-                    entity, min_id=last_id, reverse=True, limit=500
-                ):
-                    await process_supplier_message(client, bot_client, supplier, msg)
-                    count += 1
-            else:
-                # First time seeing this supplier: fetch recent history (up to 100 recent messages)
-                recent_msgs = []
-                async for msg in client.iter_messages(entity, limit=100):
-                    recent_msgs.append(msg)
-                for msg in reversed(recent_msgs):
-                    await process_supplier_message(client, bot_client, supplier, msg)
-                    count += 1
+    active_suppliers = suppliers if suppliers is not None else db.list_suppliers(active_only=True)
+    if not active_suppliers:
+        return
 
-            if count > 0:
-                logger.info(
-                    "Backfill done for supplier %s: %s new message(s) processed.",
-                    _supplier_label(supplier),
-                    count,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "Backfill failed for supplier %s",
-                _supplier_label(supplier),
-            )
+    logger.info("Sweeping %d source channel(s) concurrently for new/missed messages...", len(active_suppliers))
+    await asyncio.gather(
+        *[backfill_supplier(client, bot_client, s) for s in active_suppliers],
+        return_exceptions=True,
+    )
     logger.info("Backfill sweep finished.")
 
 
@@ -2920,28 +2962,35 @@ async def inbound_catchup_worker(
     client: TelegramClient,
     bot_client: Optional[TelegramClient],
     stop_event: asyncio.Event,
-    interval: int = 60,
+    interval: int = 30,
 ) -> None:
     """Periodic catch-up worker ensuring no messages are missed if MTProto push updates drop."""
-    await asyncio.sleep(20)
+    await asyncio.sleep(2)
     while not stop_event.is_set():
         try:
-            for supplier in db.list_suppliers(active_only=True):
-                if stop_event.is_set():
-                    break
+            suppliers = db.list_suppliers(active_only=True)
+            async def _catchup_one(supplier):
                 try:
                     last_id = db.get_last_source_message_id(supplier["id"])
-                    if last_id <= 0:
-                        continue
                     entity = await resolve_chat(client, supplier)
-                    async for msg in client.iter_messages(
-                        entity, min_id=last_id, reverse=True, limit=50
-                    ):
-                        await process_supplier_message(client, bot_client, supplier, msg)
+                    if last_id > 0:
+                        async for msg in client.iter_messages(
+                            entity, min_id=last_id, reverse=True, limit=50
+                        ):
+                            await process_supplier_message(client, bot_client, supplier, msg)
+                    else:
+                        async for msg in client.iter_messages(entity, limit=30):
+                            await process_supplier_message(client, bot_client, supplier, msg)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     pass
+
+            if suppliers:
+                await asyncio.gather(
+                    *[_catchup_one(s) for s in suppliers],
+                    return_exceptions=True,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -3005,6 +3054,7 @@ async def rephrase_unpublished() -> None:
             listing_id,
             analysis.get("platform"),
         )
+        await asyncio.sleep(0.05)
     logger.info(
         "Rephrase sweep finished: %s unpublished listing(s) refreshed (%d considered).",
         refreshed,
@@ -3204,11 +3254,19 @@ async def main() -> None:
         nonlocal bot_client
         if BOT_TOKEN:
             try:
+                def _on_supplier_changed() -> None:
+                    invalidate_supplier_cache()
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(run_backfill(user_client, bot_client))
+                    except Exception:
+                        pass
+
                 bot_client = await admin_bot.create_admin_bot_client()
                 admin_bot.set_user_client(user_client)
                 admin_bot.set_on_approve_callback(wake_approved_worker)
                 admin_bot.set_on_forward_callback(wake_forward_worker)
-                admin_bot.set_on_supplier_change_callback(invalidate_supplier_cache)
+                admin_bot.set_on_supplier_change_callback(_on_supplier_changed)
                 logger.info("Admin bot integrated successfully.")
             except Exception:
                 logger.exception("Failed to start integrated admin bot; continuing with user listener only.")

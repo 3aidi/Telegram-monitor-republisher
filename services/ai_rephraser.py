@@ -27,7 +27,7 @@ logger = logging.getLogger("ai_rephraser")
 
 _client = None
 _api_key: Optional[str] = None
-_model_name: str = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
+_model_name: str = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 _raw_temp = float(os.environ.get("GROQ_TEMPERATURE", "0.1") or 0.1)
 if _raw_temp > 0.3:
     logger.warning("GROQ_TEMPERATURE (%.2f) exceeds allowed maximum 0.3; clamping to 0.3", _raw_temp)
@@ -265,7 +265,7 @@ def init_groq(api_key: Optional[str] = None) -> bool:
     global _model_name, _temperature, _max_tokens, _timeout, _max_retries, _max_concurrency
     global _openrouter_api_key, _openrouter_model, _openrouter_timeout, _ai_cache_ttl_hours
     global _openrouter_next_attempt_ts, _model_resolution_failed
-    _model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
+    _model_name = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
     _raw_temp = float(os.environ.get("GROQ_TEMPERATURE", "0.1") or 0.1)
     if _raw_temp > 0.3:
         logger.warning("GROQ_TEMPERATURE (%.2f) exceeds allowed maximum 0.3; clamping to 0.3", _raw_temp)
@@ -334,6 +334,17 @@ async def verify_model_available() -> bool:
         models_resp = await asyncio.wait_for(_client.models.list(), timeout=10.0)
         available_ids = {getattr(m, "id", "") for m in getattr(models_resp, "data", [])}
         if _model_name not in available_ids:
+            candidates = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile"]
+            matched = next((c for c in candidates if c in available_ids), None)
+            if matched:
+                logger.warning(
+                    "Configured GROQ_MODEL '%s' was NOT found in Groq's model list. Auto-switching to available model: '%s'.",
+                    _model_name,
+                    matched,
+                )
+                _model_name = matched
+                _model_resolution_failed = False
+                return True
             logger.error(
                 "Configured GROQ_MODEL '%s' was NOT found in Groq's model list. "
                 "Available models: %s. Falling back to OpenRouter or pending_approval.",
@@ -539,6 +550,12 @@ async def _create_completion(prompt: str, json_mode: bool):
         raise
     except asyncio.TimeoutError:
         logger.warning("Groq timed out; trying OpenRouter :free fallback.")
+        fallback = await _create_openrouter_completion(prompt, json_mode=False)
+        if fallback is not None:
+            return fallback
+        raise
+    except Exception as exc:
+        logger.warning("Groq API error (%s); trying OpenRouter fallback.", exc)
         fallback = await _create_openrouter_completion(prompt, json_mode=False)
         if fallback is not None:
             return fallback

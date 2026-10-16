@@ -72,8 +72,9 @@ STATUS_PAUSED_BANNER = "⏸ **System Paused** — Auto-publishing stopped\n\n"
 # ═══════════════════════════ REVIEW CARD (PENDING) ═══════════════════════════
 REASONS = {
     "unknown_platform": "Platform Unidentified",
-    "ai_unavailable": "AI Offline — Review Required",
-    "ai_blocked_review": "⚠️ AI Flagged — Verify",
+    "manual_review": "Manual Review",
+    "blocked_keyword": "Keyword Screen — Verify",
+    "ai_blocked_review": "⚠️ Flagged — Verify",
 }
 REASON_DEFAULT = "Manual Review"
 REVIEW_HEADER = "📬 {reason} · #{id}"
