@@ -46,11 +46,15 @@ class TestMonitorSystem(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if os.path.exists(TEST_DB):
-            try:
-                os.remove(TEST_DB)
-            except OSError:
-                pass
+        import gc
+        gc.collect()
+        for suffix in ("", "-wal", "-shm"):
+            path = TEST_DB + suffix
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     # -------------------------------------------------------------
     # PARSER TESTS
@@ -6523,11 +6527,15 @@ class MainChannelConfigTests(unittest.TestCase):
         self.admin_bot.DEST_CHANNEL = self._orig_admin_dest
         self.main_mod.DEST_CHANNEL = self._orig_main_dest
         os.environ["DEST_CHANNEL"] = self._orig_env_dest
-        if os.path.exists(self._test_db):
-            try:
-                os.remove(self._test_db)
-            except Exception:
-                pass
+        import gc
+        gc.collect()
+        for suffix in ("", "-wal", "-shm"):
+            path = self._test_db + suffix
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
     def test_db_get_set_dest_channel(self):
         """db.set_dest_channel stores normalized values and get_dest_channel retrieves them."""
@@ -6858,11 +6866,15 @@ class TestHardenTasks(unittest.TestCase):
         self.main_mod.FALLBACK_AUTOPUBLISH = self._orig_fallback_auto
         self.admin_bot.set_user_client(None)
         self.admin_bot.set_forward_client(None)
-        if os.path.exists(self._test_db):
-            try:
-                os.remove(self._test_db)
-            except Exception:
-                pass
+        import gc
+        gc.collect()
+        for suffix in ("", "-wal", "-shm"):
+            path = self._test_db + suffix
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
     # -------------------------------------------------------------
     # TASK 1: Edit propagation
@@ -7996,11 +8008,15 @@ class TestPhase2Verification(unittest.TestCase):
 
     def tearDown(self):
         db.DEFAULT_DB_PATH = self._old_db
-        if os.path.exists(self._test_db):
-            try:
-                os.remove(self._test_db)
-            except Exception:
-                pass
+        import gc
+        gc.collect()
+        for suffix in ("", "-wal", "-shm"):
+            path = self._test_db + suffix
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
     def test_claim_stale_received_listing_recovers_claimed_status(self):
         """claim_stale_received_listing recovers both stale 'received' and 'claimed' listings atomically."""
