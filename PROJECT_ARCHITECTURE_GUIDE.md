@@ -78,7 +78,7 @@ flowchart TD
     subgraph UserClient["Telethon User Client (main.py)"]
         NM["on_new_message / on_message_edited"]
         IdemCheck{"Idempotency Check\n(supplier_id, msg_id)"}
-        Quarantine["Insert as status: 'held'\nhold_until: now + 100s"]
+        Quarantine["Insert as status: 'held'\nhold_until: now + QUARANTINE_SECONDS (0s default)"]
     end
 
     subgraph Workers["Background Workers (main.py)"]
@@ -183,7 +183,7 @@ api tele/
 │   ├── db.py                     # Primary storage facade re-exporting all repositories
 │   └── repositories/
 │       ├── base.py               # db_session, connection lifecycle, WAL pragma, schema versioning & migrations
-│       ├── listings.py           # Listings CRUD, 100s quarantine claims, duplicate detection, publish claims
+│       ├── listings.py           # Listings CRUD, quarantine claims, duplicate detection, publish claims
 │       ├── suppliers.py          # Supplier channel CRUD, deduplication, resolution, membership tracking
 │       ├── destinations.py       # Destination targets CRUD, health checking, forwarding queue
 │       ├── headers.py            # Custom emoji header pool CRUD, sticky random header resolution
@@ -216,7 +216,7 @@ api tele/
 ### 5.1 Orchestration Layer (`main.py`)
 - **Lifecycle & Setup (`main()`):**
   1. Validates configuration variables (`API_ID`, `API_HASH`, `DEST_CHANNEL`, `BOT_TOKEN`, `ADMIN_USER_ID`).
-  2. Runs `db.init_db()` to initialize tables, WAL mode, foreign keys, and run pending migrations up to current version (v12).
+  2. Runs `db.init_db()` to initialize tables, WAL mode, foreign keys, and run pending migrations up to current version (v14).
   3. Executes `db.ensure_env_seed(SOURCE_CHANNELS)` (only if the supplier table is completely empty).
   4. Initializes the AI engine (`ai_rephraser.init_groq()`).
   5. Connects the Telethon user client (`client`) and optionally starts the admin bot client (`bot_client`).
@@ -225,7 +225,7 @@ api tele/
      - `events.MessageEdited` to propagate source edits to published posts.
      - `events.MessageDeleted` to log audit records.
   7. Spawns asynchronous background workers:
-     - `held_listings_worker`: Periodically claims and evaluates messages whose 100s quarantine expired.
+     - `held_listings_worker`: Periodically claims and evaluates messages whose quarantine expired (immediate in fast mode).
      - `approved_listings_worker`: Drains manual approvals and publishes them.
      - `forwarding_worker`: Forwards published channel posts to secondary destinations.
      - `supplier_resolution_worker`: Resolves usernames/IDs into Telethon entity references.
@@ -245,11 +245,12 @@ api tele/
     - `v8`: Schema base and cleanups.
     - `v9`: Total removal of price markup columns.
     - `v10`: Adding indexes and cleanups.
-    - `v11`: 100s Quarantine hold (`listings.hold_until`, `listings.duplicate_of`, index `idx_listings_hold`).
+    - `v11`: Quarantine hold (`listings.hold_until`, `listings.duplicate_of`, index `idx_listings_hold`).
     - `v12`: Admin-managed custom-emoji headers (`headers` table, `listings.header_id`).
     - `v13`: Ingest crash recovery (`listings.received_at`, index `idx_listings_received_at`) and persistent post sequence (`app_settings.post_counter`).
+    - `v14`: Multi-account session storage and forwarding account management (`forward_accounts` table, `idx_fwd_acc_name`).
 - **`storage.repositories.listings`:**
-  - `insert_listing(...)`: Creates a listing record with status `held` and `hold_until = now + 100s`.
+  - `insert_listing(...)`: Creates a listing record with status `held` and `hold_until = now + QUARANTINE_SECONDS (0s default)`.
   - `claim_held_listing(...)`: Atomically queries `listings` for expired held records, groups duplicates by fingerprint, selects the oldest row as the winner, marks duplicate twins as `skipped_duplicate`, and transitions the winner to `received`.
   - `claim_listing_for_publish(...)`: Atomically transitions an approved/auto listing to `publishing` with a twin check, ensuring that two concurrent workers cannot publish identical listings.
   - `find_recent_similar_listing(...)`: Fingerprint match within `DEDUP_HOURS` (8 hours) for published/active listings, and within `REJECT_MEMORY_MINUTES` (3 hours) for admin-rejected listings.
@@ -284,8 +285,8 @@ api tele/
 
 ### 5.4 AI Analysis Engine (`services/ai_rephraser.py`)
 - **Model Providers:**
-  - Primary: **Groq** (`qwen/qwen3.8-27b` or configured `GROQ_MODEL`). Fast inference, low latency.
-  - Secondary / Free Fallback: **OpenRouter** (`openai/gpt-oss-120b:free` or configured `OPENROUTER_MODEL`). Circuit-breaker cooldown prevents quota exhaustion during Groq outages.
+  - Primary: **Groq** (`llama-3.3-70b-versatile` or configured `GROQ_MODEL`). Fast inference, low latency.
+  - Secondary / Free Fallback: **OpenRouter** (`meta-llama/llama-3.3-70b-instruct:free` or configured `OPENROUTER_MODEL`). Circuit-breaker cooldown prevents quota exhaustion during Groq outages.
 - **Single-Shot Prompting (`ANALYZE_PROMPT`):**
   - Untrusted supplier text is strictly wrapped in `<supplier_message>` tags to defend against prompt injection.
   - The model outputs a strict JSON payload:
@@ -346,12 +347,12 @@ Here is the exact progression of a supplier message through the system:
    │   └── If already recorded -> Drop immediately (ignore duplicates).
    └── Insert into `listings` table:
        ├── status = 'held'
-       └── hold_until = datetime.utcnow() + 100 seconds
+       └── hold_until = datetime.utcnow() + QUARANTINE_SECONDS (0s in fast mode)
              │
              ▼
-2. 100-SECOND QUARANTINE HOLD
-   ├── Message waits in SQLite.
-   └── Gives time for identical re-posts across supplier networks to arrive.
+2. INGESTION QUARANTINE HOLD (DEFAULT 0s FAST MODE)
+   ├── In fast mode (QUARANTINE_SECONDS=0), listings are immediately due and evaluated instantly.
+   └── For burst buffering (QUARANTINE_SECONDS > 0), holds twins to arrive before first decision.
              │
              ▼
 3. BATCH CLAIM & EVALUATION (`held_listings_worker`)
@@ -441,8 +442,8 @@ Here is the exact progression of a supplier message through the system:
 stateDiagram-v2
     [*] --> held: Ingestion (NewMessage)
     
-    held --> received: 100s Hold Expired (Oldest winner)
-    held --> skipped_duplicate: 100s Hold Expired (Twin of older post)
+    held --> received: Hold Expired / Due (Oldest winner)
+    held --> skipped_duplicate: Hold Expired / Due (Twin of older post)
     
     received --> skipped_chatter: Chatter Pre-Filter
     received --> skipped_duplicate: 8h Published / 3h Rejected Twin
@@ -462,6 +463,9 @@ stateDiagram-v2
     publishing --> published: Destination send success
     publishing --> failed: Send retries exhausted
     publishing --> approved: Recovered after crash/timeout
+    
+    published --> sold: Admin marks sold (/sold or button)
+    sold --> [*]
     
     published --> [*]
     skipped_duplicate --> [*]
@@ -615,4 +619,4 @@ When editing or extending this codebase, adhere to these rules:
 - **NEVER auto-publish payment receipts or proof messages:** These must always be flagged for review.
 - **NEVER use Python `len()` for Telegram entity offsets:** Always use `_utf16_len()`.
 - **NEVER re-read `SOURCE_CHANNELS` from `.env` after initial startup:** Manage channels dynamically via `db` and `/sources`.
-- **NEVER delete `listings` rows arbitrarily:** Maintain foreign key constraints and rely on `purge_expired_retention_data()`.
+- **NEVER delete `listings` rows arbitrarily:** Maintain foreign key constraints and rely on `purge_expired_data()`.

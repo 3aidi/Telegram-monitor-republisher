@@ -6,6 +6,40 @@ from typing import Any
 import db
 
 
+class _TrackedDict(dict):
+    """A dictionary wrapper that propagates in-place mutations to its parent PersistentDict."""
+
+    def __init__(self, parent: "PersistentDict", parent_key: Any, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._parent = parent
+        self._key = parent_key
+
+    def _sync(self) -> None:
+        if self._parent and getattr(self._parent, "_sync_enabled", False):
+            self._parent._persist_key(self._key, self)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        super().__setitem__(key, value)
+        self._sync()
+
+    def __delitem__(self, key: Any) -> None:
+        super().__delitem__(key)
+        self._sync()
+
+    def pop(self, key: Any, *args: Any) -> Any:
+        res = super().pop(key, *args)
+        self._sync()
+        return res
+
+    def clear(self) -> None:
+        super().clear()
+        self._sync()
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        super().update(*args, **kwargs)
+        self._sync()
+
+
 class PersistentDict(dict):
     """A dictionary that mirrors its entries to SQLite app_settings.
 
@@ -20,6 +54,13 @@ class PersistentDict(dict):
         self._loaded = False
         self._sync_enabled = True
 
+    def _persist_key(self, key: Any, value: Any) -> None:
+        if self._sync_enabled:
+            try:
+                db.set_setting(f"{self._prefix}{key}", json.dumps(value))
+            except Exception:
+                pass
+
     def _ensure_loaded(self) -> None:
         if self._loaded:
             return
@@ -31,10 +72,15 @@ class PersistentDict(dict):
                 try:
                     int_k = int(clean_k)
                     val = json.loads(v)
+                    if isinstance(val, dict) and not isinstance(val, _TrackedDict):
+                        val = _TrackedDict(self, int_k, val)
                     super().__setitem__(int_k, val)
                 except (ValueError, TypeError, json.JSONDecodeError):
                     try:
-                        super().__setitem__(clean_k, json.loads(v))
+                        val = json.loads(v)
+                        if isinstance(val, dict) and not isinstance(val, _TrackedDict):
+                            val = _TrackedDict(self, clean_k, val)
+                        super().__setitem__(clean_k, val)
                     except Exception:
                         super().__setitem__(clean_k, v)
         except Exception:
@@ -54,12 +100,10 @@ class PersistentDict(dict):
 
     def __setitem__(self, key: Any, value: Any) -> None:
         self._ensure_loaded()
+        if isinstance(value, dict) and not isinstance(value, _TrackedDict):
+            value = _TrackedDict(self, key, value)
         super().__setitem__(key, value)
-        if self._sync_enabled:
-            try:
-                db.set_setting(f"{self._prefix}{key}", json.dumps(value))
-            except Exception:
-                pass
+        self._persist_key(key, value)
 
     def __delitem__(self, key: Any) -> None:
         self._ensure_loaded()
@@ -91,10 +135,6 @@ class PersistentDict(dict):
 
     def update(self, *args: Any, **kwargs: Any) -> None:
         self._ensure_loaded()
-        super().update(*args, **kwargs)
-        if self._sync_enabled:
-            for k, v in self.items():
-                try:
-                    db.set_setting(f"{self._prefix}{k}", json.dumps(v))
-                except Exception:
-                    pass
+        temp = dict(*args, **kwargs)
+        for k, v in temp.items():
+            self[k] = v

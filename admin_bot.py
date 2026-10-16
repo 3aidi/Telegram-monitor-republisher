@@ -269,7 +269,6 @@ async def send_approval_prompt(
 
     buttons = [
         [
-            Button.inline(texts.BTN_PREVIEW, data=f"preview:{listing_id}"),
             Button.inline(texts.BTN_EDIT,    data=f"edit:{listing_id}"),
             Button.inline(texts.BTN_APPROVE, data=f"approve:{listing_id}"),
             Button.inline(texts.BTN_SKIP,    data=f"skip:{listing_id}"),
@@ -293,35 +292,36 @@ async def send_review_notification(
     admin_id: int,
     listing: dict,
 ) -> None:
-    """Clean review notification with direct action buttons."""
+    """Notification-only card alerting admin that an unclassified message was routed to the manual review queue."""
     listing_id = listing["id"]
     src = _pretty_source(
         listing.get("supplier_username"), listing.get("supplier_display_name")
     )
     src_disp = src if src and src != "?" else "Unknown"
     platform = (listing.get("platform_name") or listing.get("game_name") or "—").title()
+    review_reason = listing.get("_review_reason") or "unclassified"
+    reason_label = texts.REASONS.get(review_reason, review_reason.replace("_", " ").title())
 
     raw = (listing.get("clean_text") or listing.get("raw_text") or "").strip()
     if raw:
         snippet = " ".join(raw.split())
-        if len(snippet) > 160:
-            snippet = snippet[:157] + "..."
+        if len(snippet) > 200:
+            snippet = snippet[:197] + "..."
     else:
         snippet = "(No content)"
 
     text = (
-        f"📬 **Review needed · Listing #{listing_id}**\n"
-        f"Source: {src_disp} | Platform: {platform}\n\n"
-        f"> {snippet}"
+        f"📬 **Sent to Manual Review** · Listing #{listing_id}\n"
+        f"{texts.LINE}\n"
+        f"**Source:** {src_disp}\n"
+        f"**Platform:** {platform}\n"
+        f"**Reason:** {reason_label}\n"
+        f"{texts.LINE}\n"
+        f"> {snippet}\n\n"
+        f"ℹ️ _This message could not be automatically classified and was placed in your /pending queue._"
     )
 
-    buttons = [
-        [
-            Button.inline("Approve", data=f"approve:{listing_id}"),
-            Button.inline("Skip", data=f"skip:{listing_id}"),
-            Button.inline("Edit", data=f"edit:{listing_id}"),
-        ]
-    ]
+    buttons = []
     src_url = _source_url({
         "supplier_username": listing.get("supplier_username") or listing.get("channel_username"),
         "supplier_channel_id": listing.get("supplier_channel_id") or listing.get("channel_id"),
@@ -564,27 +564,30 @@ async def send_skipped_alert(
         )
         src_disp = src if src and src != "?" else "Unknown"
         lid_disp = f"#{listing_id}" if listing_id else "N/A"
+        platform = (listing.get("platform_name") or listing.get("game_name") or "—").title()
 
         raw = (listing.get("raw_text") or listing.get("clean_text") or "").strip()
         if raw:
             snippet = " ".join(raw.split())
-            if len(snippet) > 160:
-                snippet = snippet[:157] + "..."
+            if len(snippet) > 200:
+                snippet = snippet[:197] + "..."
         else:
             snippet = "(No content)"
 
         text = (
             f"⏭️ **Skipped — {label}** · `{lid_disp}`\n"
-            f"Source: {src_disp} | Reason: {human_desc}\n\n"
+            f"{texts.LINE}\n"
+            f"**Source:** {src_disp}\n"
+            f"**Platform:** {platform}\n"
+            f"**Reason:** {human_desc}\n"
+            f"{texts.LINE}\n"
             f"> {snippet}"
         )
 
         buttons = []
+        action_row = []
         if listing_id:
-            buttons.append([
-                Button.inline("Review", data=f"reskip_lid:{listing_id}"),
-                Button.inline("Approve", data=f"force_approve:{listing_id}"),
-            ])
+            action_row.append(Button.inline("Set to Manual Review", data=f"reskip_lid:{listing_id}"))
 
         src_url = _source_url({
             "supplier_username": listing.get("supplier_username") or listing.get("channel_username"),
@@ -592,7 +595,10 @@ async def send_skipped_alert(
             "source_message_id": listing.get("source_message_id") or listing.get("message_id"),
         })
         if src_url:
-            buttons.append([Button.url("Source", src_url)])
+            action_row.append(Button.url("Source", src_url))
+
+        if action_row:
+            buttons.append(action_row)
 
     try:
         await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
@@ -1312,17 +1318,19 @@ def _page_window(
 def _nav_row(
     kind: str, page: int, page_count: int, back_data: Optional[str] = None
 ) -> List[List[object]]:
-    """Navigation row: [⬅️ Back] [➡️ Next] (no page indicator button).
-
-    Back steps to the previous page; on the first page it falls back to
-    ``back_data`` (the parent menu) when given, otherwise it is omitted. Next
-    appears only when a further page exists. Returns [] when the row would be
-    empty, so callers can always ``extend`` with the result."""
+    """Navigation row:
+    - If page_count <= 1: return [] (no pagination buttons).
+    - First page (page == 0): only [ Next ] if page_count > 1.
+    - Middle pages (0 < page < page_count - 1): both [ Back ] and [ Next ].
+    - Last page (page == page_count - 1 and page > 0): only [ Back ].
+    """
+    if page_count <= 1:
+        if back_data:
+            return [[Button.inline(texts.BTN_BACK, data=back_data)]]
+        return []
     row = []
     if page > 0:
         row.append(Button.inline(texts.BTN_BACK, data=f"{kind}:page:{page - 1}"))
-    elif back_data:
-        row.append(Button.inline(texts.BTN_BACK, data=back_data))
     if page + 1 < page_count:
         row.append(Button.inline(texts.BTN_NEXT, data=f"{kind}:page:{page + 1}"))
     return [row] if row else []
@@ -2783,13 +2791,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 lid,
                 actor_id=event.sender_id,
             )
-            await event.answer("Moved to review queue! 📬")
+            await event.answer("Moved to manual review queue! 📬")
             try:
                 await event.delete()
             except Exception:
                 pass
-            listing["_review_reason"] = "manual_override"
-            await send_approval_prompt(bot, ADMIN_USER_ID, listing)
             return
 
         force_approve_match = re.match(r"^force_approve:(\d+)$", data_str)
@@ -3014,7 +3020,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 )
                 prompt_id = getattr(sent, "id", None)
                 if prompt_id:
-                    _wizard_state[ADMIN_USER_ID]["prompt_message_id"] = prompt_id
+                    state = dict(_wizard_state.get(ADMIN_USER_ID) or {})
+                    state["prompt_message_id"] = prompt_id
+                    _wizard_state[ADMIN_USER_ID] = state
             except Exception:
                 logger.exception("Failed to send post search prompt")
             try:
@@ -3755,7 +3763,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 )
                 prompt_id = getattr(sent, "id", None)
                 if prompt_id:
-                    _wizard_state[ADMIN_USER_ID]["prompt_message_id"] = prompt_id
+                    state = dict(_wizard_state.get(ADMIN_USER_ID) or {})
+                    state["prompt_message_id"] = prompt_id
+                    _wizard_state[ADMIN_USER_ID] = state
             except Exception:
                 logger.exception("Failed to send edit prompt for listing #%s", listing_id)
             return

@@ -15,6 +15,9 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from telethon import Button, TelegramClient, events
 from telethon.errors import (
     ChannelInvalidError,
@@ -37,8 +40,6 @@ import parser
 import publish_guard
 import texts
 from pipeline import rules
-
-load_dotenv()
 
 logger = logging.getLogger("monitor")
 
@@ -91,7 +92,7 @@ PUBLISH_MAX_RETRIES = int(os.environ.get("PUBLISH_MAX_RETRIES", "4"))
 PUBLISH_CLAIM_GRACE_SECONDS = int(
     os.environ.get("PUBLISH_CLAIM_GRACE_SECONDS", "300") or 300
 )
-BACKFILL_ON_START = os.environ.get("BACKFILL_ON_START", "0").strip().lower() in ("1", "true", "yes")
+BACKFILL_ON_START = os.environ.get("BACKFILL_ON_START", "1").strip().lower() in ("1", "true", "yes")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 # Free-tier reliability toggles: the chatter pre-filter saves AI quota, and the
 # deterministic fallback keeps real listings publishing when every AI path is down.
@@ -679,6 +680,35 @@ def buy_auto_publish_ok(
         and not category_blocked
         and (rendered_body is None or rules.check_buyer_framing(rendered_body))
     )
+
+
+def auto_publish_ok(
+    intent: str,
+    paused: bool,
+    body_ok: bool,
+    has_payment_proof: Optional[str],
+    rendered_body: Optional[Any] = None,
+    risky_keyword: Optional[str] = None,
+    category_blocked: Optional[str] = None,
+) -> bool:
+    """Gate automatic publishing for valid listings (both buy and sell).
+
+    A listing auto-publishes when:
+    - Not paused
+    - Valid listing intent ('buy' or 'sell')
+    - Substantive sanitized body (body_ok)
+    - No payment-proof signal
+    - No blocked/risky keywords
+    - No category blocklist hit
+    - For buy intent: satisfies buyer framing if rendered_body given
+    """
+    if paused or not body_ok or has_payment_proof or risky_keyword or category_blocked:
+        return False
+    if intent == "buy":
+        return rendered_body is None or rules.check_buyer_framing(rendered_body)
+    if intent == "sell":
+        return True
+    return False
 
 
 def zero_resolved_suppliers_alert_text(active_total: int, resolved_ok: int) -> Optional[str]:
@@ -1987,10 +2017,10 @@ async def _evaluate_listing(
     if ai_clean_text:
         await db.run_async(db.update_listing_content, listing_id, clean_text=ai_clean_text)
 
-    # Sanitize the AI body now and gate the buy auto-publish.
+    # Sanitize the AI body now and gate auto-publish.
     body_lines, body_ok = parser.prepare_body(content_lines, ai_clean_text or raw_text)
     temp_rendered = "\n".join(body_lines)
-    buy_auto_ok = buy_auto_publish_ok(
+    listing_auto_ok = auto_publish_ok(
         intent=intent,
         paused=await db.run_async(db.is_paused),
         body_ok=body_ok,
@@ -2000,7 +2030,7 @@ async def _evaluate_listing(
         category_blocked=category_blocked,
     )
 
-    if buy_auto_ok:
+    if listing_auto_ok:
         post_number = await db.run_async(db.next_post_number)
         claimed = await db.run_async(
             db.claim_listing_for_publish, listing_id, post_number
@@ -2053,21 +2083,29 @@ async def _evaluate_listing(
             await db.run_async(db.mark_listing_failed, listing_id, "unexpected publish error")
             logger.exception("Failed to publish message for listing #%s", listing_id)
     else:
-        # Not an auto-publishable buy signal (unsafe buy, sell, neutral, paused)
-        # -> route to manual approval with the exact reason attached.
+        # Not auto-publishable (unclassified, neutral, weak body, paused, or risk flagged)
+        # -> route to manual approval queue with the exact reason attached.
         gate_reason = None
-        if intent == "buy":
-            if filters.detect_payment_proof(raw_text):
-                gate_reason = "payment_proof"
-            elif not body_ok:
-                gate_reason = "buy_gate_weak_body"
-            else:
-                gate_reason = "buy_gate"
+        if await db.run_async(db.is_paused):
+            gate_reason = "system_paused"
+        elif filters.detect_payment_proof(raw_text):
+            gate_reason = "payment_proof"
+        elif not body_ok:
+            gate_reason = "weak_body"
+        elif intent not in ("buy", "sell"):
+            gate_reason = "unclassified_intent"
+        elif filters.contains_blocked_keyword(raw_text):
+            gate_reason = f"risky_keyword:{filters.contains_blocked_keyword(raw_text)}"
+        elif category_blocked:
+            gate_reason = f"category_{category_blocked}"
+        else:
+            gate_reason = "unclassified"
+
         await db.run_async(db.update_listing_status, listing_id, "pending_approval")
         logger.info(
             "Listing #%s marked pending_approval (gate=%s). Alerting admin...",
             listing_id,
-            gate_reason or "sell/neutral",
+            gate_reason,
         )
 
         if bot_client and ADMIN_USER_ID:
@@ -2160,21 +2198,29 @@ async def process_edited_message(
         rendered_candidate = "\n".join(sanitized_lines)
         framing_ok = rules.check_buyer_framing(rendered_candidate)
         is_blocked = bool((analysis and analysis.get("blocked")) or risky_keyword or cat_blocked)
-        intent_buy = bool(analysis and analysis.get("intent") == "buy" and analysis.get("is_listing"))
+        intent = (analysis.get("intent") if analysis else None) or (existing.get("intent") or "sell")
+        is_listing = bool(analysis and analysis.get("is_listing"))
         paused = await db.run_async(db.is_paused)
+
+        auto_ok = auto_publish_ok(
+            intent=intent,
+            paused=paused,
+            body_ok=body_ok,
+            has_payment_proof=has_payment_proof,
+            rendered_body=rendered_candidate,
+            risky_keyword=risky_keyword,
+            category_blocked=cat_blocked,
+        )
 
         all_gates_pass = (
             not is_blocked
-            and not has_payment_proof
-            and intent_buy
-            and body_ok
-            and framing_ok
-            and not paused
+            and is_listing
+            and auto_ok
         )
 
         if all_gates_pass:
             # Edit the published post
-            platform_name = analysis.get("platform")
+            platform_name = (analysis.get("platform") if analysis else None) or existing.get("platform_name")
             header_emoji = await header_emoji_for_listing(existing["id"])
             updated_text, entities = parser.build_ai_message(
                 content_lines=sanitized_lines,
@@ -2195,6 +2241,12 @@ async def process_edited_message(
                     db.update_listing_content,
                     listing_id=listing_id,
                     clean_text=rendered_candidate,
+                )
+                await db.run_async(
+                    db.update_listing_fields,
+                    listing_id=listing_id,
+                    platform_name=platform_name,
+                    intent=intent,
                 )
                 edit_price, _ = parser.extract_price(raw_text)
                 await db.run_async(
@@ -2220,11 +2272,11 @@ async def process_edited_message(
             rejection_reasons.append("blocked content/keyword")
         if has_payment_proof:
             rejection_reasons.append("payment proof")
-        if not intent_buy:
-            rejection_reasons.append("intent not buy / not listing")
+        if not (is_listing and intent in ("buy", "sell")):
+            rejection_reasons.append("intent not valid listing")
         if not body_ok:
             rejection_reasons.append("sanitizer failed / link or handle / platform lost")
-        if not framing_ok:
+        if intent == "buy" and not rules.check_buyer_framing(rendered_candidate):
             rejection_reasons.append("seller framing (WTS/sell)")
         if paused:
             rejection_reasons.append("system paused")
@@ -2821,28 +2873,39 @@ async def retention_worker(stop_event: asyncio.Event) -> None:
 
 async def run_backfill(client: TelegramClient, bot_client: Optional[TelegramClient]) -> None:
     """
-    Optional catch-up sweep. When BACKFILL_ON_START=1, iterate supplier channels
+    Catch-up sweep. When BACKFILL_ON_START=1, iterate supplier channels
     and re-process any messages newer than the last one we already recorded.
     """
     if not BACKFILL_ON_START:
         return
 
-    logger.info("BACKFILL_ON_START enabled — sweeping source channels for missed messages.")
+    logger.info("Sweeping source channels for new/missed messages...")
     for supplier in db.list_suppliers(active_only=True):
         try:
             entity = await resolve_chat(client, supplier)
             last_id = db.get_last_source_message_id(supplier["id"])
             count = 0
-            async for msg in client.iter_messages(
-                entity, min_id=last_id, reverse=True, limit=200
-            ):
-                await process_supplier_message(client, bot_client, supplier, msg)
-                count += 1
-            logger.info(
-                "Backfill done for supplier %s: %s new message(s) processed.",
-                _supplier_label(supplier),
-                count,
-            )
+            if last_id > 0:
+                async for msg in client.iter_messages(
+                    entity, min_id=last_id, reverse=True, limit=500
+                ):
+                    await process_supplier_message(client, bot_client, supplier, msg)
+                    count += 1
+            else:
+                # First time seeing this supplier: fetch recent history (up to 100 recent messages)
+                recent_msgs = []
+                async for msg in client.iter_messages(entity, limit=100):
+                    recent_msgs.append(msg)
+                for msg in reversed(recent_msgs):
+                    await process_supplier_message(client, bot_client, supplier, msg)
+                    count += 1
+
+            if count > 0:
+                logger.info(
+                    "Backfill done for supplier %s: %s new message(s) processed.",
+                    _supplier_label(supplier),
+                    count,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2851,6 +2914,42 @@ async def run_backfill(client: TelegramClient, bot_client: Optional[TelegramClie
                 _supplier_label(supplier),
             )
     logger.info("Backfill sweep finished.")
+
+
+async def inbound_catchup_worker(
+    client: TelegramClient,
+    bot_client: Optional[TelegramClient],
+    stop_event: asyncio.Event,
+    interval: int = 60,
+) -> None:
+    """Periodic catch-up worker ensuring no messages are missed if MTProto push updates drop."""
+    await asyncio.sleep(20)
+    while not stop_event.is_set():
+        try:
+            for supplier in db.list_suppliers(active_only=True):
+                if stop_event.is_set():
+                    break
+                try:
+                    last_id = db.get_last_source_message_id(supplier["id"])
+                    if last_id <= 0:
+                        continue
+                    entity = await resolve_chat(client, supplier)
+                    async for msg in client.iter_messages(
+                        entity, min_id=last_id, reverse=True, limit=50
+                    ):
+                        await process_supplier_message(client, bot_client, supplier, msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error in inbound catch-up worker")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -3204,7 +3303,7 @@ async def main() -> None:
 
     # Ensure user client dialogs/pts are synchronized before message ingestion
     try:
-        await user_client.get_dialogs(limit=100)
+        await user_client.get_dialogs(limit=300)
         logger.info("Warmed up user client dialogs cache.")
     except Exception as exc:
         logger.warning("Could not pre-warm user client dialogs cache: %s", exc)
@@ -3308,6 +3407,7 @@ async def main() -> None:
     health_task = None
     resolve_task = None
     rephrase_task = None
+    catchup_task = None
     backfill_task = None
     if not MANUAL_MODE:
         health_task = asyncio.create_task(health_check_worker(stop_event, bot_client))
@@ -3315,6 +3415,9 @@ async def main() -> None:
             supplier_resolution_worker(user_client, bot_client, stop_event)
         )
         rephrase_task = asyncio.create_task(rephrase_unpublished())
+        catchup_task = asyncio.create_task(
+            inbound_catchup_worker(user_client, bot_client, stop_event)
+        )
         if BACKFILL_ON_START:
             backfill_task = asyncio.create_task(run_backfill(user_client, bot_client))
 
@@ -3343,7 +3446,7 @@ async def main() -> None:
         retention_task.cancel()
         if dest_sync_task is not None:
             dest_sync_task.cancel()
-        for task in (health_task, resolve_task, rephrase_task):
+        for task in (health_task, resolve_task, rephrase_task, catchup_task):
             if task is not None:
                 task.cancel()
         if backfill_task:
@@ -3353,7 +3456,7 @@ async def main() -> None:
         pending_tasks = [held_task, worker_task, forward_task, retention_task]
         if dest_sync_task is not None:
             pending_tasks.append(dest_sync_task)
-        for task in (health_task, resolve_task, rephrase_task):
+        for task in (health_task, resolve_task, rephrase_task, catchup_task):
             if task is not None:
                 pending_tasks.append(task)
         if backfill_task:

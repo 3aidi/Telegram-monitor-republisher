@@ -61,7 +61,10 @@ def make_listing_fingerprint(
     like prices are removed so re-posts with changed prices or formatting are
     recognized as duplicates. When DEDUP_IGNORE_PRICE=0, price is folded in.
     """
-    should_ignore = DEDUP_IGNORE_PRICE if ignore_price is None else ignore_price
+    if ignore_price is None:
+        should_ignore = os.environ.get("DEDUP_IGNORE_PRICE", "1").strip().lower() in ("1", "true", "yes")
+    else:
+        should_ignore = ignore_price
     norm = unicodedata.normalize("NFKC", (clean_text or "").strip().lower())
     # DEDUP-FN: collapse the punctuation variants that are visually identical to
     # readers — em/en/2-em dashes and the minus sign become '-', smart quotes
@@ -857,7 +860,7 @@ def next_post_number(db_path: Optional[str] = None) -> int:
     on listings and survives all database purges.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
-    with db_session(db_path) as conn:
+    with db_session(db_path, immediate=True) as conn:
         conn.execute(
             "INSERT INTO app_settings (key, value, updated_at) VALUES ('post_counter', '0', ?) "
             "ON CONFLICT(key) DO NOTHING",
@@ -892,15 +895,15 @@ def next_post_number(db_path: Optional[str] = None) -> int:
 def claim_stale_received_listing(
     stale_threshold_seconds: int = 120, limit: int = 5, db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """Find listings in 'received' status older than stale_threshold_seconds and atomically touch them."""
+    """Find listings in 'received' or 'claimed' status older than stale_threshold_seconds and atomically touch them."""
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
     cutoff = (now_dt - timedelta(seconds=stale_threshold_seconds)).isoformat()
-    with db_session(db_path) as conn:
+    with db_session(db_path, immediate=True) as conn:
         rows = conn.execute(
             """
             SELECT * FROM listings
-            WHERE status = 'received'
+            WHERE status IN ('received', 'claimed')
               AND (
                   (received_at IS NOT NULL AND received_at <= ?)
                   OR (received_at IS NULL AND updated_at <= ?)
@@ -913,8 +916,17 @@ def claim_stale_received_listing(
         claimed = []
         for r in rows:
             cur = conn.execute(
-                "UPDATE listings SET received_at = ?, updated_at = ? WHERE id = ? AND status = 'received'",
-                (now_iso, now_iso, r["id"]),
+                """
+                UPDATE listings
+                SET received_at = ?, updated_at = ?
+                WHERE id = ?
+                  AND status IN ('received', 'claimed')
+                  AND (
+                      (received_at IS NOT NULL AND received_at <= ?)
+                      OR (received_at IS NULL AND updated_at <= ?)
+                  )
+                """,
+                (now_iso, now_iso, r["id"], cutoff, cutoff),
             )
             if cur.rowcount > 0:
                 claimed.append(dict(r))

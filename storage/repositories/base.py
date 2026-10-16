@@ -102,10 +102,12 @@ def _commit_with_retry(conn, retries: int = 5, base_delay: float = 0.1) -> None:
 # raises instead of freezing the process).
 # ---------------------------------------------------------------------------
 @contextmanager
-def db_session(db_path: Optional[str] = None):
+def db_session(db_path: Optional[str] = None, immediate: bool = False):
     """Context manager: opens a fresh connection, commits, and closes."""
     conn = get_db_connection(db_path)
     try:
+        if immediate:
+            conn.execute("BEGIN IMMEDIATE")
         yield conn
         _commit_with_retry(conn)
     except Exception:

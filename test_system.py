@@ -2003,8 +2003,8 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual([b.text for b in row], ["Next"])
         self.assertEqual([b.data.decode() for b in row], ["sup:page:1"])
         row = admin_bot._nav_row("sup", 0, 3, back_data="menu:home")[0]
-        self.assertEqual([b.text for b in row], ["Back", "Next"])
-        self.assertEqual([b.data.decode() for b in row], ["menu:home", "sup:page:1"])
+        self.assertEqual([b.text for b in row], ["Next"])
+        self.assertEqual([b.data.decode() for b in row], ["sup:page:1"])
         row = admin_bot._nav_row("sup", 1, 3)[0]
         self.assertEqual([b.text for b in row], ["Back", "Next"])
         self.assertEqual([b.data.decode() for b in row], ["sup:page:0", "sup:page:2"])
@@ -2013,7 +2013,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual([b.data.decode() for b in row], ["dest:page:1"])
 
     def test_sources_buttons_pagination(self):
-        """13 sources → 6/6/1 across pages; [Back|Next] row, then Add Source row."""
+        """13 sources → 6/6/1 across pages; [Next] on page 0, [Back|Next] on page 1, [Back] on page 2."""
         import admin_bot
 
         suppliers = [
@@ -2023,10 +2023,10 @@ class TestMonitorSystem(unittest.TestCase):
         ]
 
         b0 = admin_bot._sources_buttons(suppliers, 0)
-        self.assertEqual(len(b0), 8, "6 supplier rows + Back/Next nav + Add")
-        self.assertEqual([x.text for x in b0[6]], ["Back", "Next"])
-        self.assertEqual([x.data.decode() for x in b0[6]], ["menu:home", "sup:page:1"])
-        self.assertEqual([x.text for x in b0[7]], ["Add Source"])
+        self.assertEqual(len(b0), 8, "6 supplier rows + Next nav + Add/Home")
+        self.assertEqual([x.text for x in b0[6]], ["Next"])
+        self.assertEqual([x.data.decode() for x in b0[6]], ["sup:page:1"])
+        self.assertEqual(b0[7][0].text, "Add Source")
 
         b1 = admin_bot._sources_buttons(suppliers, 1)
         self.assertEqual(len(b1), 8)
@@ -2034,7 +2034,7 @@ class TestMonitorSystem(unittest.TestCase):
         self.assertEqual([x.data.decode() for x in b1[6]], ["sup:page:0", "sup:page:2"])
 
         b2 = admin_bot._sources_buttons(suppliers, 2)
-        self.assertEqual(len(b2), 3, "1 supplier row + Back nav + Add")
+        self.assertEqual(len(b2), 3, "1 supplier row + Back nav + Add/Home")
         self.assertEqual(b2[0][0].data.decode(), "sup:13")
         self.assertEqual([x.text for x in b2[1]], ["Back"])
         self.assertEqual(b2[1][0].data.decode(), "sup:page:1")
@@ -2067,9 +2067,9 @@ class TestMonitorSystem(unittest.TestCase):
             for i in range(1, 21)
         ]
         b0 = admin_bot._destinations_buttons(dests, 0)
-        self.assertEqual(len(b0), 18, "15 destinations + Back/Next row + 2 Action rows")
-        self.assertEqual([x.text for x in b0[15]], ["Back", "Next"])
-        self.assertEqual([x.data.decode() for x in b0[15]], ["menu:home", "dest:page:1"])
+        self.assertEqual(len(b0), 18, "15 destinations + Next row + 2 Action rows")
+        self.assertEqual([x.text for x in b0[15]], ["Next"])
+        self.assertEqual([x.data.decode() for x in b0[15]], ["dest:page:1"])
         self.assertEqual(b0[16][0].data.decode(), "destadd")
 
         b1 = admin_bot._destinations_buttons(dests, 1)
@@ -7949,6 +7949,116 @@ class TestLatencyAndDelaysPerformance(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(ok_wait)
                 self.assertEqual(status_wait, "SUCCESS")
+
+
+class TestPhase2Verification(unittest.TestCase):
+    """Unit tests verifying Phase 2 fixes."""
+
+    def setUp(self):
+        self._test_db = f"test_phase2_{int(time.time() * 1000)}_{os.getpid()}.db"
+        db.init_db(self._test_db)
+        self._old_db = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = self._test_db
+
+    def tearDown(self):
+        db.DEFAULT_DB_PATH = self._old_db
+        if os.path.exists(self._test_db):
+            try:
+                os.remove(self._test_db)
+            except Exception:
+                pass
+
+    def test_claim_stale_received_listing_recovers_claimed_status(self):
+        """claim_stale_received_listing recovers both stale 'received' and 'claimed' listings atomically."""
+        sid = db.add_supplier("@test_stale_src", channel_id=-100777, db_path=self._test_db)
+        past_iso = (datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat()
+        recent_iso = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+
+        # 1. Stale listing with status 'claimed'
+        lid_stale_claimed = db.insert_listing(
+            sid, 701, "Stale claimed post", None, "claimed",
+            "Stale claimed post", "Stale claimed post",
+            db_path=self._test_db,
+        )
+        with db.db_session(self._test_db) as conn:
+            conn.execute("UPDATE listings SET received_at = ?, updated_at = ? WHERE id = ?", (past_iso, past_iso, lid_stale_claimed))
+
+        # 2. Stale listing with status 'received'
+        lid_stale_received = db.insert_listing(
+            sid, 702, "Stale received post", None, "received",
+            "Stale received post", "Stale received post",
+            db_path=self._test_db,
+        )
+        with db.db_session(self._test_db) as conn:
+            conn.execute("UPDATE listings SET received_at = ?, updated_at = ? WHERE id = ?", (past_iso, past_iso, lid_stale_received))
+
+        # 3. Fresh listing with status 'claimed' (should NOT be claimed)
+        lid_fresh_claimed = db.insert_listing(
+            sid, 703, "Fresh claimed post", None, "claimed",
+            "Fresh claimed post", "Fresh claimed post",
+            db_path=self._test_db,
+        )
+        with db.db_session(self._test_db) as conn:
+            conn.execute("UPDATE listings SET received_at = ?, updated_at = ? WHERE id = ?", (recent_iso, recent_iso, lid_fresh_claimed))
+
+        # Run recovery
+        claimed = db.claim_stale_received_listing(stale_threshold_seconds=120, limit=10, db_path=self._test_db)
+        claimed_ids = [c["id"] for c in claimed]
+
+        self.assertIn(lid_stale_claimed, claimed_ids)
+        self.assertIn(lid_stale_received, claimed_ids)
+        self.assertNotIn(lid_fresh_claimed, claimed_ids)
+
+        # Verify atomic update touched received_at to present (now > past_iso)
+        updated_row = db.get_listing_by_id(lid_stale_claimed, db_path=self._test_db)
+        self.assertGreater(updated_row["received_at"], past_iso)
+
+        # Immediate second claim attempt with same threshold should return nothing
+        second_claimed = db.claim_stale_received_listing(stale_threshold_seconds=120, limit=10, db_path=self._test_db)
+        self.assertEqual(len(second_claimed), 0)
+
+    def test_wizard_state_nested_update_persistence_across_reload(self):
+        """Nested mutations and top-level reassignments on PersistentDict persist across reloads."""
+        import json
+        from services.fsm import PersistentDict
+
+        # Phase A: In-place nested mutation
+        wiz = PersistentDict(prefix="wiz_test:")
+        wiz.clear()
+        admin_id = 99887766
+        wiz[admin_id] = {"step": "post_search"}
+        # In-place mutation of the nested dictionary
+        wiz[admin_id]["prompt_message_id"] = 123456
+
+        # Verify direct SQLite persistence
+        raw_val = db.get_setting(f"wiz_test:{admin_id}", db_path=self._test_db)
+        self.assertIsNotNone(raw_val)
+        data = json.loads(raw_val)
+        self.assertEqual(data.get("prompt_message_id"), 123456)
+        self.assertEqual(data.get("step"), "post_search")
+
+        # Reload with a brand new PersistentDict instance
+        wiz_reloaded = PersistentDict(prefix="wiz_test:")
+        self.assertIn(admin_id, wiz_reloaded)
+        self.assertEqual(wiz_reloaded[admin_id]["prompt_message_id"], 123456)
+
+        # Phase B: Top-level reassignment pattern
+        state = dict(wiz_reloaded.get(admin_id) or {})
+        state["prompt_message_id"] = 654321
+        state["extra_field"] = "confirmed"
+        wiz_reloaded[admin_id] = state
+
+        # Verify direct SQLite persistence after reassignment
+        raw_val2 = db.get_setting(f"wiz_test:{admin_id}", db_path=self._test_db)
+        data2 = json.loads(raw_val2)
+        self.assertEqual(data2.get("prompt_message_id"), 654321)
+        self.assertEqual(data2.get("extra_field"), "confirmed")
+
+        # Reload again with another new PersistentDict instance
+        wiz_reloaded2 = PersistentDict(prefix="wiz_test:")
+        self.assertEqual(wiz_reloaded2[admin_id]["prompt_message_id"], 654321)
+        self.assertEqual(wiz_reloaded2[admin_id]["extra_field"], "confirmed")
+        wiz_reloaded2.clear()
 
 
 if __name__ == "__main__":

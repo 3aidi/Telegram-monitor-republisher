@@ -49,16 +49,31 @@ An automated, robust Telegram channel monitor and republisher for digital accoun
 ## Project Structure
 
 ```
-├── main.py            # Main entry point & orchestrator
-├── parser.py          # Emoji stripping, platform/price/intent extraction & formatting
-├── filters.py         # Keyword blocklist & fingerprint duplicate detection
-├── db.py              # SQLite schema, migrations & helper queries
-├── admin_bot.py       # Telegram bot for admin management & inline approvals
-├── test_system.py     # Automated unit test suite
-├── run.ps1            # PowerShell quick start script
-├── .env.example       # Template for environment variables
-├── requirements.txt   # Python dependencies
-└── monitor.db         # SQLite database (auto-generated, gitignored)
+├── main.py                  # Main entry point & orchestrator
+├── admin_bot.py             # Telegram bot for admin management & inline approvals
+├── core/                    # Core configuration and validation utilities
+│   ├── config.py
+│   └── errors.py
+├── domain/                  # Domain data classes and listing entities
+│   ├── listing.py
+│   └── supplier.py
+├── pipeline/                # Parsing, filtering, and publishing rules
+│   ├── filters.py
+│   ├── parser.py
+│   └── rules.py
+├── services/                # Background services and external integrations
+│   ├── ai_rephraser.py      # LLM listing analysis (Groq primary, OpenRouter fallback)
+│   ├── fsm.py               # PersistentDict SQLite-backed state machine
+│   └── publish_guard.py     # Channel publish limits and lock management
+├── storage/                 # Storage engine and modular repositories
+│   ├── database.py          # SQLite connection and migration coordinator
+│   └── repositories/        # Domain-specific SQL repositories (base, listings, suppliers, forwardings, settings)
+├── texts.py                 # Bot UI strings and Markdown templates
+├── test_system.py           # Automated unit and integration test suite
+├── run.ps1                  # PowerShell quick start script
+├── .env.example             # Template for environment variables
+├── requirements.txt         # Python dependencies
+└── monitor.db               # SQLite database (auto-generated, gitignored)
 ```
 
 ---

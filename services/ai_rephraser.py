@@ -27,7 +27,7 @@ logger = logging.getLogger("ai_rephraser")
 
 _client = None
 _api_key: Optional[str] = None
-_model_name: str = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b").strip() or "qwen/qwen3.8-27b"
+_model_name: str = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 _raw_temp = float(os.environ.get("GROQ_TEMPERATURE", "0.1") or 0.1)
 if _raw_temp > 0.3:
     logger.warning("GROQ_TEMPERATURE (%.2f) exceeds allowed maximum 0.3; clamping to 0.3", _raw_temp)
@@ -52,8 +52,8 @@ _semaphore = None
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 _openrouter_api_key: Optional[str] = None
 _openrouter_model: str = (
-    os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b:free").strip()
-    or "openai/gpt-oss-120b:free"
+    os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free").strip()
+    or "meta-llama/llama-3.3-70b-instruct:free"
 )
 _openrouter_timeout: float = float(os.environ.get("OPENROUTER_TIMEOUT", "15") or 15)
 # Circuit breaker: after an OpenRouter failure we cool down before trying again
@@ -265,7 +265,7 @@ def init_groq(api_key: Optional[str] = None) -> bool:
     global _model_name, _temperature, _max_tokens, _timeout, _max_retries, _max_concurrency
     global _openrouter_api_key, _openrouter_model, _openrouter_timeout, _ai_cache_ttl_hours
     global _openrouter_next_attempt_ts, _model_resolution_failed
-    _model_name = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b").strip() or "qwen/qwen3.8-27b"
+    _model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
     _raw_temp = float(os.environ.get("GROQ_TEMPERATURE", "0.1") or 0.1)
     if _raw_temp > 0.3:
         logger.warning("GROQ_TEMPERATURE (%.2f) exceeds allowed maximum 0.3; clamping to 0.3", _raw_temp)
@@ -280,8 +280,8 @@ def init_groq(api_key: Optional[str] = None) -> bool:
     _max_concurrency = max(1, int(os.environ.get("GROQ_MAX_CONCURRENCY", "2") or 2))
     _openrouter_api_key = (os.environ.get("OPENROUTER_API_KEY", "") or "").strip() or None
     _openrouter_model = (
-        os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b:free").strip()
-        or "openai/gpt-oss-120b:free"
+        os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free").strip()
+        or "meta-llama/llama-3.3-70b-instruct:free"
     )
     _openrouter_timeout = float(os.environ.get("OPENROUTER_TIMEOUT", "15") or 15)
     _ai_cache_ttl_hours = float(os.environ.get("AI_CACHE_TTL_HOURS", "48") or 48)
