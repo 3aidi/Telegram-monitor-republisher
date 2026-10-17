@@ -58,30 +58,62 @@ KNOWN_PLATFORMS: Set[str] = {
     "bybit", "binance", "kucoin", "okx", "crypto.com", "coinbase", "kraken", "bitget",
     "mexc", "gate.io", "huobi", "htx",
     # Neobanks & Payment
-    "revolut", "wise", "buddybank", "buddypay", "indexo", "paypal", "stripe", "payoneer",
+    "revolut", "wise", "buddybank", "buddypay", "magentapay", "indexo", "paypal", "stripe", "payoneer",
     "skrill", "neteller", "n26", "chime", "monzo", "cashapp", "venmo", "curve",
-    "norisbank", "postbank", "sparkasse", "ing",
+    "norisbank", "postbank", "sparkasse", "ing", "airwallex", "bunq", "monese",
     # Cloud & VPS
     "hetzner", "aws", "digitalocean", "ovh", "chatgpt", "openai", "vultr", "linode",
+}
+
+_PLATFORM_SKIP_DESCRIPTORS: Set[str] = {
+    "verified", "unverified", "fresh", "old", "aged", "new", "full", "clean",
+    "personal", "business", "cheap", "bulk", "good", "high", "quality",
+    "a", "an", "the", "any", "some", "urgent", "instant", "fast",
+}
+
+_PLATFORM_NOISE_WORDS: Set[str] = {
+    "account", "acc", "accs", "accounts", "profile", "profiles", "number", "numbers",
+    "method", "methods", "card", "cards", "vps", "rdp", "mail", "email", "emails",
+    "doc", "docs", "kyc", "id", "data", "dm", "pm", "price", "budget", "usd", "usdt",
+    "eur", "deal", "deals", "service", "services", "login", "logins", "seller", "buyer",
+    "someone", "who", "help", "info", "please", "bro", "sir", "admin", "today", "now",
 }
 
 PLATFORM_CATEGORIES = {
     "kyc": {"sumsub", "veriff", "jumio", "onfido", "shufti", "kyc"},
     "exchange": {"bybit", "binance", "kucoin", "okx", "crypto.com", "coinbase", "kraken", "bitget", "mexc", "gate.io", "huobi", "htx"},
     "crypto": {"bybit", "binance", "kucoin", "okx", "crypto.com", "coinbase", "kraken", "bitget", "mexc", "gate.io", "huobi", "htx"},
-    "neobank": {"revolut", "wise", "buddybank", "buddypay", "indexo", "paypal", "stripe", "payoneer", "skrill", "neteller", "n26", "chime", "monzo", "cashapp", "venmo", "curve", "norisbank", "postbank", "sparkasse", "ing"},
-    "bank": {"revolut", "wise", "buddybank", "buddypay", "indexo", "paypal", "stripe", "payoneer", "skrill", "neteller", "n26", "chime", "monzo", "cashapp", "venmo", "curve", "norisbank", "postbank", "sparkasse", "ing"},
+    "neobank": {"revolut", "wise", "buddybank", "buddypay", "magentapay", "indexo", "paypal", "stripe", "payoneer", "skrill", "neteller", "n26", "chime", "monzo", "cashapp", "venmo", "curve", "norisbank", "postbank", "sparkasse", "ing", "airwallex", "bunq", "monese"},
+    "bank": {"revolut", "wise", "buddybank", "buddypay", "magentapay", "indexo", "paypal", "stripe", "payoneer", "skrill", "neteller", "n26", "chime", "monzo", "cashapp", "venmo", "curve", "norisbank", "postbank", "sparkasse", "ing", "airwallex", "bunq", "monese"},
     "streaming": {"netflix", "spotify", "youtube", "disney", "disney+", "hulu", "prime", "prime video", "apple tv", "iptv", "deezer", "tidal", "crunchyroll", "paramount+"},
     "vps": {"hetzner", "aws", "digitalocean", "ovh", "vultr", "linode"},
     "cloud": {"hetzner", "aws", "digitalocean", "ovh", "chatgpt", "openai", "vultr", "linode"},
 }
 
 def detect_platform_from_text(text: str) -> Optional[str]:
-    """Extract platform name from text if it matches known platforms."""
+    """Extract platform name from text matching known platforms or WTB/WTS/Need heuristics."""
     t = (text or "").lower()
+    # 1. Exact match against known platforms list
     for p in sorted(KNOWN_PLATFORMS, key=len, reverse=True):
         if re.search(rf"\b{re.escape(p)}\b", t):
             return p
+
+    # 2. Heuristic extraction for "WTB <platform>", "WTS <platform>", "Need <platform>", etc.
+    m = re.search(
+        r"\b(?:wtb|wts|wtt|buying|selling|need|looking\s+for|lf)\s+([a-zA-Z0-9_\-\.\+]+(?:\s+[a-zA-Z0-9_\-\.\+]+){0,4})",
+        t,
+    )
+    if m:
+        tokens = re.findall(r"[a-zA-Z0-9_\-\.\+]+", m.group(1))
+        for token in tokens:
+            if token.isdigit() or len(token) < 2:
+                continue
+            if token in _PLATFORM_SKIP_DESCRIPTORS:
+                continue
+            if token in _PLATFORM_NOISE_WORDS:
+                continue
+            return token
+
     return None
 
 def check_category_blocked(text: str, platform: Optional[str] = None, blocked_categories: Optional[str] = None) -> Optional[str]:

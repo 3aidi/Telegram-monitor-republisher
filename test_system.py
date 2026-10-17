@@ -8678,6 +8678,97 @@ class TestJoinedDestinationGroupMultiAccount(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_platform_detection_heuristics(self):
+        """detect_platform_from_text extracts platform from WTB/WTS/Need heuristics and known platforms."""
+        t1 = "WTB magentapay personal number can change data 200-250$"
+        self.assertEqual(filters.detect_platform_from_text(t1), "magentapay")
+
+        t2 = "I need wise Old account Indonesia Thailand Philippines With transaction history Dm @KYC672"
+        self.assertEqual(filters.detect_platform_from_text(t2), "wise")
+
+        t3 = "WTB verified stripe account with balance"
+        self.assertEqual(filters.detect_platform_from_text(t3), "stripe")
+
+        t4 = "Need fresh revolut uk"
+        self.assertEqual(filters.detect_platform_from_text(t4), "revolut")
+
+        t5 = "WTB somenewservice acc fast"
+        self.assertEqual(filters.detect_platform_from_text(t5), "somenewservice")
+
+        # Noise words alone should not be detected as platforms
+        self.assertIsNone(filters.detect_platform_from_text("WTB account"))
+        self.assertIsNone(filters.detect_platform_from_text("WTB cheap cards"))
+
+    def test_verify_model_available_auto_switch(self):
+        """verify_model_available auto-switches to available candidate without UnboundLocalError."""
+        import asyncio
+        import types
+        from unittest.mock import AsyncMock, patch
+
+        mock_models_resp = types.SimpleNamespace(
+            data=[
+                types.SimpleNamespace(id="openai/gpt-oss-120b"),
+                types.SimpleNamespace(id="qwen/qwen3.8-27b"),
+            ]
+        )
+        fake_client = types.SimpleNamespace(
+            models=types.SimpleNamespace(
+                list=AsyncMock(return_value=mock_models_resp)
+            )
+        )
+
+        with patch.object(ai_rephraser, "_client", fake_client), \
+             patch.object(ai_rephraser, "_api_key", "mock_key"), \
+             patch.object(ai_rephraser, "_model_name", "deprecated/old-model"):
+            ok = asyncio.run(ai_rephraser.verify_model_available())
+            self.assertTrue(ok)
+            self.assertEqual(ai_rephraser._model_name, "openai/gpt-oss-120b")
+            self.assertFalse(ai_rephraser._model_resolution_failed)
+
+    def test_auto_approve_duplicate_messages_never_republished(self):
+        """Deduplication guarantee: duplicate of an auto-published message is marked skipped and never published."""
+        import asyncio
+
+        sid = db.add_supplier("@test_dedup_supplier", channel_id=-100222, db_path=self._test_db)
+        raw_msg = "WTB magentapay personal number can change data 200-250$"
+        source_price = 200.0
+        fp = db.make_listing_fingerprint(raw_msg, price=source_price)
+
+        # First message arrives
+        lid1 = db.insert_listing(
+            sid, 1001, "magentapay", None, "held",
+            raw_msg, raw_msg, fingerprint=fp, db_path=self._test_db,
+        )
+        # Wins claim
+        won1 = db.claim_held_listing(lid1, hours=8, db_path=self._test_db)
+        self.assertEqual(won1, lid1)
+
+        # Published
+        post_num1 = db.next_post_number(db_path=self._test_db)
+        claimed_pub1 = db.claim_listing_for_publish(lid1, post_num1, hours=8, db_path=self._test_db)
+        self.assertTrue(claimed_pub1)
+        db.update_listing_status(lid1, "published", published_message_id=5001, post_number=post_num1, db_path=self._test_db)
+
+        # Second identical message arrives 5 minutes later
+        lid2 = db.insert_listing(
+            sid, 1002, "magentapay", None, "held",
+            raw_msg, raw_msg, fingerprint=fp, db_path=self._test_db,
+        )
+
+        # Claim MUST be lost to lid1
+        won2 = db.claim_held_listing(lid2, hours=8, db_path=self._test_db)
+        self.assertEqual(won2, lid1)
+
+        # Even if claim_listing_for_publish was somehow attempted, it MUST return False
+        post_num2 = db.next_post_number(db_path=self._test_db)
+        claimed_pub2 = db.claim_listing_for_publish(lid2, post_num2, hours=8, db_path=self._test_db)
+        self.assertFalse(claimed_pub2)
+
+        # Listing 2 status remains not published
+        row2 = db.get_listing_by_id(lid2, db_path=self._test_db)
+        self.assertNotEqual(row2["status"], "published")
+        self.assertIsNone(row2["published_message_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,8 +52,8 @@ _semaphore = None
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 _openrouter_api_key: Optional[str] = None
 _openrouter_model: str = (
-    os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free").strip()
-    or "meta-llama/llama-3.3-70b-instruct:free"
+    os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free").strip()
+    or "nvidia/nemotron-3-super-120b-a12b:free"
 )
 _openrouter_timeout: float = float(os.environ.get("OPENROUTER_TIMEOUT", "15") or 15)
 # Circuit breaker: after an OpenRouter failure we cool down before trying again
@@ -93,11 +93,14 @@ Additionally you MUST:
      • selling raw identity documents (passport/ID cards/driver's license) AS THE PRODUCT ITSELF
      • stolen credit/debit card data, card dumps, account takeovers, remote access to others' accounts
    When blocked=true, is_listing MUST be false and content MUST be empty.
-2. Identify the PLATFORM (the app/product/service being sold or requested). Common examples:
+2. Identify the PLATFORM (the app/product/service/bank/payment method being sold or requested).
+   For example, if the message says "WTB magentapay" or "I need wise" or "selling netflix", the
+   platform is "magentapay", "wise", "netflix", etc. Any brand, payment app, fintech, bank,
+   game, or service being traded is the platform. Common examples:
    bybit, binance, kucoin, okx, crypto.com, netflix, spotify, disney, revolut, wise, paypal,
-   n26, chime, monzo, cashapp, venmo, chatgpt, openai, aws, hetzner, youtube, prime video,
+   magentapay, n26, chime, monzo, cashapp, venmo, chatgpt, openai, aws, hetzner, youtube, prime video,
    buddypay (buddybank), curve, indexo, norisbank, postbank, ing, sparkasse. If the message is a
-   listing but the specific platform cannot be confidently identified, use null (platform=null).
+   listing but the specific platform cannot be identified at all, use null (platform=null).
 3. Extract the ORIGINAL PRICE the supplier quoted, as a number ONLY (drop currency symbols).
    e.g. "$50" -> 50, "50$" -> 50, "1,200$" -> 1200, "Price: 100 €" -> 100. If no price is
    present, use null. If a price is present but is clearly not a listing (blocked/spam), keep null.
@@ -280,8 +283,8 @@ def init_groq(api_key: Optional[str] = None) -> bool:
     _max_concurrency = max(1, int(os.environ.get("GROQ_MAX_CONCURRENCY", "2") or 2))
     _openrouter_api_key = (os.environ.get("OPENROUTER_API_KEY", "") or "").strip() or None
     _openrouter_model = (
-        os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free").strip()
-        or "meta-llama/llama-3.3-70b-instruct:free"
+        os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free").strip()
+        or "nvidia/nemotron-3-super-120b-a12b:free"
     )
     _openrouter_timeout = float(os.environ.get("OPENROUTER_TIMEOUT", "15") or 15)
     _ai_cache_ttl_hours = float(os.environ.get("AI_CACHE_TTL_HOURS", "48") or 48)
@@ -327,14 +330,14 @@ def is_available() -> bool:
 
 async def verify_model_available() -> bool:
     """Check Groq model availability against Groq's model list at startup."""
-    global _model_resolution_failed
+    global _model_resolution_failed, _model_name
     if not _client or not _api_key:
         return False
     try:
         models_resp = await asyncio.wait_for(_client.models.list(), timeout=10.0)
         available_ids = {getattr(m, "id", "") for m in getattr(models_resp, "data", [])}
         if _model_name not in available_ids:
-            candidates = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile"]
+            candidates = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
             matched = next((c for c in candidates if c in available_ids), None)
             if matched:
                 logger.warning(
@@ -555,6 +558,19 @@ async def _create_completion(prompt: str, json_mode: bool):
             return fallback
         raise
     except Exception as exc:
+        err_msg = str(exc).lower()
+        if "model_not_found" in err_msg or "does not exist" in err_msg:
+            logger.warning("Groq model '%s' not found at runtime. Attempting auto-switch...", _model_name)
+            if await verify_model_available():
+                kwargs["model"] = _model_name
+                try:
+                    async with _concurrency_semaphore():
+                        return await asyncio.wait_for(
+                            _client.chat.completions.create(**kwargs),
+                            timeout=_timeout + 5,
+                        )
+                except Exception as inner_exc:
+                    logger.warning("Retry with auto-switched model '%s' failed: %s", _model_name, inner_exc)
         logger.warning("Groq API error (%s); trying OpenRouter fallback.", exc)
         fallback = await _create_openrouter_completion(prompt, json_mode=False)
         if fallback is not None:

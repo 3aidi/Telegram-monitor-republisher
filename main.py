@@ -1927,15 +1927,6 @@ async def _evaluate_listing(
     analysis = await ai_rephraser.analyze_message(raw_text)
 
     if analysis is None:
-        # AI unavailable / failed. Record the neutral intent; price is never a
-        # publishing input (the regex price only ever fed the dedup fingerprint,
-        # which the atomic claim has already consumed).
-        await db.run_async(
-            db.update_listing_fields,
-            listing_id,
-            intent="neutral",
-        )
-
         # Deterministic fallback (no AI): keep real listings publishing during
         # an AI outage via the regex/emoji-strip path already used for previews.
         # Fallback NEVER auto-publishes unless FALLBACK_AUTOPUBLISH=1 and all checks pass.
@@ -1947,7 +1938,23 @@ async def _evaluate_listing(
         ] or ["Available"]
         fb_lines, fb_body_ok = parser.prepare_body(fb_content_lines, raw_text)
         fb_platform = filters.detect_platform_from_text(raw_text)
+        fb_intent = (
+            "buy"
+            if filters.detect_buy_intent(raw_text) and not filters.detect_sell_intent(raw_text)
+            else (
+                "sell"
+                if filters.detect_sell_intent(raw_text) and not filters.detect_buy_intent(raw_text)
+                else "neutral"
+            )
+        )
         fb_rendered = "\n".join(fb_lines)
+
+        await db.run_async(
+            db.update_listing_fields,
+            listing_id,
+            intent=fb_intent,
+            platform_name=fb_platform,
+        )
 
         if deterministic_fallback_publish_ok(
             paused=await db.run_async(db.is_paused),
@@ -2109,7 +2116,16 @@ async def _evaluate_listing(
         return
 
     platform_name = analysis.get("platform")
+    if not platform_name:
+        platform_name = filters.detect_platform_from_text(raw_text)
+
     intent = analysis.get("intent") or "neutral"
+    if intent == "neutral":
+        if filters.detect_buy_intent(raw_text) and not filters.detect_sell_intent(raw_text):
+            intent = "buy"
+        elif filters.detect_sell_intent(raw_text) and not filters.detect_buy_intent(raw_text):
+            intent = "sell"
+
     content_lines = analysis.get("content") or []
     ai_clean_text = "\n".join(content_lines) if content_lines else fallback_clean_text
 
