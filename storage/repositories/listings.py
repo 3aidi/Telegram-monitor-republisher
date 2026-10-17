@@ -665,7 +665,7 @@ def expire_stale_pending_listings(
                    l.source_message_id, l.raw_text, l.clean_text
             FROM listings l
             LEFT JOIN suppliers s ON l.supplier_id = s.id
-            WHERE l.status IN ('pending_approval', 'pending_review')
+            WHERE l.status IN ('pending_approval', 'pending_review', 'received', 'claimed')
               AND l.created_at < ?
             """,
             (cutoff,),
@@ -889,7 +889,7 @@ def claim_listing_for_publish(
                 post_number = ?,
                 updated_at = ?
             WHERE id = ?
-              AND status IN ('approved', 'pending_approval', 'pending_review')
+              AND status IN ('approved', 'pending_approval', 'pending_review', 'claimed', 'received')
               AND published_message_id IS NULL
               AND NOT EXISTS (
                     SELECT 1 FROM listings AS twin
@@ -1029,11 +1029,13 @@ def claim_stale_received_listing(
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
     cutoff = (now_dt - timedelta(seconds=stale_threshold_seconds)).isoformat()
+    max_age_cutoff = (now_dt - timedelta(hours=PENDING_MAX_AGE_HOURS)).isoformat()
     with db_session(db_path, immediate=True) as conn:
         rows = conn.execute(
             """
             SELECT * FROM listings
             WHERE status IN ('received', 'claimed')
+              AND (created_at IS NULL OR created_at >= ?)
               AND (
                   (received_at IS NOT NULL AND received_at <= ?)
                   OR (received_at IS NULL AND updated_at <= ?)
@@ -1041,7 +1043,7 @@ def claim_stale_received_listing(
             ORDER BY id ASC
             LIMIT ?
             """,
-            (cutoff, cutoff, limit),
+            (max_age_cutoff, cutoff, cutoff, limit),
         ).fetchall()
         claimed = []
         for r in rows:
@@ -1051,12 +1053,13 @@ def claim_stale_received_listing(
                 SET received_at = ?, updated_at = ?
                 WHERE id = ?
                   AND status IN ('received', 'claimed')
+                  AND (created_at IS NULL OR created_at >= ?)
                   AND (
                       (received_at IS NOT NULL AND received_at <= ?)
                       OR (received_at IS NULL AND updated_at <= ?)
                   )
                 """,
-                (now_iso, now_iso, r["id"], cutoff, cutoff),
+                (now_iso, now_iso, r["id"], max_age_cutoff, cutoff, cutoff),
             )
             if cur.rowcount > 0:
                 claimed.append(dict(r))

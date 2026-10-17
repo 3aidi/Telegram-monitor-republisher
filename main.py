@@ -2017,6 +2017,36 @@ async def _evaluate_listing(
                         listing_id,
                     )
                 return
+            else:
+                race_twin = await db.run_async(
+                    db.get_earlier_duplicate_twin, listing_id, DEDUP_HOURS
+                )
+                if race_twin:
+                    await db.run_async(db.mark_duplicate_of, listing_id, race_twin)
+                    await db.run_async(
+                        db.log_skip,
+                        supplier_id,
+                        source_msg_id,
+                        filters.REASON_DUPLICATE,
+                        raw_text,
+                    )
+                    await db.run_async(
+                        db.record_audit,
+                        filters.REASON_DUPLICATE,
+                        listing_id,
+                        detail=f"race duplicate of #{race_twin}",
+                    )
+                    logger.info(
+                        "Listing #%s is a race duplicate of #%s; marked skipped_duplicate.",
+                        listing_id,
+                        race_twin,
+                    )
+                else:
+                    logger.warning(
+                        "Listing #%s deterministic fallback could not be claimed for publish; skipping.",
+                        listing_id,
+                    )
+                return
 
         # Fallback could not auto-publish: route to pending_approval with proper category
         review_reason = (
@@ -2137,10 +2167,34 @@ async def _evaluate_listing(
             db.claim_listing_for_publish, listing_id, post_number
         )
         if not claimed:
-            logger.warning(
-                "Listing #%s could not be claimed for publish (already claimed or published); skipping.",
-                listing_id,
+            race_twin = await db.run_async(
+                db.get_earlier_duplicate_twin, listing_id, DEDUP_HOURS
             )
+            if race_twin:
+                await db.run_async(db.mark_duplicate_of, listing_id, race_twin)
+                await db.run_async(
+                    db.log_skip,
+                    supplier_id,
+                    source_msg_id,
+                    filters.REASON_DUPLICATE,
+                    raw_text,
+                )
+                await db.run_async(
+                    db.record_audit,
+                    filters.REASON_DUPLICATE,
+                    listing_id,
+                    detail=f"race duplicate of #{race_twin}",
+                )
+                logger.info(
+                    "Listing #%s is a race duplicate of #%s; marked skipped_duplicate.",
+                    listing_id,
+                    race_twin,
+                )
+            else:
+                logger.warning(
+                    "Listing #%s could not be claimed for publish (already claimed or published); skipping.",
+                    listing_id,
+                )
             return
 
         our_text, entities = parser.build_ai_message(

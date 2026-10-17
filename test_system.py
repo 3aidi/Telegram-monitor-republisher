@@ -8067,6 +8067,37 @@ class TestPhase2Verification(unittest.TestCase):
         second_claimed = db.claim_stale_received_listing(stale_threshold_seconds=120, limit=10, db_path=self._test_db)
         self.assertEqual(len(second_claimed), 0)
 
+    def test_claim_listing_for_publish_supports_claimed_and_received(self):
+        """claim_listing_for_publish transitions claimed and received listings to publishing."""
+        sid = db.add_supplier("@test_claim_pub_src", channel_id=-100778, db_path=self._test_db)
+        lid1 = db.insert_listing(sid, 801, "Auto listing 1", "fp_pub1", "claimed", "Auto 1", "Auto 1", db_path=self._test_db)
+        lid2 = db.insert_listing(sid, 802, "Auto listing 2", "fp_pub2", "received", "Auto 2", "Auto 2", db_path=self._test_db)
+
+        self.assertTrue(db.claim_listing_for_publish(lid1, post_number=50, db_path=self._test_db))
+        row1 = db.get_listing_by_id(lid1, db_path=self._test_db)
+        self.assertEqual(row1["status"], "publishing")
+        self.assertEqual(row1["post_number"], 50)
+
+        self.assertTrue(db.claim_listing_for_publish(lid2, post_number=51, db_path=self._test_db))
+        row2 = db.get_listing_by_id(lid2, db_path=self._test_db)
+        self.assertEqual(row2["status"], "publishing")
+        self.assertEqual(row2["post_number"], 51)
+
+    def test_expire_stale_pending_listings_expires_claimed_and_received(self):
+        """expire_stale_pending_listings transitions ancient claimed and received rows to skipped_expired."""
+        sid = db.add_supplier("@test_expire_src", channel_id=-100779, db_path=self._test_db)
+        past_iso = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
+        lid_claimed = db.insert_listing(sid, 901, "Old claimed", None, "claimed", "Old claimed", "Old claimed", db_path=self._test_db)
+        lid_received = db.insert_listing(sid, 902, "Old received", None, "received", "Old received", "Old received", db_path=self._test_db)
+
+        with db.db_session(self._test_db) as conn:
+            conn.execute("UPDATE listings SET created_at = ? WHERE id IN (?, ?)", (past_iso, lid_claimed, lid_received))
+
+        expired_count = db.expire_stale_pending_listings(max_age_hours=4, db_path=self._test_db)
+        self.assertGreaterEqual(expired_count, 2)
+        self.assertEqual(db.get_listing_by_id(lid_claimed, db_path=self._test_db)["status"], "skipped_expired")
+        self.assertEqual(db.get_listing_by_id(lid_received, db_path=self._test_db)["status"], "skipped_expired")
+
     def test_wizard_state_nested_update_persistence_across_reload(self):
         """Nested mutations and top-level reassignments on PersistentDict persist across reloads."""
         import json

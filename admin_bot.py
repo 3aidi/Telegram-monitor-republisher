@@ -2626,6 +2626,41 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         await _execute_sold(event, post_number=int(arg))
 
+    @bot.on(events.NewMessage(pattern=r"^/setseq(?:[ \t]+(\d+))?"))
+    async def handle_setseq(event):
+        if not await check_admin(event):
+            return
+        arg = event.pattern_match.group(1)
+        cur_seq = db.get_setting("post_counter") or db.get_setting("post_seq") or "0"
+        try:
+            cur_int = int(cur_seq)
+        except ValueError:
+            cur_int = 0
+        if not arg:
+            await event.reply(
+                f"🔢 **Post Sequence Number**\n\n"
+                f"• Current sequence counter: `#{cur_int}`\n"
+                f"• Next published post will be: `#{cur_int + 1}`\n\n"
+                f"To change the sequence, send:\n`/setseq <next_post_number>`\n"
+                f"Example: `/setseq 854` sets next post to `#854`.",
+                buttons=_home_keyboard(),
+                parse_mode="markdown",
+            )
+            return
+        target = int(arg)
+        if target < 1:
+            await event.reply("⚠️ Sequence number must be at least 1.", buttons=_home_keyboard())
+            return
+        val = target - 1
+        db.set_setting("post_counter", str(val))
+        db.set_setting("post_seq", str(val))
+        await db.record_audit("set_seq", None, actor_id=event.sender_id, detail=f"Next post set to #{target} (counter={val})")
+        await event.reply(
+            f"✅ **Sequence Updated**\n\nNext published post will be **#{target}**.",
+            buttons=_home_keyboard(),
+            parse_mode="markdown",
+        )
+
     @bot.on(events.NewMessage(pattern=r"^(?:/health|🩺 Health)"))
     async def handle_health(event):
         if not await check_admin(event):
