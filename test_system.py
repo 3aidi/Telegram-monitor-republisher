@@ -7326,6 +7326,7 @@ class TestHardenTasks(unittest.TestCase):
         from unittest.mock import AsyncMock, patch
 
         # Clean buy message: deterministic fallback should be OK
+        self.main_mod.FALLBACK_AUTOPUBLISH = True
         ok = self.main_mod.deterministic_fallback_publish_ok(
             paused=False,
             risky_keyword=None,
