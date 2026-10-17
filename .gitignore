@@ -16,3 +16,6 @@ captured_messages.jsonl
 test_monitor.db
 __pycache__/
 venv/
+.opencode/
+*.patch
+test_*.db*

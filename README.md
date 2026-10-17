@@ -49,32 +49,39 @@ An automated, robust Telegram channel monitor and republisher for digital accoun
 ## Project Structure
 
 ```
-├── main.py                  # Main entry point & orchestrator
+├── main.py                  # Main entry point & background orchestration engine
 ├── admin_bot.py             # Telegram bot for admin management & inline approvals
-├── core/                    # Core configuration and validation utilities
-│   ├── config.py
-│   └── errors.py
-├── domain/                  # Domain data classes and listing entities
-│   ├── listing.py
-│   └── supplier.py
-├── pipeline/                # Parsing, filtering, and publishing rules
-│   ├── filters.py
-│   ├── parser.py
-│   └── rules.py
-├── services/                # Background services and external integrations
-│   ├── ai_rephraser.py      # LLM listing analysis (Groq primary, OpenRouter fallback)
-│   ├── fsm.py               # PersistentDict SQLite-backed state machine
-│   └── publish_guard.py     # Channel publish limits and lock management
-├── storage/                 # Storage engine and modular repositories
-│   ├── database.py          # SQLite connection and migration coordinator
-│   └── repositories/        # Domain-specific SQL repositories (base, listings, suppliers, forwardings, settings)
-├── texts.py                 # Bot UI strings and Markdown templates
-├── test_system.py           # Automated unit and integration test suite
-├── run.ps1                  # PowerShell quick start script
+├── test_system.py           # Comprehensive test suite (~315+ automated tests)
+│
+├── core/                    # Core runtime, configuration, and UI text constants
+├── domain/                  # Domain models and country emoji mappings
+├── pipeline/                # Parser, regex filters, and business rules
+├── services/                # AI rephraser, publish guard, and forwarder manager
+├── storage/                 # Database facade and SQL repositories
+│
+├── docs/                    # In-depth architectural & operational documentation
+│   ├── ARCHITECTURE.md      # Authoritative architectural blueprint & invariants
+│   ├── ONBOARDING.md        # Operations & developer onboarding guide
+│   └── CHANGES.md           # History of fixes, improvements, and schema migrations
+│
+├── scripts/                 # Operational and deployment helper scripts
+│   ├── add_forwarder.py     # Interactive CLI tool to authenticate forward accounts
+│   ├── run.ps1              # Local startup safety script (checks AWS status)
+│   ├── start_aws.ps1        # Remote AWS bot start controller
+│   └── stop_aws.ps1         # Remote AWS bot stop controller
+│
 ├── .env.example             # Template for environment variables
-├── requirements.txt         # Python dependencies
-└── monitor.db               # SQLite database (auto-generated, gitignored)
+└── requirements.txt         # Project Python dependencies
 ```
+
+---
+
+## Documentation
+
+* 📖 **[Architecture Guide](docs/ARCHITECTURE.md)**: System invariants, dual-client MTProto architecture, processing pipeline, and worker lifecycle.
+* 🚀 **[Onboarding Guide](docs/ONBOARDING.md)**: Step-by-step developer setup, Telegram API credentials, and AWS deployment.
+* 📝 **[Changelog](docs/CHANGES.md)**: Historical evolution, audit findings, and schema versions.
+
 
 ---
 
