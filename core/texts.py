@@ -6,7 +6,7 @@ Placeholders formatted as {name} are dynamically populated at runtime.
 
 # ═══════════════════════════ COMMON ═══════════════════════════
 LINE = "━━━━━━━━━━━━━━"
-ACCESS_DENIED = "⚠️ Access denied. (ID: {user_id})"
+ACCESS_DENIED = "⚠️ Access denied , please contact admin @elaidi "
 UNAUTHORIZED = "⛔ Unauthorized"
 UNKNOWN_ACTION = "Unknown action"
 CANCELLED = "Cancelled"
