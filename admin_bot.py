@@ -533,6 +533,9 @@ async def send_skipped_alert(
     separate notifications — which is what made the review queue look flooded.
     Every other reason alerts individually with an executive card layout.
     """
+    if reason in ("admin_skip", "expired"):
+        return
+
     listing_id = listing.get("id")
     winner_id = listing.get("duplicate_of")
 
@@ -640,15 +643,19 @@ async def skip_digest_worker(bot: TelegramClient) -> None:
             if now - _skip_digest_last_sent < SKIP_DIGEST_MIN_INTERVAL:
                 continue
             recent = await asyncio.to_thread(db.get_skipped_listings, 1000)
-            new_skips = [
-                k for k in recent
-                if k["skip_id"] > marker
-                and k.get("reason") != "admin_skip"
-                and k.get("reason") != "duplicate"
-            ]
-            if not new_skips:
+            unseen = [k for k in recent if k["skip_id"] > marker]
+            if not unseen:
                 continue
-            for k in new_skips[:SKIP_DIGEST_MAX_CARDS]:
+
+            max_seen_id = max(k["skip_id"] for k in unseen)
+
+            # Do NOT send notifications for admin_skip, duplicate, or expired
+            notify_skips = [
+                k for k in unseen
+                if k.get("reason") not in ("admin_skip", "duplicate", "expired")
+            ]
+
+            for k in notify_skips[:SKIP_DIGEST_MAX_CARDS]:
                 text, buttons = _skip_notification(k)
                 try:
                     await bot.send_message(
@@ -661,7 +668,7 @@ async def skip_digest_worker(bot: TelegramClient) -> None:
                     continue
             await db.run_async(
                 db.set_skip_digest_marker,
-                max(k["skip_id"] for k in new_skips),
+                max_seen_id,
             )
             _skip_digest_last_sent = now
         except asyncio.CancelledError:

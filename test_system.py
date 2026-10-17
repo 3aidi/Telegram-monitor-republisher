@@ -8596,6 +8596,58 @@ class TestJoinedDestinationGroupMultiAccount(unittest.TestCase):
         asyncio.run(_run())
 
 
+    def test_skip_digest_worker_ignores_expired_skips(self):
+        """skip_digest_worker and send_skipped_alert must NEVER send notifications for reason='expired'."""
+        import admin_bot
+
+        async def _run():
+            old_admin = admin_bot.ADMIN_USER_ID
+            admin_bot.ADMIN_USER_ID = 777001
+            try:
+                sid = db.add_supplier("@expired_test_supp", channel_id=-100999888, db_path=self._test_db)
+                # 1. Insert an expired skip
+                db.log_skip(
+                    sid, 99911, "expired",
+                    raw_text="WTS Old Netflix $10",
+                    db_path=self._test_db
+                )
+                # 2. Insert a normal skip (e.g. not_a_listing)
+                db.log_skip(
+                    sid, 99912, "not_a_listing",
+                    raw_text="Hello guys how are you",
+                    db_path=self._test_db
+                )
+
+                bot = _P5FakeBot()
+                bot.is_connected = lambda: True
+
+                # Reset digest last sent time so it runs immediately
+                admin_bot._skip_digest_last_sent = 0
+                admin_bot.SKIP_DIGEST_MIN_INTERVAL = 0
+                db.set_skip_digest_marker(0, db_path=self._test_db)
+
+                recent = await asyncio.to_thread(db.get_skipped_listings, 1000, 0, self._test_db)
+                marker = db.get_skip_digest_marker(self._test_db)
+                unseen = [k for k in recent if k["skip_id"] > marker]
+                notify_skips = [
+                    k for k in unseen
+                    if k.get("reason") not in ("admin_skip", "duplicate", "expired")
+                ]
+
+                # notify_skips must NOT contain expired skip
+                self.assertFalse(any(k["reason"] == "expired" for k in notify_skips))
+                self.assertTrue(any(k["reason"] == "not_a_listing" for k in notify_skips))
+
+                # send_skipped_alert must also return early for expired without sending
+                await admin_bot.send_skipped_alert(bot, 777001, {"id": 123}, "expired")
+                self.assertEqual(len(bot.sent), 0)
+            finally:
+                admin_bot.ADMIN_USER_ID = old_admin
+
+        asyncio.run(_run())
+
+
 if __name__ == "__main__":
     unittest.main()
-
+
+
