@@ -6780,7 +6780,6 @@ class MainChannelConfigTests(unittest.TestCase):
     def test_delete_all_dead_destinations_leaves_chats(self):
         """Callback 'destdel:confirm_dead' leaves groups on forward_client_ref."""
         import admin_bot
-        from core import runtime as core_runtime
 
         class FakeClient:
             def __init__(self):
@@ -6840,7 +6839,6 @@ class TestHardenTasks(unittest.TestCase):
     """Unit and regression tests for Tasks 1-11 and Section 2 hard invariants."""
 
     def setUp(self):
-        import asyncio
         self._test_db = f"test_harden_{int(time.time() * 1000)}_{os.getpid()}.db"
         db.init_db(self._test_db)
         self._old_db = db.DEFAULT_DB_PATH
@@ -7322,8 +7320,6 @@ class TestHardenTasks(unittest.TestCase):
 
     def test_fallback_auto_publishes_buy_intent_and_never_tags_ai_unavailable(self):
         """When AI is down/None, buy listings auto-publish if clean, and unpublishable listings never get tagged ai_unavailable."""
-        import asyncio
-        from unittest.mock import AsyncMock, patch
 
         # Clean buy message: deterministic fallback should be OK
         self.main_mod.FALLBACK_AUTOPUBLISH = True
@@ -8536,7 +8532,6 @@ class TestJoinedDestinationGroupMultiAccount(unittest.TestCase):
     def test_none_writable_leaves_all_accounts_and_alerts_admin(self):
         """When neither account can write to the group, both leave and destination is NOT added."""
         import main
-        from core import texts
         import types
 
         async def _run():
@@ -8727,7 +8722,6 @@ class TestJoinedDestinationGroupMultiAccount(unittest.TestCase):
 
     def test_auto_approve_duplicate_messages_never_republished(self):
         """Deduplication guarantee: duplicate of an auto-published message is marked skipped and never published."""
-        import asyncio
 
         sid = db.add_supplier("@test_dedup_supplier", channel_id=-100222, db_path=self._test_db)
         raw_msg = "WTB magentapay personal number can change data 200-250$"

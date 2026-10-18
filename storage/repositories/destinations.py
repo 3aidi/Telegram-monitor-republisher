@@ -1,34 +1,12 @@
 """Destination channels and forwardings repository."""
 
-import asyncio
-import hashlib
-import json
-import logging
-import os
-import random
-import re
-import sqlite3
-import time
-import unicodedata
-from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
-import models
+from typing import Any, Dict, List, Optional
 
 from .base import (
-    DEFAULT_DB_PATH,
     db_session,
-    run_async,
-    is_numeric_identifier,
     normalize_channel_id,
-    to_peer_reference,
 )
-
-def list_destination_items(active_only: bool = True, db_path: Optional[str] = None) -> List[models.DestinationItem]:
-    """Fetch destinations as strongly-typed DestinationItem dataclasses."""
-    rows = list_destinations(active_only=active_only, db_path=db_path)
-    return [models.DestinationItem.from_row(r) for r in rows]
 
 def reset_unresolved_forwardings(db_path: Optional[str] = None) -> int:
     """Reset forwardings that were blocked by entity resolution string errors.

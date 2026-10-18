@@ -4,19 +4,15 @@ import asyncio
 import logging
 import os
 import re
-import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.errors import (
     ApiIdInvalidError,
     ChannelsTooMuchError,
-    ChatAdminRequiredError,
-    ChatWriteForbiddenError,
     FloodWaitError,
     InviteHashExpiredError,
     InviteHashInvalidError,
-    InviteRequestSentError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     PhoneNumberBannedError,
@@ -25,15 +21,12 @@ from telethon.errors import (
     SendCodeUnavailableError,
     SessionPasswordNeededError,
     UserAlreadyParticipantError,
-    UserBannedInChannelError,
-    UserKickedError,
 )
 from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
 import db
-from core.runtime import check_can_write_to_destination, is_group_chat, leave_destination_chat
 
 logger = logging.getLogger("forwarders_manager")
 

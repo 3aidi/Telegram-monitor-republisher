@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from .base import (
-    DEFAULT_DB_PATH,
     db_session,
 )
 

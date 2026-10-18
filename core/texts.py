@@ -4,6 +4,8 @@ All user-facing phrases are organized by screen/feature for easy editing.
 Placeholders formatted as {name} are dynamically populated at runtime.
 """
 
+from typing import Optional
+
 # ═══════════════════════════ COMMON ═══════════════════════════
 LINE = "━━━━━━━━━━━━━━"
 ACCESS_DENIED = "⚠️ Access denied , please contact admin @elaidi "

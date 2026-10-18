@@ -13,7 +13,7 @@ import logging
 import os
 import time
 import types
-from typing import Optional
+from typing import Any, Optional
 
 import db
 import parser
@@ -364,11 +364,6 @@ async def verify_model_available() -> bool:
         return False
 
 
-def is_openrouter_available() -> bool:
-    """True when the OpenRouter :free fallback is configured and usable."""
-    return httpx is not None and bool(_openrouter_api_key)
-
-
 def _concurrency_semaphore():
     """Return the module-wide rate-limit semaphore, creating it lazily.
 
@@ -660,48 +655,55 @@ def _adapt_openrouter_response(data) -> Optional[types.SimpleNamespace]:
     return adapted
 
 
-def validate_ai_schema(data: Any) -> bool:
-    """Validate parsed AI JSON against a strict schema.
+from pydantic import BaseModel, Field, field_validator, ValidationError
+from typing import Literal, List
 
-    Enforces:
-    - Must be a dictionary.
-    - is_listing: boolean type.
-    - blocked: optional boolean type.
-    - intent: must be one of 'buy', 'sell', 'neutral'.
-    - content: list of strings, max 40 items, each item max 500 chars.
-    - platform: optional string max 100 chars or None.
-    - price: optional number (int/float) >= 0 or None.
-    - block_reason: optional string max 500 chars or None.
-    - dm_request: optional boolean type.
-    """
+
+class AIListingPayload(BaseModel):
+    """Pydantic model for strict AI response schema validation."""
+    is_listing: bool
+    blocked: Optional[bool] = False
+    block_reason: Optional[str] = Field(default="", max_length=500)
+    platform: Optional[str] = Field(default=None, max_length=100)
+    price: Optional[float] = Field(default=None, ge=0)
+    intent: Literal["buy", "sell", "neutral"] = "neutral"
+    dm_request: Optional[bool] = False
+    content: List[str] = Field(default_factory=list, max_length=40)
+
+    @field_validator("is_listing", "blocked", "dm_request", mode="before")
+    @classmethod
+    def _check_strict_bool(cls, v: Any) -> Any:
+        if v is not None and type(v) is not bool:
+            raise ValueError("Must be a strict boolean")
+        return v
+
+    @field_validator("price", mode="before")
+    @classmethod
+    def _check_strict_price(cls, v: Any) -> Any:
+        if v is not None and (type(v) is bool or (isinstance(v, (int, float)) and v < 0)):
+            raise ValueError("Must be a non-negative number and not boolean")
+        return v
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _check_content_items(cls, v: Any) -> Any:
+        if not isinstance(v, list) or len(v) > 40:
+            raise ValueError("Content must be a list of at most 40 items")
+        for item in v:
+            if not isinstance(item, str) or len(item) > 500:
+                raise ValueError("Content items must be strings under 500 chars")
+        return v
+
+
+def validate_ai_schema(data: Any) -> bool:
+    """Validate parsed AI JSON against strict schema using Pydantic."""
     if not isinstance(data, dict):
         return False
-    if "is_listing" not in data or type(data["is_listing"]) is not bool:
+    try:
+        AIListingPayload.model_validate(data)
+        return True
+    except ValidationError:
         return False
-    if "blocked" in data and data["blocked"] is not None and type(data["blocked"]) is not bool:
-        return False
-    if "intent" not in data or data["intent"] not in ("buy", "sell", "neutral"):
-        return False
-    if "content" not in data or not isinstance(data["content"], list):
-        return False
-    if len(data["content"]) > 40:
-        return False
-    for item in data["content"]:
-        if not isinstance(item, str) or len(item) > 500:
-            return False
-    platform = data.get("platform")
-    if platform is not None and (not isinstance(platform, str) or len(platform) > 100):
-        return False
-    price = data.get("price")
-    if price is not None and (type(price) not in (int, float) or price < 0):
-        return False
-    block_reason = data.get("block_reason")
-    if block_reason is not None and (not isinstance(block_reason, str) or len(block_reason) > 500):
-        return False
-    dm_request = data.get("dm_request")
-    if dm_request is not None and type(dm_request) is not bool:
-        return False
-    return True
 
 
 def _parse_analysis_json(text: str, strict: bool = False) -> Optional[dict]:

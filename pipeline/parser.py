@@ -110,16 +110,6 @@ def strip_all_emoji(text: str) -> str:
     return emoji.replace_emoji(text, replace="").strip()
 
 
-def build_header_line(emoji: List[Tuple[str, int]]) -> Tuple[str, list]:
-    """Render one header on its own, starting at offset 0.
-
-    The same builder the post shell uses, exposed so the admin bot can echo a
-    saved header back to the admin (with its real custom emoji attached) to prove
-    it renders. Returns ("", []) for an empty pool.
-    """
-    return _build_custom_emoji_header(emoji, 0)
-
-
 def _parse_amount(raw: str) -> float:
     """
     Convert a matched numeric string to a float, handling thousands separators

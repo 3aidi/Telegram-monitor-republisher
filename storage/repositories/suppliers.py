@@ -1,25 +1,12 @@
 """Suppliers and source channels repository."""
 
-import asyncio
-import hashlib
-import json
-import logging
-import os
-import random
-import re
 import sqlite3
-import time
-import unicodedata
-from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-import models
 
 from .base import (
-    DEFAULT_DB_PATH,
     db_session,
-    run_async,
     is_numeric_identifier,
     normalize_channel_id,
 )
@@ -472,11 +459,6 @@ def delete_supplier(supplier_id: int, db_path: Optional[str] = None) -> bool:
         conn.execute("DELETE FROM skips WHERE supplier_id = ?", (supplier_id,))
         cursor = conn.execute("DELETE FROM suppliers WHERE id = ?", (supplier_id,))
         return cursor.rowcount > 0
-
-def list_supplier_items(active_only: bool = True, db_path: Optional[str] = None) -> List[models.SupplierItem]:
-    """Fetch suppliers as strongly-typed SupplierItem dataclasses."""
-    rows = list_suppliers(active_only=active_only, db_path=db_path)
-    return [models.SupplierItem.from_row(r) for r in rows]
 
 # ---------------------------------------------------------------------------
 # .env bootstrap seeding â€” SOURCE_CHANNELS is ONE-TIME, never live state

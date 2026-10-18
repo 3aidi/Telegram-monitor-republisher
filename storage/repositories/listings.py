@@ -1,22 +1,14 @@
 """Listings lifecycle, quarantine, deduplication, and publishing claims repository."""
 
-import asyncio
 import hashlib
-import json
-import logging
 import os
-import random
 import re
-import sqlite3
-import time
 import unicodedata
-from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import models
 
-from .base import DEFAULT_DB_PATH, db_session, run_async, _SOURCE_HWM_PREFIX
+from .base import db_session, _SOURCE_HWM_PREFIX
 
 # ---------------------------------------------------------------------------
 # Fingerprinting (canonical, shared between store + dedup lookup)
@@ -1116,30 +1108,6 @@ def claim_stale_received_listing(
             if cur.rowcount > 0:
                 claimed.append(dict(r))
         return claimed
-
-def recompute_active_fingerprints(hours: int = 8, db_path: Optional[str] = None) -> int:
-    """Recompute dedup fingerprints for listings active in the last `hours` window."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-    with db_session(db_path) as conn:
-        rows = conn.execute(
-            "SELECT id, raw_text, clean_text, platform_name FROM listings WHERE created_at >= ?",
-            (cutoff,),
-        ).fetchall()
-        count = 0
-        for r in rows:
-            txt = r["clean_text"] or r["raw_text"] or ""
-            fp = make_listing_fingerprint(txt, platform=r["platform_name"])
-            conn.execute("UPDATE listings SET fingerprint = ? WHERE id = ?", (fp, r["id"]))
-            count += 1
-        return count
-
-# ---------------------------------------------------------------------------
-# Strongly-typed domain model queries (models.py)
-# ---------------------------------------------------------------------------
-def get_listing_item(listing_id: int, db_path: Optional[str] = None) -> Optional[models.ListingItem]:
-    """Fetch a listing by ID as a strongly-typed ListingItem dataclass."""
-    raw = get_listing_by_id(listing_id, db_path=db_path)
-    return models.ListingItem.from_row(raw) if raw else None
 
 def mark_listing_sold(listing_id: int, db_path: Optional[str] = None) -> bool:
     """Mark a listing as sold."""

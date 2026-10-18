@@ -408,7 +408,6 @@ async def _alert_stuck_workers(bot_client: Optional[TelegramClient]) -> None:
 
 
 from core.runtime import (
-    destination_health_handle as _destination_health_handle,
     format_destination_health_report as _format_destination_health_report,
     leave_destination_chat,
     check_can_write_to_destination,

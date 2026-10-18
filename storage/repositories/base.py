@@ -1,20 +1,14 @@
 """Database base connection, session management, and schema migrations."""
 
 import asyncio
-import hashlib
-import json
 import logging
 import os
-import random
-import re
 import sqlite3
 import time
-import unicodedata
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
-import models
 
 
 DEFAULT_DB_PATH = os.environ.get("DB_PATH", "monitor.db")

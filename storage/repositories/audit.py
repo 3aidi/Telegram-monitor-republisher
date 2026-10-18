@@ -1,25 +1,13 @@
 """Audit logs, skip logs, settings, and AI caching repository."""
 
-import asyncio
-import hashlib
-import json
-import logging
 import os
-import random
-import re
 import sqlite3
-import time
-import unicodedata
-from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import models
 
 from .base import (
-    DEFAULT_DB_PATH,
     db_session,
-    run_async,
     is_numeric_identifier,
     normalize_channel_id,
 )

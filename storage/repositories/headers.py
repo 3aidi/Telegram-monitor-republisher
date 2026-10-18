@@ -1,27 +1,11 @@
 """Custom emoji headers pool repository."""
 
-import asyncio
-import hashlib
 import json
-import logging
-import os
 import random
-import re
-import sqlite3
-import time
-import unicodedata
-from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-import models
-
-from .base import DEFAULT_DB_PATH, db_session, run_async
-
-def list_header_items(db_path: Optional[str] = None) -> List[models.HeaderItem]:
-    """Fetch headers as strongly-typed HeaderItem dataclasses."""
-    rows = list_headers(db_path=db_path)
-    return [models.HeaderItem.from_row(r) for r in rows]
+from .base import db_session
 
 # ---------------------------------------------------------------------------
 # Custom-emoji headers (admin-managed pool, schema v12).

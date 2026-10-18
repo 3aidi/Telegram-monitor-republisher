@@ -1501,7 +1501,7 @@ def _destinations_menu_text(destinations: List[dict], page: int = 0) -> str:
     )
     if footer:
         msg += f"• {footer}\n"
-    msg += f"\nTap a destination below to manage settings:\n"
+    msg += "\nTap a destination below to manage settings:\n"
     return msg
 
 
