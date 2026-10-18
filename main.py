@@ -577,6 +577,13 @@ def _validate_config() -> None:
     """Fail fast with clear messages when critical env vars are missing."""
     errors: List[str] = []
     publish_guard.set_publish_interval(PUBLISH_INTERVAL)
+    try:
+        from core.config import validate_startup_config
+        schema_errors = validate_startup_config()
+        if schema_errors:
+            errors.extend(schema_errors)
+    except Exception as exc:
+        logger.debug("Schema config validation check error: %s", exc)
     if not API_ID:
         errors.append("API_ID is missing/0 (get it from https://my.telegram.org)")
     if not API_HASH:
@@ -3072,6 +3079,36 @@ async def retention_worker(stop_event: asyncio.Event) -> None:
             pass
 
 
+async def backup_worker(stop_event: asyncio.Event) -> None:
+    """Perform periodic zero-downtime online database backups using sqlite3.Connection.backup."""
+    backup_interval = float(os.environ.get("BACKUP_INTERVAL_HOURS", "24") or 24)
+    backup_retention = int(os.environ.get("BACKUP_RETENTION_DAYS", "7") or 7)
+    logger.info(
+        "Automated backup enabled: snapshot every %.1fh (keeping %d days).",
+        backup_interval,
+        backup_retention,
+    )
+    while not stop_event.is_set():
+        try:
+            backup_path = await db.run_async(
+                db.backup_database,
+                retention_days=backup_retention,
+            )
+            _mark_worker_heartbeat("backup")
+            if backup_path:
+                logger.info("Automated database backup completed: %s", backup_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error in database backup worker")
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=backup_interval * 3600
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # One-time stale-body rephrase sweep
 # ---------------------------------------------------------------------------
@@ -3234,7 +3271,15 @@ async def main() -> None:
     stop_event = asyncio.Event()
 
     # User client for monitoring and publishing
-    user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    user_client = TelegramClient(
+        SESSION_NAME,
+        API_ID,
+        API_HASH,
+        connection_retries=None,
+        retry_delay=2,
+        auto_reconnect=True,
+    )
+    user_client.flood_sleep_threshold = 0
 
     # Optional admin bot client
     bot_client: Optional[TelegramClient] = None
@@ -3287,6 +3332,8 @@ async def main() -> None:
                 admin_bot.set_on_forward_callback(wake_forward_worker)
                 admin_bot.set_on_supplier_change_callback(_on_supplier_changed)
                 logger.info("Admin bot integrated successfully.")
+                from core.runtime import setup_telegram_error_handler
+                setup_telegram_error_handler(bot_client, ADMIN_USER_ID)
             except Exception:
                 logger.exception("Failed to start integrated admin bot; continuing with user listener only.")
 
@@ -3478,6 +3525,7 @@ async def main() -> None:
         forwarding_worker(user_client, stop_event, forward_client=forward_clients_pool or forward_client)
     )
     retention_task = asyncio.create_task(retention_worker(stop_event))
+    backup_task = asyncio.create_task(backup_worker(stop_event))
     health_task = None
     resolve_task = None
     rephrase_task = None
@@ -3494,16 +3542,35 @@ async def main() -> None:
         while not stop_event.is_set():
             try:
                 await user_client.run_until_disconnected()
-                break
+                if stop_event.is_set():
+                    break
+                logger.warning(
+                    "Listener client disconnected cleanly. Reconnecting in %ss...",
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 120)
+                if not user_client.is_connected():
+                    try:
+                        await user_client.connect()
+                    except Exception as conn_err:
+                        logger.warning("Reconnect attempt error: %s", conn_err)
             except asyncio.CancelledError:
                 break
             except Exception:
+                if stop_event.is_set():
+                    break
                 logger.exception(
                     "Listener client disconnected unexpectedly. Reconnecting in %ss...",
                     backoff,
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
+                try:
+                    if not user_client.is_connected():
+                        await user_client.connect()
+                except Exception as conn_err:
+                    logger.warning("Reconnect attempt error: %s", conn_err)
     finally:
         logger.info("Shutting down workers and clients...")
         stop_event.set()
@@ -3511,12 +3578,13 @@ async def main() -> None:
         worker_task.cancel()
         forward_task.cancel()
         retention_task.cancel()
+        backup_task.cancel()
         for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 task.cancel()
         # SHUT-1: actually await the cancelled tasks so their finally-blocks and
         # DB connection check-ins complete instead of leaking as orphans.
-        pending_tasks = [held_task, worker_task, forward_task, retention_task]
+        pending_tasks = [held_task, worker_task, forward_task, retention_task, backup_task]
         for task in (health_task, resolve_task, rephrase_task):
             if task is not None:
                 pending_tasks.append(task)

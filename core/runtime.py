@@ -4,8 +4,11 @@ Centralizes runtime state shared between ingestion, worker tasks, and the admin 
 preventing circular imports between main.py and admin_bot.py.
 """
 
+import asyncio
+import collections
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -322,3 +325,108 @@ async def check_can_write_to_destination(client: Any, entity: Any) -> Tuple[bool
     except Exception as exc:
         logger.debug("Permission check error on destination %s: %s", entity, exc)
         return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Telegram Error Alerting Handler (wctse design pattern)
+# ---------------------------------------------------------------------------
+class TelegramErrorHandler(logging.Handler):
+    """Logging handler that dispatches ERROR+ log records directly to ADMIN_USER_ID.
+
+    Features:
+    - Rate-limited via a sliding window (max 5 alerts per minute).
+    - Secret redaction (removes API keys, bot tokens, auth hashes, passwords).
+    - Debouncing: identical errors are silenced and a count is appended to the next message.
+    - Loop safety: handles both synchronous and asynchronous contexts safely.
+    - Recursion protection: ignores Telethon logging records to prevent infinite loops.
+    """
+
+    MAX_PER_MINUTE = 5
+    WINDOW_SECONDS = 60.0
+    _REDACT_PATTERNS = re.compile(
+        r"(Bearer\s+)\S+|"
+        r'((?:api[_-]?key|bot_token|token|password|secret|hash)["\s:=]+)\S+',
+        re.IGNORECASE,
+    )
+
+    def __init__(self, bot_client: Any, admin_chat_id: int):
+        super().__init__(level=logging.ERROR)
+        self.bot_client = bot_client
+        self.admin_chat_id = admin_chat_id
+        self._send_times: collections.deque = collections.deque()
+        self._seen: Dict[str, int] = {}
+        self._suppressed_total: int = 0
+
+    def _redact(self, text: str) -> str:
+        return self._REDACT_PATTERNS.sub(r"\1\2[REDACTED]", text)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Prevent recursion if Telethon, asyncio, or transport logs an error
+        if record.name.startswith("telethon") or record.name.startswith("asyncio"):
+            return
+        if not self.bot_client or not self.admin_chat_id:
+            return
+
+        now = time.monotonic()
+        msg_template = record.getMessage()
+        msg_key = f"{record.name}:{msg_template[:80]}"
+
+        # Debounce identical errors
+        if msg_key in self._seen:
+            self._seen[msg_key] += 1
+            self._suppressed_total += 1
+            return
+        self._seen[msg_key] = 0
+
+        # Enforce sliding-window rate limit
+        while self._send_times and self._send_times[0] <= now - self.WINDOW_SECONDS:
+            self._send_times.popleft()
+        if len(self._send_times) >= self.MAX_PER_MINUTE:
+            self._suppressed_total += 1
+            return
+
+        self._send_times.append(now)
+        formatted = self.format(record) if self.formatter else f"[{record.levelname}] {record.name}: {record.getMessage()}"
+        redacted = self._redact(formatted)
+
+        suppressed = self._suppressed_total
+        self._suppressed_total = 0
+        self._seen.clear()
+        self._seen[msg_key] = 0
+
+        alert_text = f"🚨 <b>Application Error Alert</b>\n<code>{redacted[:1200]}</code>"
+        if suppressed > 0:
+            alert_text += f"\n\n<i>(+{suppressed} similar error(s) silenced)</i>"
+
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                loop.create_task(self._send_alert(alert_text))
+        except RuntimeError:
+            pass
+
+    async def _send_alert(self, text: str) -> None:
+        try:
+            await self.bot_client.send_message(self.admin_chat_id, text, parse_mode="html")
+        except Exception:
+            pass
+
+
+_INSTALLED_ERROR_HANDLER: Optional[TelegramErrorHandler] = None
+
+
+def setup_telegram_error_handler(bot_client: Any, admin_chat_id: int) -> Optional[TelegramErrorHandler]:
+    """Register TelegramErrorHandler on the root logger so uncaught errors alert the admin."""
+    global _INSTALLED_ERROR_HANDLER
+    if not bot_client or not admin_chat_id:
+        return None
+    if _INSTALLED_ERROR_HANDLER is not None:
+        return _INSTALLED_ERROR_HANDLER
+    handler = TelegramErrorHandler(bot_client, admin_chat_id)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    handler.setFormatter(formatter)
+    logging.getLogger().addHandler(handler)
+    _INSTALLED_ERROR_HANDLER = handler
+    logger.info("Telegram error logging handler attached to admin chat %s.", admin_chat_id)
+    return handler
+

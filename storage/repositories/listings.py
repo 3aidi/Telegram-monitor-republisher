@@ -413,6 +413,58 @@ def find_recent_similar_listing(
         row = conn.execute(query, params).fetchone()
         return dict(row) if row else None
 
+
+def check_fuzzy_similarity_warning(
+    clean_text: str,
+    platform: Optional[str] = None,
+    hours: int = 8,
+    exclude_listing_id: Optional[int] = None,
+    threshold: float = 88.0,
+    db_path: Optional[str] = None,
+) -> Optional[Tuple[int, float]]:
+    """Advisory-only fuzzy matching for admin review cards (never auto-rejects).
+
+    Scans recent listings from the last N hours for near-duplicate text using
+    token_sort_ratio. Returns (matched_listing_id, similarity_score) if a match
+    is >= threshold, or None.
+    """
+    text = (clean_text or "").strip().lower()
+    if not text or len(text) < 10:
+        return None
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        return None
+
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=hours)).isoformat()
+    query = """
+        SELECT id, clean_text, raw_text FROM listings
+        WHERE created_at >= ?
+          AND status IN ('published', 'approved', 'pending_approval', 'pending_review')
+    """
+    params: List[Any] = [cutoff]
+    if platform and platform.lower() != "unknown":
+        query += " AND platform_name = ?"
+        params.append(platform.strip().lower())
+    if exclude_listing_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_listing_id)
+    query += " ORDER BY id DESC LIMIT 50"
+
+    with db_session(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    for r in rows:
+        cand_text = (r["clean_text"] or r["raw_text"] or "").strip().lower()
+        if not cand_text or len(cand_text) < 10:
+            continue
+        score = fuzz.token_sort_ratio(text, cand_text)
+        if score >= threshold:
+            return (r["id"], float(score))
+    return None
+
+
 def get_held_listings_due(
     limit: int = 10, db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:

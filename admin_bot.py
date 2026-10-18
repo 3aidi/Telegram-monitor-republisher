@@ -258,6 +258,18 @@ async def send_approval_prompt(
 
     content_section = ai_preview if ai_preview else raw_preview
 
+    try:
+        fuzzy_match = db.check_fuzzy_similarity_warning(
+            clean_text=listing.get("clean_text") or listing.get("raw_text") or "",
+            platform=listing.get("platform_name"),
+            exclude_listing_id=listing_id,
+        )
+        if fuzzy_match:
+            matched_id, score = fuzzy_match[0], fuzzy_match[1]
+            content_section += f"\n\n⚠️ <i>Advisory: {score:.0f}% similarity with #{matched_id}</i>"
+    except Exception:
+        pass
+
     text = texts.REVIEW_CARD.format(
         header=header,
         source=_pretty_source(listing.get("supplier_username"), listing.get("supplier_display_name")),

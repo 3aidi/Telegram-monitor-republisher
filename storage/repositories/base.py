@@ -771,3 +771,43 @@ def to_peer_reference(chat_id: Any) -> Any:
         return s
     return chat_id
 
+
+def backup_database(
+    db_path: Optional[str] = None,
+    backup_dir: str = "backups",
+    retention_days: int = 7,
+) -> Optional[str]:
+    """Perform a zero-downtime point-in-time online backup of SQLite database.
+
+    Creates timestamped copies in `backup_dir` using SQLite's backup API and
+    prunes backups older than `retention_days`. Returns destination path on success.
+    """
+    path = db_path or DEFAULT_DB_PATH
+    if not os.path.exists(path):
+        return None
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        dest_filename = f"monitor_backup_{timestamp}.db"
+        dest_path = os.path.join(backup_dir, dest_filename)
+
+        with sqlite3.connect(path) as src_conn:
+            with sqlite3.connect(dest_path) as dst_conn:
+                src_conn.backup(dst_conn, pages=100)
+
+        if retention_days > 0:
+            cutoff = time.time() - (retention_days * 86400)
+            for fname in os.listdir(backup_dir):
+                if fname.startswith("monitor_backup_") and fname.endswith(".db"):
+                    fpath = os.path.join(backup_dir, fname)
+                    try:
+                        if os.path.getmtime(fpath) < cutoff:
+                            os.remove(fpath)
+                    except OSError:
+                        pass
+        return dest_path
+    except Exception as exc:
+        logging.getLogger("db").error("Database backup failed: %s", exc)
+        return None
+
+
