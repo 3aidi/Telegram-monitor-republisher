@@ -113,7 +113,7 @@ DEDUP_HOURS = int(os.environ.get("DEDUP_HOURS", "8") or 8)
 # hours. Default is 24h, must be >= DEDUP_HOURS + 2.
 _raw_retention = float(os.environ.get("RETENTION_HOURS", "24") or 24)
 if _raw_retention < float(DEDUP_HOURS) + 2:
-    logger.error(
+    logger.warning(
         "RETENTION_HOURS (%.1f) must be >= DEDUP_HOURS (%d) + 2; raising to %.1f",
         _raw_retention,
         DEDUP_HOURS,
