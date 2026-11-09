@@ -10,6 +10,11 @@ from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
+from telethon.errors import (
+    MessageIdInvalidError,
+    MessageNotModifiedError,
+    ReplyMarkupInvalidError,
+)
 from telethon.tl.types import PeerChannel, PeerChat
 
 import db
@@ -291,12 +296,13 @@ async def send_approval_prompt(
     ]
     buttons.extend(_channel_view_buttons(listing))
 
+    send_buttons = buttons if buttons else None
     try:
-        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
+        await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown")
         logger.info("Sent approval prompt for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
         try:
-            await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
+            await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None)
             logger.info("Sent approval prompt (plain fallback) for listing #%s to admin %s", listing_id, admin_id)
         except Exception:
             logger.exception("Failed to send approval prompt to admin for listing #%s", listing_id)
@@ -345,12 +351,13 @@ async def send_review_notification(
     if src_url:
         buttons.append([Button.url("Source", src_url)])
 
+    send_buttons = buttons if buttons else None
     try:
-        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
+        await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown")
         logger.info("Sent review notification for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
         try:
-            await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
+            await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None)
             logger.info("Sent review notification (fallback) for listing #%s to admin %s", listing_id, admin_id)
         except Exception:
             logger.exception("Failed to send review notification for listing #%s", listing_id)
@@ -419,12 +426,13 @@ async def send_published_alert(
     if listing_id:
         buttons.append([Button.inline("Sold", data=f"sold:{listing_id}")])
 
+    send_buttons = buttons if buttons else None
     try:
-        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
+        await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown")
         logger.info("Sent published alert for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
         try:
-            await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
+            await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None)
             logger.info("Sent published alert (fallback) for listing #%s to admin %s", listing_id, admin_id)
         except Exception:
             logger.exception("Failed to send published alert to admin for listing #%s", listing_id)
@@ -574,6 +582,20 @@ async def send_skipped_alert(
             dropped=dropped_text,
         )
         buttons = []
+        action_row = []
+        if listing_id:
+            action_row.append(Button.inline("Set to Manual Review", data=f"reskip_lid:{listing_id}"))
+
+        src_url = _source_url({
+            "supplier_username": listing.get("supplier_username") or listing.get("channel_username"),
+            "supplier_channel_id": listing.get("supplier_channel_id") or listing.get("channel_id"),
+            "source_message_id": listing.get("source_message_id") or listing.get("message_id"),
+        })
+        if src_url:
+            action_row.append(Button.url("Source", src_url))
+
+        if action_row:
+            buttons.append(action_row)
     else:
         label = _SKIP_REASON_LABELS.get(reason, reason)
         human_desc = _HUMAN_SKIP_REASONS.get(reason, label.replace("_", " ").title())
@@ -618,11 +640,12 @@ async def send_skipped_alert(
         if action_row:
             buttons.append(action_row)
 
+    send_buttons = buttons if buttons else None
     try:
-        await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode="markdown")
+        await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown")
     except Exception:
         try:
-            await bot_client.send_message(admin_id, text, buttons=buttons, parse_mode=None)
+            await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None)
         except Exception:
             logger.exception(
                 "Failed to send skip alert for listing #%s (reason %s)",
@@ -669,15 +692,21 @@ async def skip_digest_worker(bot: TelegramClient) -> None:
 
             for k in notify_skips[:SKIP_DIGEST_MAX_CARDS]:
                 text, buttons = _skip_notification(k)
+                send_buttons = buttons if buttons else None
                 try:
                     await bot.send_message(
-                        ADMIN_USER_ID, text, buttons=buttons, parse_mode="markdown"
+                        ADMIN_USER_ID, text, buttons=send_buttons, parse_mode="markdown"
                     )
                 except Exception:
-                    logger.exception(
-                        "Failed to send skip notification for skip #%s", k["skip_id"]
-                    )
-                    continue
+                    try:
+                        await bot.send_message(
+                            ADMIN_USER_ID, text, buttons=None, parse_mode=None
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to send skip notification for skip #%s", k["skip_id"]
+                        )
+                        continue
             await db.run_async(
                 db.set_skip_digest_marker,
                 max_seen_id,
@@ -1028,17 +1057,18 @@ async def _message_delete_send(
         await event.delete()
     except Exception:
         pass
+    send_buttons = buttons if buttons else None
     try:
         if formatting_entities:
             try:
                 await event.client.send_message(
-                    ADMIN_USER_ID, text, buttons=buttons, formatting_entities=formatting_entities
+                    ADMIN_USER_ID, text, buttons=send_buttons, formatting_entities=formatting_entities
                 )
                 return
             except Exception:
                 pass
         await event.client.send_message(
-            ADMIN_USER_ID, text, buttons=buttons, parse_mode=parse_mode
+            ADMIN_USER_ID, text, buttons=send_buttons, parse_mode=parse_mode
         )
     except Exception:
         logger.exception("Failed to send fresh message after delete-and-refresh")
@@ -2814,9 +2844,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             dest_peer = db.to_peer_reference(DEST_CHANNEL)
             try:
                 if user_client_ref and user_client_ref.is_connected():
-                    await user_client_ref.edit_message(
-                        dest_peer, published_msg_id, updated_text, formatting_entities=entities
-                    )
+                    try:
+                        await user_client_ref.edit_message(
+                            dest_peer, published_msg_id, updated_text, formatting_entities=entities
+                        )
+                    except MessageNotModifiedError:
+                        logger.info("Destination message %s already matches desired text", published_msg_id)
                 await db.run_async(db.update_listing_raw_text, listing_id, pending_raw)
                 await db.run_async(db.update_listing_content, listing_id, clean_text="\n".join(sanitized_lines))
                 await db.run_async(db.delete_setting, f"pending_edit:{listing_id}")
@@ -2832,6 +2865,9 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     await event.delete()
                 except Exception:
                     pass
+            except MessageIdInvalidError as exc:
+                logger.warning("Failed to apply edit for listing #%s: message %s invalid: %s", listing_id, published_msg_id, exc)
+                await event.answer(f"Channel post {published_msg_id} was deleted or invalid", alert=True)
             except Exception as exc:
                 logger.exception("Failed to apply edit for listing #%s: %s", listing_id, exc)
                 await event.answer(f"Failed to edit message: {exc}", alert=True)

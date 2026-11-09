@@ -7641,6 +7641,210 @@ class TestHardenTasks(unittest.TestCase):
         c2 = db.claim_listing_for_publish(lid, post_number=100, db_path=self._test_db)
         self.assertFalse(c2)
 
+    def test_send_skipped_alert_duplicate_no_empty_buttons(self):
+        """send_skipped_alert for duplicate must NEVER send empty buttons list to avoid ReplyMarkupInvalidError."""
+        import asyncio
+        from telethon.errors import ReplyMarkupInvalidError
+
+        class StrictFakeBot:
+            def __init__(self):
+                self.sent_messages = []
+            async def send_message(self, peer, text, buttons=None, parse_mode=None):
+                if buttons is not None and len(buttons) == 0:
+                    raise ReplyMarkupInvalidError(request=None)
+                self.sent_messages.append({"peer": peer, "text": text, "buttons": buttons, "parse_mode": parse_mode})
+
+        bot = StrictFakeBot()
+        sid = db.add_supplier("@test_dup_supplier", channel_id=-100333, db_path=self._test_db)
+        lid1 = db.insert_listing(sid, 501, "netflix", None, "published", "WTS netflix", "WTS netflix", db_path=self._test_db)
+        lid2 = db.insert_listing(sid, 502, "netflix", None, "skipped", "WTS netflix", "WTS netflix", db_path=self._test_db)
+        db.mark_duplicate_of(lid2, lid1, db_path=self._test_db)
+
+        listing = db.get_listing_by_id(lid2, db_path=self._test_db)
+        listing["supplier_username"] = "test_dup_supplier"
+        listing["duplicate_of"] = lid1
+
+        # Must succeed without ReplyMarkupInvalidError
+        asyncio.run(self.admin_bot.send_skipped_alert(bot, 555000111, listing, "duplicate"))
+        self.assertEqual(len(bot.sent_messages), 1)
+        sent_buttons = bot.sent_messages[0]["buttons"]
+        self.assertTrue(sent_buttons is None or len(sent_buttons) > 0)
+
+    def test_send_skipped_alert_markup_invalid_fallback(self):
+        """If send_message fails on markdown or buttons, it falls back to buttons=None and parse_mode=None."""
+        import asyncio
+        from telethon.errors import ReplyMarkupInvalidError
+
+        class FallbackBot:
+            def __init__(self):
+                self.calls = []
+            async def send_message(self, peer, text, buttons=None, parse_mode=None):
+                self.calls.append({"buttons": buttons, "parse_mode": parse_mode})
+                if parse_mode == "markdown":
+                    raise ReplyMarkupInvalidError(request=None)
+
+        bot = FallbackBot()
+        listing = {"id": 999, "supplier_username": "supp", "raw_text": "hello"}
+        asyncio.run(self.admin_bot.send_skipped_alert(bot, 555000111, listing, "not_a_listing"))
+        # First call failed with markdown, second call succeeded with None/None
+        self.assertEqual(len(bot.calls), 2)
+        self.assertIsNone(bot.calls[1]["buttons"])
+        self.assertIsNone(bot.calls[1]["parse_mode"])
+
+    def test_process_edited_message_handles_message_not_modified(self):
+        """When client.edit_message raises MessageNotModifiedError, destination edit succeeds cleanly."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from telethon.errors import MessageNotModifiedError
+
+        sid = db.add_supplier("@test_src_edit", channel_id=-100105, db_path=self._test_db)
+        raw_msg = "Spotify Premium account 1 year warranty $10"
+        lid = db.insert_listing(
+            sid, 301, "spotify", None, "published",
+            raw_msg, raw_msg, db_path=self._test_db,
+        )
+        db.update_listing_status(lid, "published", published_message_id=777, post_number=10, db_path=self._test_db)
+
+        class MockTeleClient:
+            def is_connected(self):
+                return True
+            async def edit_message(self, peer, msg_id, text, **kw):
+                raise MessageNotModifiedError(request=None)
+
+        class MockBotClient:
+            async def send_message(self, peer, text, **kw):
+                pass
+
+        class MockMsg:
+            id = 301
+            text = "Spotify Premium account 1 year warranty $15"
+
+        class MockChat:
+            id = -100105
+            username = "test_src_edit"
+
+        class MockEvent:
+            chat_id = -100105
+            chat = MockChat()
+            message = MockMsg()
+
+        mock_analysis = {
+            "is_listing": True,
+            "intent": "sell",
+            "platform": "Spotify",
+            "content": ["Spotify Premium account", "1 year warranty $15"],
+            "blocked": False,
+        }
+        with patch("ai_rephraser.analyze_message", AsyncMock(return_value=mock_analysis)):
+            asyncio.run(self.main_mod.process_edited_message(MockTeleClient(), MockEvent(), MockBotClient()))
+        audits = db.get_audit_logs(limit=10, db_path=self._test_db)
+        self.assertTrue(any(a["action"] == "edited_destination" for a in audits))
+
+    def test_process_edited_message_handles_message_id_invalid(self):
+        """When client.edit_message raises MessageIdInvalidError, warning is recorded and audit log captures failure."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from telethon.errors import MessageIdInvalidError
+
+        sid = db.add_supplier("@test_src_edit2", channel_id=-100106, db_path=self._test_db)
+        raw_msg = "Disney Plus account 1 year warranty $20"
+        lid = db.insert_listing(
+            sid, 302, "disney", None, "published",
+            raw_msg, raw_msg, db_path=self._test_db,
+        )
+        db.update_listing_status(lid, "published", published_message_id=888, post_number=11, db_path=self._test_db)
+
+        class MockTeleClient:
+            def is_connected(self):
+                return True
+            async def edit_message(self, peer, msg_id, text, **kw):
+                raise MessageIdInvalidError(request=None)
+
+        class MockBotClient:
+            async def send_message(self, peer, text, **kw):
+                pass
+
+        class MockMsg:
+            id = 302
+            text = "Disney Plus account 1 year warranty $25"
+
+        class MockChat:
+            id = -100106
+            username = "test_src_edit2"
+
+        class MockEvent:
+            chat_id = -100106
+            chat = MockChat()
+            message = MockMsg()
+
+        mock_analysis = {
+            "is_listing": True,
+            "intent": "sell",
+            "platform": "Disney Plus",
+            "content": ["Disney Plus account", "1 year warranty $25"],
+            "blocked": False,
+        }
+        with patch("ai_rephraser.analyze_message", AsyncMock(return_value=mock_analysis)):
+            asyncio.run(self.main_mod.process_edited_message(MockTeleClient(), MockEvent(), MockBotClient()))
+        audits = db.get_audit_logs(limit=10, db_path=self._test_db)
+        self.assertTrue(any(a["action"] == "edit_destination_failed" for a in audits))
+
+    def test_admin_bot_apply_edit_handles_message_not_modified(self):
+        """When apply_edit encounters MessageNotModifiedError, it treats it as success."""
+        import asyncio
+        from telethon.errors import MessageNotModifiedError
+
+        sid = db.add_supplier("@test_edit_apply", channel_id=-100107, db_path=self._test_db)
+        lid = db.insert_listing(
+            sid, 303, "netflix", None, "published",
+            "WTS Netflix 4K", "WTS Netflix 4K", db_path=self._test_db,
+        )
+        db.update_listing_status(lid, "published", published_message_id=999, post_number=12, db_path=self._test_db)
+        db.set_setting(f"pending_edit:{lid}", "WTS Netflix 4K UHD", db_path=self._test_db)
+
+        class MockTeleClient:
+            def is_connected(self):
+                return True
+            async def edit_message(self, peer, msg_id, text, **kw):
+                raise MessageNotModifiedError(request=None)
+
+        self.admin_bot.set_user_client(MockTeleClient())
+
+        class FakeBot:
+            def __init__(self):
+                self.handlers = []
+            def on(self, filt):
+                def deco(fn):
+                    self.handlers.append((filt, fn))
+                    return fn
+                return deco
+            def is_connected(self):
+                return True
+
+        fake_bot = FakeBot()
+        self.admin_bot.setup_admin_handlers(fake_bot)
+        callback_handler = next(
+            (fn for _, fn in fake_bot.handlers if getattr(fn, "__name__", "") == "handle_callback"),
+            None,
+        )
+
+        class MockCbEvent:
+            def __init__(self, data_bytes):
+                self.sender_id = 555000111
+                self.data = data_bytes
+                self.answered = []
+                self.client = fake_bot
+            async def answer(self, text=None, alert=False):
+                self.answered.append({"text": text, "alert": alert})
+            async def edit(self, text=None, buttons=None, parse_mode=None):
+                pass
+            async def delete(self):
+                pass
+
+        ev = MockCbEvent(f"apply_edit:{lid}".encode("utf-8"))
+        asyncio.run(callback_handler(ev))
+        self.assertTrue(any("applied" in a["text"].lower() for a in ev.answered))
+
 
 class TestLatencyAndDelaysPerformance(unittest.IsolatedAsyncioTestCase):
     """Verify elimination of all pipeline delays and event-driven wakeups."""

@@ -26,7 +26,10 @@ from telethon.errors import (
     ChatIdInvalidError,
     ChatWriteForbiddenError,
     FloodWaitError,
+    MessageIdInvalidError,
+    MessageNotModifiedError,
     PeerIdInvalidError,
+    ReplyMarkupInvalidError,
     UserBannedInChannelError,
     UserKickedError,
     UsernameNotOccupiedError,
@@ -2413,34 +2416,51 @@ async def process_edited_message(
                 await client.edit_message(
                     dest_peer, published_msg_id, updated_text, formatting_entities=entities
                 )
-                await db.run_async(db.update_listing_raw_text, listing_id, raw_text)
-                await db.run_async(
-                    db.update_listing_content,
-                    listing_id=listing_id,
-                    clean_text=rendered_candidate,
-                )
-                await db.run_async(
-                    db.update_listing_fields,
-                    listing_id=listing_id,
-                    platform_name=platform_name,
-                    intent=intent,
-                )
-                edit_price, _ = parser.extract_price(raw_text)
-                await db.run_async(
-                    db.set_listing_fingerprint,
-                    listing_id,
-                    raw_text,
-                    price=edit_price,
+                logger.info("Updated destination post %s for edited source msg %s", published_msg_id, source_msg_id)
+            except MessageNotModifiedError:
+                logger.info("Destination post %s already up to date for edited source msg %s", published_msg_id, source_msg_id)
+            except MessageIdInvalidError as exc:
+                logger.warning(
+                    "Cannot edit destination post %s (message invalid or deleted): %s",
+                    published_msg_id,
+                    exc,
                 )
                 await db.run_async(
                     db.record_audit,
-                    "edited_destination",
+                    "edit_destination_failed",
                     listing_id,
-                    detail=f"source {source_msg_id}",
+                    detail=f"MessageIdInvalidError msg {published_msg_id}",
                 )
-                logger.info("Updated destination post %s for edited source msg %s", published_msg_id, source_msg_id)
+                return
             except Exception as exc:
                 logger.exception("Failed to edit destination message %s: %s", published_msg_id, exc)
+                return
+
+            await db.run_async(db.update_listing_raw_text, listing_id, raw_text)
+            await db.run_async(
+                db.update_listing_content,
+                listing_id=listing_id,
+                clean_text=rendered_candidate,
+            )
+            await db.run_async(
+                db.update_listing_fields,
+                listing_id=listing_id,
+                platform_name=platform_name,
+                intent=intent,
+            )
+            edit_price, _ = parser.extract_price(raw_text)
+            await db.run_async(
+                db.set_listing_fingerprint,
+                listing_id,
+                raw_text,
+                price=edit_price,
+            )
+            await db.run_async(
+                db.record_audit,
+                "edited_destination",
+                listing_id,
+                detail=f"source {source_msg_id}",
+            )
             return
 
         # Otherwise leave published post UNCHANGED, set audit_log edit_rejected_review, and send alert card
