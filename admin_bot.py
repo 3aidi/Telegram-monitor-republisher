@@ -796,7 +796,6 @@ BOT_MENU = [
     ("pending", "Pending approval listings"),
     ("skipall", "Skip all pending listings"),
     ("skipped", "Recently skipped messages"),
-    ("network", " Unified network matrix hub"),
     ("sources", " Manage monitored sources"),
     ("published", "Published posts & channel links"),
     ("headers", " Manage the custom-emoji WTB headers"),
@@ -1699,116 +1698,11 @@ async def _forwarders_menu_payload() -> Tuple[str, List[List[object]]]:
             buttons.append(del_row)
 
     buttons.append([
-        Button.inline("🌐 Network", data="menu:network"),
+        Button.inline("Destinations", data="menu:destinations"),
         Button.inline(texts.BTN_HOME, data="menu:home"),
     ])
 
     return full_text, buttons
-
-
-async def _network_hub_payload() -> Tuple[str, List[List[object]]]:
-    """Render the Unified Network Hub (Screen 3: Sources, Destinations, Forwarders)."""
-    suppliers = await db.run_async(db.list_suppliers, active_only=False)
-    active_sups = sum(1 for s in suppliers if s.get("active"))
-
-    destinations = await db.run_async(db.get_destination_health)
-    active_dests = sum(1 for d in destinations if d.get("active"))
-    dead_dests = sum(1 for d in destinations if d.get("is_dead"))
-    needs_link = [
-        d for d in destinations
-        if not d.get("invite_link") and str(d.get("chat_id") or "").lstrip("-").isdigit()
-    ]
-
-    accounts = await db.run_async(db.list_forward_accounts)
-    active_fwd = sum(1 for a in accounts if a.get("active"))
-
-    # Sources summary preview
-    if suppliers:
-        top_sups = []
-        for s in suppliers[:3]:
-            icon = "🟢" if s.get("active") else "⏸️"
-            top_sups.append(f"{icon} `{_pretty_source(s.get('channel_username'), s.get('display_name'))}`")
-        src_preview = "  ".join(top_sups)
-        if len(suppliers) > 3:
-            src_preview += f" _(+{len(suppliers) - 3} more)_"
-    else:
-        src_preview = "_No sources configured._"
-
-    # Destinations health notes
-    dest_notes = []
-    if dead_dests:
-        dest_notes.append(f"🔴 `{dead_dests}` dead")
-    if needs_link:
-        sample_names = [d.get("name") or str(d.get("chat_id")) for d in needs_link[:2]]
-        sample_str = f" ({', '.join(sample_names)})" if sample_names else ""
-        dest_notes.append(f"⚠️ `{len(needs_link)}` need link{sample_str}")
-    if not dest_notes:
-        dest_notes.append("🟢 All delivering")
-    dest_summary = f"{active_dests}/{len(destinations)} active · " + " · ".join(dest_notes)
-
-    # Forwarders summary
-    if accounts:
-        connected_sessions = set()
-        for cl in forward_clients_ref:
-            try:
-                if hasattr(cl, "session") and hasattr(cl.session, "filename"):
-                    fn = os.path.splitext(os.path.basename(str(cl.session.filename or "")))[0]
-                    if fn:
-                        connected_sessions.add(fn)
-            except Exception:
-                pass
-
-        fwd_names = []
-        for idx, a in enumerate(accounts[:2], start=1):
-            s_name = a.get("session_name")
-            is_conn = s_name in connected_sessions or (
-                len(forward_clients_ref) >= idx and getattr(forward_clients_ref[idx - 1], "is_connected", lambda: False)()
-            )
-            icon = "🟢" if is_conn else ("⏸️" if not a.get("active") else "⚪")
-            uname = f"@{a['username']}" if a.get("username") else (a.get("display_name") or a.get("phone") or s_name)
-            fwd_names.append(f"{icon} `{uname}`")
-        fwd_summary = f"{active_fwd} active · " + " ".join(fwd_names)
-        if len(accounts) > 2:
-            fwd_summary += f" _(+{len(accounts) - 2})_"
-    else:
-        fwd_summary = "⚪ Main listener fallback"
-
-    text = (
-        "🌐 **Network Matrix**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 **Sources** ({active_sups}/{len(suppliers)} active)\n"
-        f"{src_preview}\n\n"
-        f"📫 **Destinations** ({len(destinations)} total)\n"
-        f"• {dest_summary}\n\n"
-        f"👥 **Forwarder Pool**\n"
-        f"• {fwd_summary}"
-    )
-
-    buttons = [
-        [
-            Button.inline(f"📡 Sources ({len(suppliers)})", data="menu:sources"),
-            Button.inline("➕ Add Source", data="supadd"),
-        ],
-        [
-            Button.inline(f"📥 Destinations ({len(destinations)})", data="menu:destinations"),
-            Button.inline("➕ Add Destination", data="destadd"),
-        ],
-        [
-            Button.inline(f"👥 Forwarders ({len(accounts)})", data="forwarders:view"),
-            Button.inline("➕ Add Forwarder", data="fwdadd:start"),
-        ],
-        [
-            Button.inline("🔄 Auto-Join", data="fwdjoin:all"),
-            Button.inline("🏠 Home", data="menu:home"),
-        ],
-    ]
-    return text, buttons
-
-
-async def _send_network_hub(event) -> None:
-    """Send or edit the current message into the Unified Network Hub."""
-    text, buttons = await _network_hub_payload()
-    await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
 
 
 async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
@@ -2091,10 +1985,6 @@ def _home_inline_keyboard() -> List[List[object]]:
             Button.inline("✅ Published", data="home:published"),
         ],
         [
-            Button.inline("🌐 Network Matrix", data="menu:network"),
-            Button.inline("📊 Status", data="home:status"),
-        ],
-        [
             Button.inline("📥 Destinations", data="menu:destinations"),
             Button.inline("👥 Forwarders", data="forwarders:view"),
         ],
@@ -2103,7 +1993,10 @@ def _home_inline_keyboard() -> List[List[object]]:
             Button.inline("🚫 Skipped", data="home:skipped"),
         ],
         [
+            Button.inline("📊 Status", data="home:status"),
             Button.inline(pause_label, data="home:toggle"),
+        ],
+        [
             Button.inline(asleep_label, data="home:asleep"),
         ],
     ]
@@ -2647,13 +2540,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             logger.exception("Error running /syncdestinations")
             await status_msg.edit(texts.SYNC_FAIL.format(error=exc), buttons=_home_keyboard())
 
-    @bot.on(events.NewMessage(pattern=r"^(?:/network|/net|🌐 Network)"))
-    async def handle_network(event):
-        if not await check_admin(event):
-            return
-        text, buttons = await _network_hub_payload()
-        await event.reply(text, buttons=buttons, parse_mode="markdown")
-
     @bot.on(events.NewMessage(pattern=r"^(?:/forwarders|👥 Forwarders)"))
     async def handle_forwarders(event):
         if not await check_admin(event):
@@ -3164,11 +3050,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         if data_str == "menu:home":
             await event.answer(texts.BTN_HOME)
             await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
-            return
-
-        if data_str == "menu:network":
-            await event.answer("🌐 Network Matrix")
-            await _send_network_hub(event)
             return
 
         if data_str == "menu:sources":
