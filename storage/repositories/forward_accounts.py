@@ -62,17 +62,6 @@ def list_forward_accounts(
         return [dict(row) for row in rows]
 
 
-def get_forward_account(
-    account_id: int, db_path: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
-    """Look up a forwarder account by ID."""
-    with db_session(db_path) as conn:
-        row = conn.execute(
-            "SELECT * FROM forward_accounts WHERE id = ?", (account_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-
 def get_forward_account_by_session(
     session_name: str, db_path: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:

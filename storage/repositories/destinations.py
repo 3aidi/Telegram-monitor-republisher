@@ -90,28 +90,14 @@ def add_destination(
         return row["id"] if row else None
 
 def set_destination_invite_link(
-    destination_id: int, invite_link: Optional[str], db_path: Optional[str] = None
+    destination_id: int, invite_link: str, db_path: Optional[str] = None
 ) -> bool:
     """Save an invite link for a destination so forwarders can auto-join."""
     now_iso = datetime.now(timezone.utc).isoformat()
-    clean_link = invite_link.strip() if invite_link else None
-    link_state = "ok" if clean_link else "needs_link"
     with db_session(db_path) as conn:
         cursor = conn.execute(
-            "UPDATE destinations SET invite_link = ?, link_state = ?, updated_at = ? WHERE id = ?",
-            (clean_link, link_state, now_iso, destination_id),
-        )
-        return cursor.rowcount > 0
-
-def set_destination_link_state(
-    destination_id: int, link_state: str, db_path: Optional[str] = None
-) -> bool:
-    """Set the link_state (e.g. 'ok', 'needs_link') for a destination."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    with db_session(db_path) as conn:
-        cursor = conn.execute(
-            "UPDATE destinations SET link_state = ?, updated_at = ? WHERE id = ?",
-            (link_state, now_iso, destination_id),
+            "UPDATE destinations SET invite_link = ?, updated_at = ? WHERE id = ?",
+            (invite_link.strip() if invite_link else None, now_iso, destination_id),
         )
         return cursor.rowcount > 0
 

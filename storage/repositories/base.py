@@ -245,7 +245,6 @@ def init_db(db_path: Optional[str] = None) -> None:
                 title TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
                 invite_link TEXT,
-                link_state TEXT DEFAULT 'ok',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -499,7 +498,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 title TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
                 invite_link TEXT,
-                link_state TEXT DEFAULT 'ok',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -680,25 +678,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
     )
     if version < 14:
         cursor.execute("PRAGMA user_version = 14")
-
-    # v15: Persist review_reason and draft_text on listings for durable restart safety (R-02, B-4)
-    # and link_state on destinations to avoid retry storms on expired invite links (R-17, B-7)
-    if version < 15:
-        _v15_listings_info = cursor.execute("PRAGMA table_info(listings)").fetchall()
-        if _v15_listings_info:
-            _v15_cols = {r["name"] for r in _v15_listings_info}
-            if "draft_text" not in _v15_cols:
-                cursor.execute("ALTER TABLE listings ADD COLUMN draft_text TEXT")
-            if "review_reason" not in _v15_cols:
-                cursor.execute("ALTER TABLE listings ADD COLUMN review_reason TEXT")
-        cursor.execute("PRAGMA user_version = 15")
-
-    # Ensure destinations.link_state exists across all environments (R-17, B-7)
-    _dests_info = cursor.execute("PRAGMA table_info(destinations)").fetchall()
-    if _dests_info:
-        _d_cols = {r["name"] for r in _dests_info}
-        if "link_state" not in _d_cols:
-            cursor.execute("ALTER TABLE destinations ADD COLUMN link_state TEXT DEFAULT 'ok'")
 
 # Schema objects the running code depends on. Used by verify_schema() so a
 # diverged database is reported loudly at startup instead of failing later

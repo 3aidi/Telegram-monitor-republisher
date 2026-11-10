@@ -22,47 +22,6 @@ import parser
 import publish_guard
 import texts
 
-from services.tokens import Area, build_token, resolve_callback
-from services.renderer import show
-from services.feature_flags import (
-    is_flag_enabled,
-    UI_V2_RENDERER,
-    UI_V2_HOME,
-    UI_V2_REVIEW,
-    UI_V2_POSTS,
-    UI_V2_SOURCES,
-    UI_V2_DELIVERY,
-    UI_V2_SYSTEM,
-    UI_V2_SINGLE_PUBLISH,
-)
-from services.screens.home import render_home_screen, get_home_reply_keyboard
-from services.screens.review import (
-    render_review_card,
-    render_review_more_overlay,
-    render_review_empty_state,
-    render_review_edit_prompt,
-)
-from services.screens.posts import (
-    render_posts_list,
-    render_post_card,
-    render_post_fill_confirm,
-)
-from services.screens.delivery import (
-    render_delivery_hub,
-    render_group_card,
-    render_main_channel_screen,
-    render_headers_screen,
-    render_forwarders_screen,
-    render_forwarder_card,
-)
-from services.screens.sources import (
-    render_sources_list,
-    render_source_card,
-    render_source_remove_confirm,
-)
-from services.screens.skipped import render_skipped_hub
-from services.screens.system import render_system_screen
-
 load_dotenv()
 
 logger = logging.getLogger("admin_bot")
@@ -339,40 +298,14 @@ async def send_approval_prompt(
 
     send_buttons = buttons if buttons else None
     try:
-        sent = await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown")
-        if sent and hasattr(sent, "id"):
-            await db.run_async(db.set_setting, f"prompt_msg:{listing_id}", str(sent.id))
+        await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown")
         logger.info("Sent approval prompt for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
         try:
-            sent = await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None)
-            if sent and hasattr(sent, "id"):
-                await db.run_async(db.set_setting, f"prompt_msg:{listing_id}", str(sent.id))
+            await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None)
             logger.info("Sent approval prompt (plain fallback) for listing #%s to admin %s", listing_id, admin_id)
         except Exception:
             logger.exception("Failed to send approval prompt to admin for listing #%s", listing_id)
-
-
-async def collapse_listing_card(
-    bot_client: Optional[TelegramClient],
-    admin_id: int,
-    listing_id: int,
-    status_label: str = "✅ Handled",
-) -> None:
-    """Collapse any standalone prompt/alert card for a resolved listing to a single line without buttons (R-21, B-6)."""
-    if not bot_client:
-        return
-    try:
-        msg_id_str = await db.run_async(db.get_setting, f"prompt_msg:{listing_id}")
-        if not msg_id_str or not str(msg_id_str).isdigit():
-            return
-        msg_id = int(msg_id_str)
-        now_str = datetime.now(timezone.utc).strftime("%H:%M")
-        collapsed_text = f"{status_label} #{listing_id} · {now_str}"
-        await bot_client.edit_message(admin_id, msg_id, collapsed_text, buttons=None)
-        await db.run_async(db.delete_setting, f"prompt_msg:{listing_id}")
-    except Exception:
-        pass
 
 
 async def send_review_notification(
@@ -461,18 +394,6 @@ async def send_edit_rejected_alert(
         logger.exception("Failed to send edit rejected alert for listing #%s", listing_id)
 
 
-def _client_supports_param(client: Any, param_name: str) -> bool:
-    """Check if client.send_message accepts param_name (e.g. silent)."""
-    try:
-        import inspect
-        sig = inspect.signature(client.send_message)
-        return param_name in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        )
-    except Exception:
-        return False
-
-
 async def send_published_alert(
     bot_client: TelegramClient,
     admin_id: int,
@@ -506,13 +427,12 @@ async def send_published_alert(
         buttons.append([Button.inline("Sold", data=f"sold:{listing_id}")])
 
     send_buttons = buttons if buttons else None
-    kw = {"silent": True} if _client_supports_param(bot_client, "silent") else {}
     try:
-        await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown", **kw)
+        await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown")
         logger.info("Sent published alert for listing #%s to admin %s", listing_id, admin_id)
     except Exception:
         try:
-            await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None, **kw)
+            await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None)
             logger.info("Sent published alert (fallback) for listing #%s to admin %s", listing_id, admin_id)
         except Exception:
             logger.exception("Failed to send published alert to admin for listing #%s", listing_id)
@@ -721,12 +641,11 @@ async def send_skipped_alert(
             buttons.append(action_row)
 
     send_buttons = buttons if buttons else None
-    kw = {"silent": True} if _client_supports_param(bot_client, "silent") else {}
     try:
-        await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown", **kw)
+        await bot_client.send_message(admin_id, text, buttons=send_buttons, parse_mode="markdown")
     except Exception:
         try:
-            await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None, **kw)
+            await bot_client.send_message(admin_id, text, buttons=None, parse_mode=None)
         except Exception:
             logger.exception(
                 "Failed to send skip alert for listing #%s (reason %s)",
@@ -771,18 +690,17 @@ async def skip_digest_worker(bot: TelegramClient) -> None:
                 if k.get("reason") not in ("admin_skip", "duplicate", "expired")
             ]
 
-            kw = {"silent": True} if _client_supports_param(bot, "silent") else {}
             for k in notify_skips[:SKIP_DIGEST_MAX_CARDS]:
                 text, buttons = _skip_notification(k)
                 send_buttons = buttons if buttons else None
                 try:
                     await bot.send_message(
-                        ADMIN_USER_ID, text, buttons=send_buttons, parse_mode="markdown", **kw
+                        ADMIN_USER_ID, text, buttons=send_buttons, parse_mode="markdown"
                     )
                 except Exception:
                     try:
                         await bot.send_message(
-                            ADMIN_USER_ID, text, buttons=None, parse_mode=None, **kw
+                            ADMIN_USER_ID, text, buttons=None, parse_mode=None
                         )
                     except Exception:
                         logger.exception(
@@ -874,9 +792,6 @@ HEADER_EMOJI_COUNT = 3
 # Keep in sync with the NewMessage handlers: listing a command here that has no
 # handler leaves a dead entry in Telegram's menu.
 BOT_MENU = [
-    ("home", "⚡ Control Center"),
-    ("review", "⏳ Review pending queue"),
-    ("posts", "✅ Published posts"),
     ("status", " Today's stats report"),
     ("pending", "Pending approval listings"),
     ("skipall", "Skip all pending listings"),
@@ -1067,13 +982,6 @@ def _home_keyboard() -> List[List[object]]:
     ]
 
 
-def _active_reply_keyboard() -> List[List[object]]:
-    """Return active persistent reply keyboard (4-button V2 if enabled, otherwise legacy 6-button)."""
-    if is_flag_enabled(UI_V2_HOME):
-        return get_home_reply_keyboard()
-    return _home_keyboard()
-
-
 def _tgram_chat_link(chat_ref: Optional[str], message_id: Optional[int]) -> Optional[str]:
     """Build a t.me deep link for a message in a public channel ('@user') or supergroup id."""
     if not message_id:
@@ -1131,10 +1039,6 @@ def _asleep_label() -> str:
     return texts.BTN_AWAKE if db.is_buyer_asleep() else texts.BTN_ASLEEP
 
 
-from services.renderer import show
-from services.feature_flags import is_flag_enabled, UI_V2_RENDERER, UI_V2_SINGLE_PUBLISH
-
-
 async def _message_delete_send(
     event,
     text: str,
@@ -1142,18 +1046,13 @@ async def _message_delete_send(
     parse_mode: str = "markdown",
     formatting_entities: Optional[list] = None,
 ) -> None:
-    """Render a screen with edit-in-place (via show()) or legacy delete-send fallback."""
-    if is_flag_enabled(UI_V2_RENDERER):
-        await show(
-            event,
-            text,
-            buttons=buttons,
-            parse_mode=parse_mode,
-            formatting_entities=formatting_entities,
-            admin_id=ADMIN_USER_ID,
-        )
-        return
+    """Delete the tapped message and send a fresh one in its place.
 
+    Keeps the admin chat clean: menu/section navigation and button actions stop
+    editing-in-place (which left every old screen sitting in the chat forever)
+    and instead replace the tapped message with a fresh one. Both steps are
+    best-effort; a deleted source or blocked send degrades gracefully.
+    """
     try:
         await event.delete()
     except Exception:
@@ -1178,11 +1077,9 @@ async def _message_delete_send(
 def _listing_action_buttons(listing: dict) -> List[List[object]]:
     """Inline actions shown with a preview: pending ones can be edited, then
     approved or skipped. A 'View in Buyer channel' link is appended when the
-    source post resolves to a t.me URL. Back and Home navigation buttons are
-    appended according to listing status."""
+    source post resolves to a t.me URL."""
     listing_id = listing["id"]
     status = listing["status"]
-    buttons = []
     if status in ("failed", "error"):
         buttons = []
     elif status in ("pending_approval", "pending_review"):
@@ -1196,12 +1093,6 @@ def _listing_action_buttons(listing: dict) -> List[List[object]]:
                 Button.inline(texts.BTN_SKIP_ALL, data="skip_all_pending"),
             ],
         ]
-    elif status == "published":
-        buttons = [
-            [Button.inline("Sold", data=f"sold:{listing_id}")]
-        ]
-    elif status == "sold":
-        buttons = []
     else:
         buttons = [
             [
@@ -1211,23 +1102,6 @@ def _listing_action_buttons(listing: dict) -> List[List[object]]:
             ]
         ]
     buttons.extend(_channel_view_buttons(listing))
-    if status in ("published", "sold"):
-        buttons.append([
-            Button.inline(texts.BTN_BACK, data="home:published"),
-            Button.inline(texts.BTN_HOME, data="menu:home"),
-        ])
-    elif status in ("pending_approval", "pending_review"):
-        buttons.append([
-            Button.inline(texts.BTN_BACK, data="home:pending"),
-            Button.inline(texts.BTN_HOME, data="menu:home"),
-        ])
-    elif status == "skipped":
-        buttons.append([
-            Button.inline(texts.BTN_BACK, data="home:skipped"),
-            Button.inline(texts.BTN_HOME, data="menu:home"),
-        ])
-    else:
-        buttons.append([Button.inline(texts.BTN_HOME, data="menu:home")])
     return buttons
 
 
@@ -1235,54 +1109,6 @@ from services.fsm import PersistentDict
 
 # Wizard state: sender_id -> {"step": "add" | "edit", ...}
 _wizard_state: Dict[int, dict] = PersistentDict(prefix="wiz:")
-_WIZARD_TTL_SECONDS: float = 600.0  # 10 minutes (R-02)
-_qr_watcher_tasks: Dict[int, asyncio.Task] = {}
-_qr_messages: Dict[int, Any] = {}
-
-def set_wizard_state(admin_id: int, state: dict) -> None:
-    """Set wizard state with automatic creation timestamp (R-02)."""
-    st = dict(state)
-    if "created_at" not in st:
-        st["created_at"] = time.time()
-    _wizard_state[admin_id] = st
-
-async def cancel_wizard(admin_id: int) -> Optional[dict]:
-    """Unified wizard cancellation and resource disposal (R-02, R-03, B-3).
-    
-    1. Pops _wizard_state for the admin.
-    2. Cancels any in-flight QR watcher background task.
-    3. Deletes any pending QR code message.
-    4. Disposes in-flight forwarder login clients.
-    5. Clears any draft associated with an edit wizard.
-    """
-    wiz = _wizard_state.pop(admin_id, None)
-    
-    qr_task = _qr_watcher_tasks.pop(admin_id, None)
-    if qr_task and not qr_task.done():
-        qr_task.cancel()
-        
-    qr_msg = _qr_messages.pop(admin_id, None)
-    if qr_msg:
-        try:
-            await qr_msg.delete()
-        except Exception:
-            pass
-
-    try:
-        import services.forwarders_manager as fwd_mgr
-        fwd_mgr.clear_in_flight_login(admin_id)
-    except Exception:
-        pass
-
-    if wiz and wiz.get("step") == "edit" and wiz.get("listing_id"):
-        lid = wiz["listing_id"]
-        _drafts.pop(lid, None)
-        try:
-            await db.run_async(db.set_listing_draft, lid, None)
-        except Exception:
-            pass
-
-    return wiz
 # Listing drafts: listing_id -> content lines typed by the admin via ✏️ Edit.
 _drafts: Dict[int, str] = PersistentDict(prefix="draft:")
 # Header undo memory for safe 1-tap recovery
@@ -2152,7 +1978,7 @@ def _home_button_row() -> List[List[object]]:
 
 def _home_text() -> str:
     paused = db.is_paused()
-    state_badge = "⏸️ **Auto-publish: PAUSED**" if paused else "🟢 **Auto-publish: ACTIVE**"
+    state_badge = "⏸️ **Paused**" if paused else "🟢 **Active**"
     asleep_badge = "💤 Away" if db.is_buyer_asleep() else "☀️ Online"
     try:
         stats = db.get_today_stats()
@@ -2443,62 +2269,6 @@ def _post_card(post: dict) -> Tuple[str, List[List[object]]]:
     return lines, buttons
 
 
-async def _prompt_sold_confirm(
-    event,
-    listing_id: Optional[int] = None,
-    post_number: Optional[int] = None,
-) -> None:
-    """Prompt confirmation before executing irreversible STOP reply and message deletions (R-01)."""
-    listing = None
-    if listing_id is not None:
-        listing = db.get_listing_by_id(listing_id)
-    elif post_number is not None:
-        listing = db.get_post_by_number(post_number)
-        if not listing:
-            listing = db.get_listing_by_id(post_number)
-
-    if not listing:
-        ref_label = str(post_number if post_number is not None else listing_id)
-        msg = texts.SOLD_NOT_FOUND.format(post=ref_label)
-        if hasattr(event, "answer"):
-            await event.answer("Listing not found", alert=True)
-        await event.reply(msg)
-        return
-
-    actual_id = listing["id"]
-    post_num = listing.get("post_number") or actual_id
-
-    if listing.get("status") == "sold":
-        msg = texts.SOLD_ALREADY.format(post=post_num)
-        if hasattr(event, "answer"):
-            await event.answer("Already marked as SOLD", alert=True)
-        await event.reply(msg)
-        return
-
-    published_msg_id = listing.get("published_message_id")
-    if not published_msg_id:
-        msg = texts.SOLD_NOT_PUBLISHED.format(post=post_num)
-        if hasattr(event, "answer"):
-            await event.answer("Post not published yet", alert=True)
-        await event.reply(msg)
-        return
-
-    fwds = await db.run_async(db.get_forwardings_for_listing, actual_id)
-    fwd_count = len([f for f in fwds if f.get("status") == "forwarded"])
-    platform = (listing.get("platform_name") or listing.get("game_name") or "—").title()
-
-    text = texts.CONFIRM_SOLD_ASK.format(
-        post=post_num,
-        platform=platform,
-        copies=fwd_count,
-    )
-    buttons = [
-        [Button.inline(texts.BTN_CONFIRM_SOLD, data=f"sold_y:{actual_id}")],
-        [Button.inline(texts.BTN_CANCEL_X, data=f"sold_cancel:{actual_id}")],
-    ]
-    await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
-
-
 async def _execute_sold(
     event,
     listing_id: Optional[int] = None,
@@ -2577,7 +2347,6 @@ async def _execute_sold(
         )
     )
     deleted_count = 0
-    failed_destinations: List[str] = []
     if del_sender:
         for f in fwds:
             if f.get("status") == "forwarded":
@@ -2601,7 +2370,6 @@ async def _execute_sold(
                             deleted_count += 1
                             logger.info("Deleted forwarded msg %s from %s for sold post #%s", dest_msg_id, dest_chat, post_num)
                         except Exception as del_err:
-                            failed_destinations.append(str(dest_chat))
                             logger.warning("Could not delete forwarded msg %s from %s: %s", dest_msg_id, dest_chat, del_err)
 
     # 4. Mark listing as sold in DB & audit log
@@ -2613,12 +2381,9 @@ async def _execute_sold(
         actor_id=event.sender_id,
         detail=f"post #{post_num} marked sold (deleted from {deleted_count} destinations)",
     )
-    await collapse_listing_card(getattr(event, "client", None), ADMIN_USER_ID, actual_id, "🔴 Sold")
 
     # 5. Admin confirmation
     done_text = texts.SOLD_DONE.format(post=post_num, deleted=deleted_count)
-    if failed_destinations:
-        done_text += f"\n⚠️ **Failed to delete from {len(failed_destinations)} destination(s):** {', '.join(failed_destinations)}"
     if hasattr(event, "answer"):
         try:
             await event.answer("🔴 Marked as SOLD", alert=False)
@@ -2646,41 +2411,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return False
         return True
 
-    @bot.on(events.NewMessage(pattern=r"^(?:/help|❓ Help)$"))
-    async def handle_help(event):
+    @bot.on(events.NewMessage(pattern=r"^(?:/start|/help|❓ Help)"))
+    async def handle_start(event):
         if not await check_admin(event):
             return
-        await event.reply(_help_text(), buttons=_active_reply_keyboard())
-
-    @bot.on(events.NewMessage(pattern=r"^(?:/start|/menu|/home|🏠 Home)$"))
-    async def handle_menu(event):
-        if not await check_admin(event):
-            return
-        payload = render_home_screen()
-        reply_kb = _active_reply_keyboard()
-        raw_cmd = (event.raw_text or "").strip()
-        if raw_cmd in ("/start", "🏠 Home", "/menu", "/home"):
-            await event.reply("⚡ **Control Center Online**", buttons=reply_kb, parse_mode="markdown")
-        await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-
-    @bot.on(events.NewMessage(pattern=r"^(?:/review|⏳ Review)$"))
-    async def handle_review_command(event):
-        if not await check_admin(event):
-            return
-        listings = db.get_pending_listings(limit=10, offset=0)
-        total_pending = db.count_pending_listings()
-        if not listings or total_pending == 0:
-            payload = render_review_empty_state()
-        else:
-            payload = render_review_card(listings[0], page_idx=0, total_count=total_pending)
-        await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
-
-    @bot.on(events.NewMessage(pattern=r"^(?:/posts|✅ Posts)$"))
-    async def handle_posts_command(event):
-        if not await check_admin(event):
-            return
-        payload = render_posts_list(page=0)
-        await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
+        await event.reply(_help_text(), buttons=_home_keyboard())
 
     @bot.on(events.NewMessage(pattern=r"^(?:/suppliers|/sources|📋 Sources)"))
     async def handle_suppliers(event):
@@ -2720,7 +2455,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             parse_mode="markdown",
         )
 
-    @bot.on(events.NewMessage(pattern=r"^(?:/pause|/resume|⏸ Pause auto-publish|▶ Resume auto-publish|⏸ All Stop|▶ All Start)$"))
+    @bot.on(events.NewMessage(pattern=r"^(?:/pause|/resume|⏸ All Stop|▶ All Start)$"))
     async def handle_pause_toggle(event):
         if not await check_admin(event):
             return
@@ -2729,18 +2464,18 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         state_label = texts.PAUSE_ON if not paused else texts.PAUSE_OFF
         await event.reply(
             state_label,
-            buttons=_active_reply_keyboard(),
+            buttons=_home_keyboard(),
             parse_mode="markdown",
         )
 
-    @bot.on(events.NewMessage(pattern=r"^(?:💤 I'm Asleep|☀️ I'm Awake|💤 Turn away mode on|☀️ Turn away mode off)$"))
+    @bot.on(events.NewMessage(pattern=r"^(?:💤 I'm Asleep|☀️ I'm Awake)$"))
     async def handle_asleep_toggle(event):
         if not await check_admin(event):
             return
         asleep = db.is_buyer_asleep()
         await db.run_async(db.set_buyer_asleep, not asleep)
         state_label = texts.ASLEEP_ON if not asleep else texts.ASLEEP_OFF
-        await event.reply(state_label, buttons=_active_reply_keyboard(), parse_mode="markdown")
+        await event.reply(state_label, buttons=_home_keyboard(), parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/addsupplier(?:\s+(.+))?"))
     async def handle_add_supplier(event):
@@ -3006,17 +2741,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 buttons=_home_keyboard(),
             )
             return
-        await _prompt_sold_confirm(event, post_number=int(arg))
-
-    @bot.on(events.NewMessage(pattern=r"^/cancel$"))
-    async def handle_cancel_command(event):
-        if not await check_admin(event):
-            return
-        await cancel_wizard(ADMIN_USER_ID)
-        await event.reply(
-            texts.CANCELLED,
-            buttons=_home_keyboard(),
-        )
+        await _execute_sold(event, post_number=int(arg))
 
     @bot.on(events.NewMessage(pattern=r"^/setseq(?:[ \t]+(\d+))?"))
     async def handle_setseq(event):
@@ -3162,296 +2887,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         data_str = event.data.decode("utf-8")
-        from services.tokens import resolve_callback
-        canonical_str = resolve_callback(data_str)
-
-        # Telemetry (R-25, B-11): Record navigation callback usage in audit_log
-        try:
-            token = data_str.split(":", 1)[0] if ":" in data_str else data_str
-            await db.run_async(
-                db.record_audit,
-                f"nav:{token[:30]}",
-                None,
-                actor_id=event.sender_id,
-                detail=data_str[:100],
-            )
-        except Exception:
-            pass
-
-        # =====================================================================
-        # Phase 3 V2 Modern Screen Dispatcher (Blueprint §4, R-06 through R-16)
-        # =====================================================================
-        if canonical_str == "nav:home" and (data_str in ("nav:home", "menu:home") or is_flag_enabled(UI_V2_RENDERER)):
-            payload = render_home_screen()
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        if canonical_str == "nav:pause":
-            paused = db.is_paused()
-            await db.run_async(db.set_paused, not paused)
-            toast = texts.PAUSE_ANSWER_ON if not paused else texts.PAUSE_ANSWER_OFF
-            await event.answer(toast)
-            payload = render_home_screen()
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        if canonical_str == "nav:away":
-            asleep = db.is_buyer_asleep()
-            await db.run_async(db.set_buyer_asleep, not asleep)
-            toast = texts.ASLEEP_ANSWER_ON if not asleep else texts.ASLEEP_ANSWER_OFF
-            await event.answer(toast)
-            payload = render_home_screen()
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        if canonical_str == "rev:noop":
-            await event.answer()
-            return
-
-        if (data_str == "rev:open" or (canonical_str == "rev:open" and is_flag_enabled(UI_V2_REVIEW))):
-            listings = db.get_pending_listings(limit=10, offset=0)
-            total_pending = db.count_pending_listings()
-            if not listings or total_pending == 0:
-                payload = render_review_empty_state()
-            else:
-                payload = render_review_card(listings[0], page_idx=0, total_count=total_pending)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
-            return
-
-        m_rev_pg = re.match(r"^rev:pg:(\d+)$", data_str) or (is_flag_enabled(UI_V2_REVIEW) and re.match(r"^rev:pg:(\d+)$", canonical_str))
-        if m_rev_pg:
-            target_idx = int(m_rev_pg.group(1))
-            total_pending = db.count_pending_listings()
-            if total_pending == 0:
-                payload = render_review_empty_state()
-            else:
-                target_idx = max(0, min(target_idx, total_pending - 1))
-                listings = db.get_pending_listings(limit=1, offset=target_idx)
-                if listings:
-                    payload = render_review_card(listings[0], page_idx=target_idx, total_count=total_pending)
-                else:
-                    payload = render_review_empty_state()
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
-            return
-
-        m_rev_toggle = re.match(r"^rev:(orig|prop):(\d+)$", data_str) or (is_flag_enabled(UI_V2_REVIEW) and re.match(r"^rev:(orig|prop):(\d+)$", canonical_str))
-        if m_rev_toggle:
-            mode = "original" if m_rev_toggle.group(1) == "orig" else "proposed"
-            lid = int(m_rev_toggle.group(2))
-            listing = db.get_listing_by_id(lid)
-            if not listing:
-                await event.answer("Listing not found", alert=True)
-                return
-            total_pending = db.count_pending_listings()
-            payload = render_review_card(listing, page_idx=0, total_count=max(1, total_pending), toggle_mode=mode)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
-            return
-
-        m_rev_more = re.match(r"^rev:more:(\d+)$", data_str) or (is_flag_enabled(UI_V2_REVIEW) and re.match(r"^rev:more:(\d+)$", canonical_str))
-        if m_rev_more:
-            lid = int(m_rev_more.group(1))
-            listing = db.get_listing_by_id(lid)
-            if not listing:
-                await event.answer("Listing not found", alert=True)
-                return
-            total_pending = db.count_pending_listings()
-            payload = render_review_more_overlay(listing, total_pending=total_pending)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        m_rev_psrc = re.match(r"^rev:psrc:(\d+)$", data_str) or (is_flag_enabled(UI_V2_REVIEW) and re.match(r"^rev:psrc:(\d+)$", canonical_str))
-        if m_rev_psrc:
-            lid = int(m_rev_psrc.group(1))
-            listing = db.get_listing_by_id(lid)
-            if listing and listing.get("supplier_id"):
-                await db.run_async(db.set_supplier_active, listing["supplier_id"], False)
-                await event.answer("⏸ Source paused")
-            else:
-                await event.answer("Source not found", alert=True)
-            total_pending = db.count_pending_listings()
-            payload = render_review_card(listing, page_idx=0, total_count=max(1, total_pending))
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        m_rev_undo = re.match(r"^rev:undoskip:(\d+)$", data_str) or (is_flag_enabled(UI_V2_REVIEW) and re.match(r"^rev:undoskip:(\d+)$", canonical_str))
-        if m_rev_undo:
-            skip_id = int(m_rev_undo.group(1))
-            reopened = await db.run_async(db.reopen_skipped, skip_id)
-            if reopened:
-                await event.answer("Restored to review! ✅")
-                total_pending = db.count_pending_listings()
-                payload = render_review_card(reopened, page_idx=0, total_count=max(1, total_pending))
-                await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
-            else:
-                await event.answer("Could not restore listing", alert=True)
-            return
-
-        m_rev_edit = re.match(r"^rev:edit:(\d+)$", data_str)
-        if m_rev_edit and is_flag_enabled(UI_V2_REVIEW):
-            lid = int(m_rev_edit.group(1))
-            listing = db.get_listing_by_id(lid)
-            if not listing:
-                await event.answer("Listing not found", alert=True)
-                return
-            _wizard_state[ADMIN_USER_ID] = {"step": "edit_v2", "listing_id": lid, "created_at": time.time()}
-            payload = render_review_edit_prompt(listing)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        if data_str.startswith("rev:ok:") and is_flag_enabled(UI_V2_REVIEW):
-            lid = int(data_str.split(":", 2)[2])
-            listing = db.get_listing_by_id(lid)
-            if not listing or not listing_is_editable(listing["status"]):
-                await event.answer("Listing already handled", alert=True)
-            else:
-                await db.run_async(db.update_listing_status, lid, "approved")
-                await db.run_async(db.record_audit, "approved", lid, actor_id=event.sender_id)
-                notify_approved()
-                await collapse_listing_card(getattr(event, "client", None), ADMIN_USER_ID, lid, "✅ Approved")
-                await event.answer(f"✅ Queued #{lid}")
-            listings = db.get_pending_listings(limit=10, offset=0)
-            total_pending = db.count_pending_listings()
-            if not listings or total_pending == 0:
-                payload = render_review_empty_state()
-            else:
-                payload = render_review_card(listings[0], page_idx=0, total_count=total_pending)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
-            return
-
-        if data_str.startswith("rev:skip:") and is_flag_enabled(UI_V2_REVIEW):
-            lid = int(data_str.split(":", 2)[2])
-            listing = db.get_listing_by_id(lid)
-            if listing and listing_is_editable(listing["status"]):
-                await db.run_async(db.update_listing_status, lid, "skipped_admin")
-                await db.run_async(db.record_audit, "skipped_admin", lid, actor_id=event.sender_id)
-                await db.run_async(
-                    db.log_skip,
-                    listing.get("supplier_id"),
-                    listing.get("source_message_id"),
-                    "admin_skip",
-                    listing.get("raw_text") or listing.get("clean_text") or "",
-                )
-                await collapse_listing_card(getattr(event, "client", None), ADMIN_USER_ID, lid, "🚫 Skipped")
-                await event.answer(f"Skipped #{lid}")
-            else:
-                await event.answer("Listing already handled", alert=True)
-            listings = db.get_pending_listings(limit=10, offset=0)
-            total_pending = db.count_pending_listings()
-            if not listings or total_pending == 0:
-                payload = render_review_empty_state()
-            else:
-                payload = render_review_card(listings[0], page_idx=0, total_count=total_pending, undo_skip_id=lid)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
-            return
-
-        # Posts V2
-        m_post_list = re.match(r"^post:list:(-?\d+)$", data_str) or (is_flag_enabled(UI_V2_POSTS) and re.match(r"^post:list:(-?\d+)$", canonical_str))
-        if m_post_list and is_flag_enabled(UI_V2_POSTS):
-            page = max(0, int(m_post_list.group(1)))
-            payload = render_posts_list(page=page)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        m_post_v = re.match(r"^post:v:(\d+)(?::(-?\d+))?$", data_str) or (is_flag_enabled(UI_V2_POSTS) and re.match(r"^post:v:(\d+)(?::(-?\d+))?$", canonical_str))
-        if m_post_v and is_flag_enabled(UI_V2_POSTS):
-            pnum = int(m_post_v.group(1))
-            from_page = max(0, int(m_post_v.group(2) or 0))
-            payload = render_post_card(pnum, from_page=from_page, dest_channel=DEST_CHANNEL)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        m_post_fill = re.match(r"^post:fill:(\d+)$", data_str)
-        if m_post_fill and is_flag_enabled(UI_V2_POSTS):
-            pnum = int(m_post_fill.group(1))
-            payload = render_post_fill_confirm(pnum)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        # Delivery V2
-        m_dlv_list = re.match(r"^dlv:list:(-?\d+)$", data_str) or (is_flag_enabled(UI_V2_DELIVERY) and re.match(r"^dlv:list:(-?\d+)$", canonical_str))
-        if m_dlv_list and is_flag_enabled(UI_V2_DELIVERY):
-            page = max(0, int(m_dlv_list.group(1)))
-            payload = render_delivery_hub(page=page)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        m_grp_v = re.match(r"^grp:v:(\d+)(?::(-?\d+))?$", data_str) or (is_flag_enabled(UI_V2_DELIVERY) and re.match(r"^grp:v:(\d+)(?::(-?\d+))?$", canonical_str))
-        if m_grp_v and is_flag_enabled(UI_V2_DELIVERY):
-            gid = int(m_grp_v.group(1))
-            from_page = max(0, int(m_grp_v.group(2) or 0))
-            payload = render_group_card(gid, from_page=from_page)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        if (data_str == "dlv:main" or (canonical_str == "dlv:main" and is_flag_enabled(UI_V2_DELIVERY))):
-            payload = render_main_channel_screen()
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        if (data_str == "fwd:list" or (canonical_str == "fwd:list" and is_flag_enabled(UI_V2_DELIVERY))):
-            payload = render_forwarders_screen()
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        m_fwd_v = re.match(r"^fwd:v:(\d+)$", data_str) or (is_flag_enabled(UI_V2_DELIVERY) and re.match(r"^fwd:v:(\d+)$", canonical_str))
-        if m_fwd_v and is_flag_enabled(UI_V2_DELIVERY):
-            aid = int(m_fwd_v.group(1))
-            payload = render_forwarder_card(aid)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        # Sources V2
-        m_src_list = re.match(r"^src:list:(-?\d+)$", data_str) or (is_flag_enabled(UI_V2_SOURCES) and re.match(r"^src:list:(-?\d+)$", canonical_str))
-        if m_src_list and is_flag_enabled(UI_V2_SOURCES):
-            page = max(0, int(m_src_list.group(1)))
-            payload = render_sources_list(page=page)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        m_src_v = re.match(r"^src:v:(\d+)(?::(-?\d+))?$", data_str) or (is_flag_enabled(UI_V2_SOURCES) and re.match(r"^src:v:(\d+)(?::(-?\d+))?$", canonical_str))
-        if m_src_v and is_flag_enabled(UI_V2_SOURCES):
-            sid = int(m_src_v.group(1))
-            from_page = max(0, int(m_src_v.group(2) or 0))
-            payload = render_source_card(sid, from_page=from_page)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        m_src_rm = re.match(r"^src:rm:(\d+)$", data_str) or (is_flag_enabled(UI_V2_SOURCES) and re.match(r"^src:rm:(\d+)$", canonical_str))
-        if m_src_rm and is_flag_enabled(UI_V2_SOURCES):
-            sid = int(m_src_rm.group(1))
-            payload = render_source_remove_confirm(sid)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        # Skipped V2
-        m_skp_list = re.match(r"^skp:list:(?:([nmxa]):)?(-?\d+)$", data_str) or re.match(r"^skp:list:(?:([nmxa]):)?(-?\d+)$", canonical_str)
-        if m_skp_list:
-            filter_code = m_skp_list.group(1) or "n"
-            page = max(0, int(m_skp_list.group(2) or 0))
-            payload = render_skipped_hub(filter_code=filter_code, page=page)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
-
-        m_skp_re = re.match(r"^skp:re:(\d+)$", data_str)
-        if m_skp_re:
-            skip_id = int(m_skp_re.group(1))
-            reopened = await db.run_async(db.reopen_skipped, skip_id)
-            if reopened:
-                await event.answer("Re-opened for review! 📬")
-                total_pending = db.count_pending_listings()
-                payload = render_review_card(reopened, page_idx=0, total_count=max(1, total_pending))
-                await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
-            else:
-                await event.answer("Could not re-open listing", alert=True)
-            return
-
-        # System V2
-        m_sys = re.match(r"^sys:view:(ov|wk|st)$", data_str) or (is_flag_enabled(UI_V2_SYSTEM) and re.match(r"^sys:view:(ov|wk|st)$", canonical_str))
-        if m_sys and is_flag_enabled(UI_V2_SYSTEM):
-            tab = m_sys.group(1)
-            payload = render_system_screen(tab=tab, user_client=user_client_ref, bot_client=bot, forward_clients=forward_clients_ref)
-            await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
-            return
 
         # ---- Edit propagation rejected review actions (Task 1) ------------
         if data_str.startswith("apply_edit:"):
@@ -3536,22 +2971,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         # ---- Quick UI dismissal & actions ----------------------------------
         if data_str == "dismiss_msg":
             await event.answer("Dismissed")
-            try:
-                await event.delete()
-            except Exception:
-                pass
-            return
-
-        pubretry_match = re.match(r"^(?:pubretry|rev:pubretry):(\d+)$", data_str)
-        if pubretry_match:
-            lid = int(pubretry_match.group(1))
-            listing = db.get_listing_by_id(lid)
-            if not listing:
-                await event.answer("Listing not found", alert=True)
-                return
-            await db.run_async(db.update_listing_status, lid, "approved")
-            notify_approved()
-            await event.answer("🔁 Retrying publish...", alert=False)
             try:
                 await event.delete()
             except Exception:
@@ -3647,12 +3066,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         # ---- Pure navigation -----------------------------------------------
-        if data_str in ("menu:home", "nav:home") or canonical_str == "nav:home":
+        if data_str == "menu:home":
             await event.answer(texts.BTN_HOME)
             await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
             return
 
-        if data_str in ("menu:sources", "src:list:0") or canonical_str == "src:list:0":
+        if data_str == "menu:sources":
             suppliers = db.list_suppliers(active_only=False)
             text = _sources_menu_text(suppliers)
             if not suppliers:
@@ -3660,7 +3079,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await _message_delete_send(event, text, buttons=_sources_buttons(suppliers), parse_mode=None)
             return
 
-        if data_str in ("menu:destinations", "dlv:list:0") or canonical_str == "dlv:list:0":
+        if data_str == "menu:destinations":
             destinations = db.get_destination_health()
             text = _destinations_menu_text(destinations)
             await _message_delete_send(
@@ -3672,10 +3091,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         # "headeradd" is the ➕ row inside the /headers list. "home:headers" has
         # no button any more, but old messages still carry it and it costs
         # nothing to keep honouring them.
-        if data_str in ("home:headers", "headeradd", "hdr:list", "hdr:add") or canonical_str in ("hdr:list", "hdr:add"):
+        if data_str in ("home:headers", "headeradd"):
             await event.answer(f"🅰 {HEADERS_BTN}")
             headers = db.list_headers()
-            if data_str in ("headeradd", "hdr:add") or canonical_str == "hdr:add":
+            if data_str == "headeradd":
                 _wizard_state[ADMIN_USER_ID] = {"step": "addheader"}
                 await _message_delete_send(
                     event,
@@ -3751,18 +3170,18 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
 
-        if data_str.startswith("home:") or canonical_str == "rev:card" or canonical_str.startswith(("post:list:", "skp:list:", "sys:toggle_")):
-            home_action = data_str.split(":", 1)[1] if data_str.startswith("home:") else None
+        if data_str.startswith("home:"):
+            home_action = data_str.split(":", 1)[1]
             if home_action == "status":
                 await _message_delete_send(event, _status_report_text(), buttons=_home_button_row())
                 return
-            if home_action == "pending" or canonical_str == "rev:card":
+            if home_action == "pending":
                 await _send_pending_page(event, bot, 0)
                 return
             if home_action == "help":
                 await _message_delete_send(event, _help_text(), buttons=_home_button_row())
                 return
-            if home_action == "toggle" or canonical_str == "sys:toggle_pause":
+            if home_action == "toggle":
                 paused = db.is_paused()
                 await db.run_async(db.set_paused, not paused)
                 await event.answer(
@@ -3770,7 +3189,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 )
                 await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
                 return
-            if home_action == "asleep" or canonical_str == "sys:toggle_away":
+            if home_action == "asleep":
                 asleep = db.is_buyer_asleep()
                 await db.run_async(db.set_buyer_asleep, not asleep)
                 await event.answer(
@@ -3778,7 +3197,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 )
                 await _message_delete_send(event, _home_text(), buttons=_home_inline_keyboard())
                 return
-            if home_action == "skipped" or canonical_str.startswith("skp:list:"):
+            if home_action == "skipped":
                 skips = db.get_skipped_listings(limit=_PAGE_SIZE, offset=0)
                 if not skips:
                     await _message_delete_send(
@@ -3790,7 +3209,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 text, buttons = _skipped_digest(skips, 0, db.count_skipped_listings())
                 await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
                 return
-            if home_action == "published" or canonical_str.startswith("post:list:"):
+            if home_action == "published":
                 rows = db.get_published_listings(limit=_PAGE_SIZE, offset=0)
                 if not rows:
                     await _message_delete_send(
@@ -3804,7 +3223,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 return
             return
 
-        if data_str in ("published:search", "post:find") or canonical_str == "post:find":
+        if data_str == "published:search":
             _wizard_state[ADMIN_USER_ID] = {"step": "post_search"}
             try:
                 sent = await event.client.send_message(
@@ -3826,12 +3245,16 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 pass
             return
 
-        if data_str in ("wiz:cancel", "wiz:x") or canonical_str == "wiz:x":
-            wiz = await cancel_wizard(ADMIN_USER_ID)
+        if data_str == "wiz:cancel":
+            import services.forwarders_manager as fwd_mgr
+            fwd_mgr.clear_in_flight_login(ADMIN_USER_ID)
+            # Dropping the wizard must ALSO drop any half-typed edit draft:
+            # otherwise the stale text silently resurrects on a later Approve
+            # of the same listing (wizard-draft leak).
+            wiz = _wizard_state.pop(ADMIN_USER_ID, None)
             edit_cancelled = bool(wiz and wiz.get("step") == "edit" and wiz.get("listing_id"))
-            dest_id = wiz.get("dest_id") if wiz else None
-            return_to = wiz.get("return_to") if wiz else None
-            step = wiz.get("step") if wiz else None
+            if edit_cancelled:
+                _drafts.pop(wiz["listing_id"], None)
             await event.answer(texts.CANCELLED)
             try:
                 await event.delete()
@@ -3843,32 +3266,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         ADMIN_USER_ID,
                         texts.EDIT_CANCELLED,
                         parse_mode="markdown",
-                    )
-                except Exception:
-                    pass
-                await _advance_review(bot)
-            elif dest_id:
-                dest = db.get_destination_by_id(dest_id)
-                if dest:
-                    await _edit_destination_menu(event, dest)
-                else:
-                    dests = db.get_destination_health()
-                    await _message_delete_send(event, _destinations_menu_text(dests), buttons=_destinations_buttons(dests))
-            elif return_to == "destinations" or step in ("dest_add", "set_main_channel"):
-                dests = db.get_destination_health()
-                await _message_delete_send(event, _destinations_menu_text(dests), buttons=_destinations_buttons(dests))
-            elif return_to == "sources" or step == "add_source":
-                suppliers = db.list_suppliers(active_only=False)
-                await _message_delete_send(event, _suppliers_menu_text(suppliers, 0), buttons=_suppliers_buttons(suppliers, 0))
-            elif return_to == "forwarders" or (step and str(step).startswith("add_fwd")):
-                text, buttons = await _forwarders_menu_payload()
-                await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
-            else:
-                try:
-                    await event.client.send_message(
-                        ADMIN_USER_ID,
-                        texts.CANCELLED,
-                        buttons=_home_keyboard(),
                     )
                 except Exception:
                     pass
@@ -4255,12 +3652,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await _message_delete_send(event, text, buttons=buttons, parse_mode="html")
             return
 
-        if data_str in ("forwarders:view", "fwd:list") or canonical_str == "fwd:list":
+        if data_str == "forwarders:view":
             text, buttons = await _forwarders_menu_payload()
             await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
             return
 
-        if data_str in ("fwdadd:start", "fwd:add") or canonical_str == "fwd:add":
+        if data_str == "fwdadd:start":
             text = "Add Forwarder:"
             buttons = [
                 [Button.inline("QR Code", data="fwdadd:qr"), Button.inline("Phone", data="fwdadd:phone")],
@@ -4274,7 +3671,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
 
-        if data_str in ("fwdadd:resendsms", "fwd:resend") or canonical_str == "fwd:resend":
+        if data_str == "fwdadd:resendsms":
             import services.forwarders_manager as fwd_mgr
             ok, res_msg = await fwd_mgr.resend_login_code(ADMIN_USER_ID)
             if ok:
@@ -4311,23 +3708,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
             )
 
-            _qr_messages[ADMIN_USER_ID] = qr_msg
-            set_wizard_state(ADMIN_USER_ID, {"step": "add_fwd_qr"})
-
             async def _watch_qr():
+                ok_qr, status_qr, cl_qr = await fwd_mgr.wait_for_qr_login(ADMIN_USER_ID, timeout=120.0)
                 try:
-                    ok_qr, status_qr, cl_qr = await fwd_mgr.wait_for_qr_login(ADMIN_USER_ID, timeout=120.0)
-                except asyncio.CancelledError:
-                    return
-                finally:
-                    _qr_watcher_tasks.pop(ADMIN_USER_ID, None)
-                    _qr_messages.pop(ADMIN_USER_ID, None)
-                    try:
-                        await qr_msg.delete()
-                    except Exception:
-                        pass
+                    await qr_msg.delete()
+                except Exception:
+                    pass
                 if status_qr == "2FA_REQUIRED":
-                    set_wizard_state(ADMIN_USER_ID, {"step": "add_fwd_password"})
+                    _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_password"}
                     await event.client.send_message(
                         ADMIN_USER_ID,
                         "Enter 2FA password:",
@@ -4367,7 +3755,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         )
                     )
 
-            _qr_watcher_tasks[ADMIN_USER_ID] = asyncio.create_task(_watch_qr())
+            asyncio.create_task(_watch_qr())
             return
 
         if data_str == "fwdjoin:all":
@@ -4406,7 +3794,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             text = (
                 f"⚠️ **Remove Forwarder Account?**\n\n"
                 f"Are you sure you want to remove **{disp}**?\n"
-                f"It will be logged out on Telegram and removed from the cascading pool."
+                f"It will be disconnected and removed from the cascading pool."
             )
             buttons = [
                 [Button.inline("Yes, Remove", data=f"fwddelyes:{aid}")],
@@ -4431,28 +3819,11 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                                 import main as main_mod
                                 if hasattr(main_mod, "forward_clients_pool") and cl in main_mod.forward_clients_pool:
                                     main_mod.forward_clients_pool.remove(cl)
-                                try:
-                                    if cl.is_connected():
-                                        await cl.log_out()
-                                    else:
-                                        await cl.connect()
-                                        await cl.log_out()
-                                except Exception:
-                                    try:
-                                        await cl.disconnect()
-                                    except Exception:
-                                        pass
+                                await cl.disconnect()
                     except Exception:
                         pass
-                if s_name:
-                    session_file = f"{s_name}.session"
-                    if os.path.exists(session_file):
-                        try:
-                            os.remove(session_file)
-                        except Exception:
-                            pass
                 await db.run_async(db.delete_forward_account, aid)
-                await event.answer("🗑️ Forwarder account removed and logged out.")
+                await event.answer("🗑️ Forwarder account removed.")
             text, buttons = await _forwarders_menu_payload()
             await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
             return
@@ -4558,7 +3929,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 pass
             return
 
-        if data_str in ("supadd", "src:add") or canonical_str == "src:add":
+        if data_str == "supadd":
             _wizard_state[ADMIN_USER_ID] = {"step": "add"}
             await _message_delete_send(
                 event,
@@ -4568,7 +3939,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
 
-        if data_str in ("destadd", "grp:add") or canonical_str == "grp:add":
+        if data_str == "destadd":
             _wizard_state[ADMIN_USER_ID] = {"step": "adddest"}
             await _message_delete_send(
                 event,
@@ -4578,7 +3949,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             )
             return
 
-        if data_str in ("mainchan:view", "dlv:main") or canonical_str == "dlv:main":
+        if data_str == "mainchan:view":
             current = get_dest_channel()
             text = texts.MAIN_CHANNEL_CARD.format(current=current or "(None)")
             buttons = [
@@ -4588,7 +3959,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             await _message_delete_send(event, text, buttons=buttons, parse_mode="markdown")
             return
 
-        if data_str in ("mainchan:edit", "dlv:mainedit") or canonical_str == "dlv:mainedit":
+        if data_str == "mainchan:edit":
             _wizard_state[ADMIN_USER_ID] = {"step": "set_main_channel"}
             text = texts.MAIN_CHANNEL_PROMPT
             buttons = [[Button.inline(texts.BTN_CANCEL, data="wiz:cancel")]]
@@ -4596,7 +3967,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         # ---- Previews / listing actions ------------------------------------
-        preview_match = re.match(r"^preview:(\d+)$", data_str) or re.match(r"^(?:rev:card|post:v):(\d+)", canonical_str)
+        preview_match = re.match(r"^preview:(\d+)$", data_str)
         if preview_match:
             listing = db.get_listing_by_id(int(preview_match.group(1)))
             if not listing:
@@ -4637,7 +4008,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 pass
             return
 
-        edit_match = re.match(r"^edit:(\d+)$", data_str) or re.match(r"^rev:edit:(\d+)$", canonical_str)
+        edit_match = re.match(r"^edit:(\d+)$", data_str)
         if edit_match:
             listing = db.get_listing_by_id(int(edit_match.group(1)))
             if not listing:
@@ -4672,32 +4043,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         sold_match = re.match(r"^sold:(\d+)$", data_str)
         if sold_match:
             lid = int(sold_match.group(1))
-            await _prompt_sold_confirm(event, listing_id=lid)
-            return
-
-        sold_y_match = re.match(r"^sold_y:(\d+)$", data_str)
-        if sold_y_match:
-            lid = int(sold_y_match.group(1))
             await _execute_sold(event, listing_id=lid)
-            return
-
-        sold_cancel_match = re.match(r"^sold_cancel:(\d+)$", data_str)
-        if sold_cancel_match:
-            lid = int(sold_cancel_match.group(1))
-            await event.answer("Mark sold cancelled.")
-            listing = db.get_listing_by_id(lid)
-            if listing and listing.get("post_number"):
-                lines, buttons = _post_card(listing)
-                await _message_delete_send(event, lines, buttons=buttons, parse_mode="markdown")
-            else:
-                await _message_delete_send(event, texts.CANCELLED, buttons=_home_keyboard())
             return
 
         if data_str.startswith("sold_info:"):
             await event.answer("This post is already marked as SOLD.", alert=True)
             return
 
-        if data_str in ("skip_all_pending", "rev:skall") or canonical_str == "rev:skall":
+        if data_str == "skip_all_pending":
             count = db.count_pending_listings()
             if count == 0:
                 await event.answer(texts.NO_PENDING, alert=True)
@@ -4728,7 +4081,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 )
             return
 
-        if data_str in ("confirm_skip_all_pending", "rev:skally") or canonical_str == "rev:skally":
+        if data_str == "confirm_skip_all_pending":
             skipped_count = await db.run_async(
                 db.skip_all_pending_listings, actor_id=event.sender_id
             )
@@ -4755,18 +4108,17 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 )
             return
 
-        if data_str in ("cancel_skip_all", "rev:cancelskall") or canonical_str == "rev:cancelskall":
+        if data_str == "cancel_skip_all":
             await event.answer(texts.CANCELLED)
             await _send_pending_page(event, bot)
             return
 
-        match = re.match(r"^(approve|skip):(\d+)$", data_str) or re.match(r"^rev:(ok|skip):(\d+)$", canonical_str)
+        match = re.match(r"^(approve|skip):(\d+)$", data_str)
         if not match:
             await event.answer(texts.UNKNOWN_ACTION, alert=True)
             return
 
-        raw_action, listing_id_str = match.groups()
-        action = "approve" if raw_action in ("approve", "ok") else "skip"
+        action, listing_id_str = match.groups()
         listing_id = int(listing_id_str)
         listing = db.get_listing_by_id(listing_id)
 
@@ -4864,19 +4216,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 post_number=post_number,
                 source_text=listing.get("raw_text"),
             )
-
-            if is_flag_enabled(UI_V2_SINGLE_PUBLISH):
-                await db.run_async(db.update_listing_status, listing_id, "approved")
-                notify_approved()
-                await db.run_async(
-                    db.record_audit,
-                    "approved",
-                    listing_id,
-                    actor_id=event.sender_id,
-                    detail="queued for worker publish",
-                )
-                await _advance_review(bot)
-                return
 
             if user_client_ref and user_client_ref.is_connected() and DEST_CHANNEL:
                 # DEDUP-RECHECK: last line of defence before an external send.
@@ -5086,13 +4425,6 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await _advance_review(bot)
                 return
 
-        # Stale / outdated callback handler (R-19, R-27)
-        logger.warning("Unhandled or outdated callback received: %s", data_str)
-        try:
-            await event.answer("⚠️ That button is outdated.", alert=False)
-        except Exception:
-            pass
-
     @bot.on(events.NewMessage())
     async def handle_header_capture(event):
         """Capture the admin's custom emoji as a new header.
@@ -5224,44 +4556,14 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         # allowlist must already be covering it.
         if text in ("📊 Status", "⏳ Pending", "📋 Sources", DESTINATIONS_BTN,
                     "⏸ All Stop", "▶ All Start", "❓ Help", "✅ Published",
-                    "💤 I'm Asleep", "☀️ I'm Awake", HEADERS_BTN,
-                    "⏸ Pause auto-publish", "▶ Resume auto-publish",
-                    "💤 Turn away mode on", "☀️ Turn away mode off",
-                    "🏠 Home", "⏳ Review", "✅ Posts"):
-            await cancel_wizard(ADMIN_USER_ID)
+                    "💤 I'm Asleep", "☀️ I'm Awake", HEADERS_BTN):
+            _wizard_state.pop(ADMIN_USER_ID, None)
             return
 
         if not state:
             return
-
-        # Check wizard TTL (R-02: 10 minutes)
-        created_at = state.get("created_at")
-        if created_at and (time.time() - float(created_at) > _WIZARD_TTL_SECONDS):
-            await cancel_wizard(ADMIN_USER_ID)
-            await event.reply(
-                "⏳ **Session Expired**\n\nYour previous action timed out after 10 minutes of inactivity.",
-                buttons=_home_keyboard(),
-                parse_mode="markdown",
-            )
-            return
-
         prompt_message_id = state.get("prompt_message_id")
         _wizard_state.pop(ADMIN_USER_ID, None)
-
-        if state["step"] == "edit_v2":
-            lid = state.get("listing_id")
-            clean_draft = text.strip()
-            if lid and clean_draft:
-                await db.run_async(db.set_listing_draft, lid, clean_draft)
-                try:
-                    await event.delete()
-                except Exception:
-                    pass
-                listing = db.get_listing_by_id(lid)
-                total_pending = db.count_pending_listings()
-                payload = render_review_card(listing, page_idx=0, total_count=max(1, total_pending))
-                await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
-            return
 
         if state["step"] == "add":
             await _run_add_supplier_flow(event, text)
@@ -5273,12 +4575,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             import services.forwarders_manager as fwd_mgr
             inv_hash = fwd_mgr.parse_invite_hash(text)
             if not inv_hash:
-                set_wizard_state(ADMIN_USER_ID, {"step": "dest_set_link", "dest_id": did, "dest_name": dest_name})
                 await event.reply(
                     f"⚠️ **Invalid invite link format**.\n\n"
                     f"Please provide a valid Telegram invite link like `https://t.me/+AbCdEf` or `https://t.me/joinchat/...`.\n"
-                    f"Or tap Cancel below to exit.",
-                    buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
+                    f"Or tap /destinations to exit.",
                     parse_mode="markdown",
                 )
                 return
@@ -5337,10 +4637,10 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                     f"❌ {msg}\n\nEnter phone number (+1234567890):",
                     buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
                 )
-                set_wizard_state(ADMIN_USER_ID, {"step": "add_fwd_phone"})
+                _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_phone"}
                 return
 
-            set_wizard_state(ADMIN_USER_ID, {"step": "add_fwd_code"})
+            _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
             if msg == "APP":
                 dest_text = "📲 Telegram sent a verification code to your **Telegram app** (look in the chat from official 'Telegram')."
             elif msg == "SMS":
@@ -5359,28 +4659,17 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         if state["step"] == "add_fwd_code":
-            try:
-                await event.delete()
-            except Exception:
-                pass
             import services.forwarders_manager as fwd_mgr
             wait_msg = await event.reply("Verifying...")
             ok, status, client = await fwd_mgr.submit_login_code(ADMIN_USER_ID, text)
             if status == "2FA_REQUIRED":
-                set_wizard_state(ADMIN_USER_ID, {"step": "add_fwd_password"})
+                _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_password"}
                 await wait_msg.edit(
                     "Enter 2FA password:",
                     buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
                 )
                 return
             if not ok:
-                if "No login in progress" in str(status):
-                    await cancel_wizard(ADMIN_USER_ID)
-                    await wait_msg.edit(
-                        "⚠️ **Login session expired.** The login process was interrupted or restarted. Please start again from the forwarders menu.",
-                        buttons=_home_keyboard(),
-                    )
-                    return
                 await wait_msg.edit(
                     f"❌ {status}\n\nEnter code sent to Telegram:",
                     buttons=[
@@ -5388,7 +4677,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                         [Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")],
                     ],
                 )
-                set_wizard_state(ADMIN_USER_ID, {"step": "add_fwd_code"})
+                _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_code"}
                 return
 
             acct_data = await fwd_mgr.save_and_activate_account(ADMIN_USER_ID)
@@ -5414,26 +4703,15 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         if state["step"] == "add_fwd_password":
-            try:
-                await event.delete()
-            except Exception:
-                pass
             import services.forwarders_manager as fwd_mgr
             wait_msg = await event.reply("Verifying...")
             ok, status, client = await fwd_mgr.submit_login_2fa(ADMIN_USER_ID, text)
             if not ok:
-                if "No login in progress" in str(status):
-                    await cancel_wizard(ADMIN_USER_ID)
-                    await wait_msg.edit(
-                        "⚠️ **Login session expired.** The login process was interrupted or restarted. Please start again from the forwarders menu.",
-                        buttons=_home_keyboard(),
-                    )
-                    return
                 await wait_msg.edit(
                     f"❌ {status}\n\nEnter 2FA password:",
                     buttons=[[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]],
                 )
-                set_wizard_state(ADMIN_USER_ID, {"step": "add_fwd_password"})
+                _wizard_state[ADMIN_USER_ID] = {"step": "add_fwd_password"}
                 return
 
             acct_data = await fwd_mgr.save_and_activate_account(ADMIN_USER_ID)
