@@ -698,48 +698,25 @@ async def auto_join_destinations_for_client(
     if bot_client and admin_user_id:
         if stopped_early:
             summary_text = (
-                f"⏸️ **Auto-Join Paused for {acct_label}**\n\n"
-                f"• 🟢 Joined: **{results['joined']}**\n"
-                f"• ℹ️ Already Member: **{results['already_member']}**\n"
-                f"• 🔴 Failed / Private: **{results['failed']}**\n"
-                f"• ⏳ Processed {results['joined'] + results['already_member'] + results['failed']} of {total} groups."
+                f"⏸️ **Auto-Join Paused**: {acct_label}\n"
+                f"🟢 Joined: **{results['joined']}** · ℹ️ Member: **{results['already_member']}** · 🔴 Failed: **{results['failed']}** (of {total})"
             )
         else:
             summary_text = (
-                f"✅ **Auto-Join Complete for {acct_label}**\n\n"
-                f"• 🟢 Joined: **{results['joined']}**\n"
-                f"• ℹ️ Already Member: **{results['already_member']}**\n"
-                f"• 🔴 Failed / Private: **{results['failed']}**\n"
-                f"• 📊 Total Verified: **{total}** groups"
+                f"✅ **Auto-Join Complete**: {acct_label}\n"
+                f"🟢 Joined: **{results['joined']}** · ℹ️ Member: **{results['already_member']}** · 🔴 Private: **{results['failed']}** (of {total})"
             )
 
         if results["failed"] > 0 and results["details"]:
-            failed_lines = []
-            for title, reason in results["details"]:
-                if reason in ("joined", "already_member"):
-                    continue
-                if reason == "private_group_no_invite" or "private_invite_error" in reason or "unresolvable_id" in reason:
-                    desc = "Private group (requires invite link or manual add)"
-                elif reason == "channels_too_much":
-                    desc = "Account in too many groups (Telegram limit)"
-                elif "floodwait" in reason:
-                    desc = "Telegram rate limit"
-                elif "invite_expired" in reason or reason == "invalid_invite_link":
-                    desc = "Invite link expired / invalid"
-                else:
-                    clean_r = str(reason).split(" (caused by")[0].replace("_", " ").title()[:60]
-                    desc = clean_r
-                failed_lines.append(f"• **{title}**: _{desc}_")
-
-            if failed_lines:
-                summary_text += "\n\n📋 **Failed Destinations:**\n" + "\n".join(failed_lines[:15])
-                if len(failed_lines) > 15:
-                    summary_text += f"\n_...and {len(failed_lines) - 15} more_"
+            failed_titles = [t for t, r in results["details"] if r not in ("joined", "already_member")]
+            if failed_titles:
+                summary_text += "\n\n📋 **Failed Destinations:**\n" + ", ".join(f"• **{t}**" for t in failed_titles[:8])
+                if len(failed_titles) > 8:
+                    summary_text += f" (+{len(failed_titles) - 8} more)"
 
             summary_text += (
                 f"\n\n💡 **To connect private groups:**\n"
-                f"1. Open the group in Telegram and add {acct_label} as a member, OR\n"
-                f"2. Add the destination in **Destinations** using its invite link (`https://t.me/+...`)."
+                f"Add {acct_label} in Telegram or set invite link in Destinations."
             )
 
         try:
