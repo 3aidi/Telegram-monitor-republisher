@@ -9257,6 +9257,88 @@ class TestJoinedDestinationGroupMultiAccount(unittest.TestCase):
         asyncio.run(_run())
 
 
+class TestUnifiedNetworkHub(unittest.TestCase):
+    def setUp(self):
+        self._test_db = os.path.join(tempfile.gettempdir(), f"test_net_hub_{os.getpid()}_{id(self)}.db")
+        if os.path.exists(self._test_db):
+            os.remove(self._test_db)
+        db.init_db(self._test_db)
+        self._old_db = db.DEFAULT_DB_PATH
+        db.DEFAULT_DB_PATH = self._test_db
+
+    def tearDown(self):
+        db.DEFAULT_DB_PATH = self._old_db
+        if os.path.exists(self._test_db):
+            try:
+                os.remove(self._test_db)
+            except OSError:
+                pass
+
+    def test_network_hub_payload_and_buttons(self):
+        """Unified Network Hub renders Sources, Destinations, and Forwarders cleanly."""
+        import admin_bot
+        db.add_supplier("@crypto_src", db_path=self._test_db)
+        db.add_destination("-1001234567890", title="OTC Group", db_path=self._test_db)
+        db.add_forward_account("sess_fwd", phone="+123456", username="fwd_bot", db_path=self._test_db)
+
+        text, buttons = asyncio.run(admin_bot._network_hub_payload())
+        self.assertIn("Network Matrix", text)
+        self.assertIn("Sources", text)
+        self.assertIn("Destinations", text)
+        self.assertIn("Forwarder Pool", text)
+        self.assertIn("@crypto_src", text)
+        self.assertIn("@fwd_bot", text)
+
+        # 4 rows of 2-column buttons
+        self.assertEqual(len(buttons), 4)
+        flat_callbacks = [b.data.decode() for row in buttons for b in row]
+        self.assertIn("menu:sources", flat_callbacks)
+        self.assertIn("supadd", flat_callbacks)
+        self.assertIn("menu:destinations", flat_callbacks)
+        self.assertIn("destadd", flat_callbacks)
+        self.assertIn("forwarders:view", flat_callbacks)
+        self.assertIn("fwdadd:start", flat_callbacks)
+        self.assertIn("fwdjoin:all", flat_callbacks)
+        self.assertIn("menu:home", flat_callbacks)
+
+    def test_home_inline_keyboard_includes_network_hub(self):
+        """Home menu inline keyboard offers direct tap to Network Matrix."""
+        import admin_bot
+        flat_callbacks = [b.data.decode() for row in admin_bot._home_inline_keyboard() for b in row]
+        self.assertIn("menu:network", flat_callbacks)
+
+    def test_network_callback_and_command_routed(self):
+        """menu:network callback query and /network command are registered."""
+        import admin_bot
+        from telethon import events
+
+        class FakeTelethonBot:
+            def __init__(self):
+                self.handlers = []
+            def on(self, filt):
+                def deco(fn):
+                    self.handlers.append((filt, fn))
+                    return fn
+                return deco
+            def add_event_handler(self, fn, event_type=None):
+                self.handlers.append((event_type, fn))
+            def is_connected(self):
+                return True
+
+        fake_b = FakeTelethonBot()
+        admin_bot.setup_admin_handlers(fake_b)
+
+        # Check /network regex matches
+        found_cmd = False
+        for filt, fn in fake_b.handlers:
+            if isinstance(filt, events.NewMessage):
+                pat = getattr(filt, "pattern", None)
+                if pat and callable(pat) and (pat("/network") or pat("/net")):
+                    found_cmd = True
+                    break
+        self.assertTrue(found_cmd, "/network command must be handled")
+
+
 if __name__ == "__main__":
     unittest.main()
 
