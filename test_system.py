@@ -3655,7 +3655,7 @@ class TestDestinationsForwarding(unittest.TestCase):
                          "a private destination must not be given a t.me link")
         cbs = [b.data.decode() for r in out["buttons"] for b in r
                if getattr(b, "data", None) is not None]
-        self.assertEqual(cbs, ["desttoggle:7", "destdel:7", "menu:destinations"])
+        self.assertEqual(cbs, ["desttoggle:7", "destdel:7", "destlink:7", "menu:destinations"])
         self.assertEqual(out["buttons"][0][0].text, "Resume")
 
     def test_destination_health_report_links_usernames_not_numeric_ids(self):
@@ -9087,6 +9087,174 @@ class TestJoinedDestinationGroupMultiAccount(unittest.TestCase):
         row2 = db.get_listing_by_id(lid2, db_path=self._test_db)
         self.assertNotEqual(row2["status"], "published")
         self.assertIsNone(row2["published_message_id"])
+
+    def test_auto_join_discovers_invite_link_from_full_channel(self):
+        """When user_client is not admin, auto-join checks GetFullChannelRequest for invite link or bio."""
+        import asyncio
+        import types
+        import services.forwarders_manager as fwd_mgr
+        from telethon.tl.types import Channel
+        from telethon.tl.functions.channels import GetFullChannelRequest
+        from telethon.tl.functions.messages import ImportChatInviteRequest
+
+        did = db.add_destination(
+            "-1006677889900", "Discovered Bio Group", active=True,
+            db_path=self._test_db,
+        )
+
+        class FakeUserClient:
+            def __init__(self):
+                self.calls = []
+            def is_connected(self):
+                return True
+            async def get_dialogs(self, limit=250):
+                return []
+            async def get_entity(self, peer):
+                return types.SimpleNamespace(id=peer, username=None)
+            async def get_input_entity(self, user):
+                return None
+            async def __call__(self, request):
+                self.calls.append(request)
+                if isinstance(request, GetFullChannelRequest):
+                    full_chat = types.SimpleNamespace(
+                        exported_invite=None,
+                        about="Official trading group. Join our channel or backup: https://t.me/+BioDiscoveredHash999",
+                    )
+                    return types.SimpleNamespace(full_chat=full_chat)
+                raise Exception("admin required")
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+            def is_connected(self):
+                return True
+            async def get_me(self):
+                class FakeMe:
+                    username = "accept_Escrow"
+                    phone = "+1234567890"
+                return FakeMe()
+            async def get_dialogs(self, limit=250):
+                return []
+            async def get_entity(self, peer):
+                raise ValueError("cannot resolve entity")
+            async def __call__(self, request):
+                self.calls.append(request)
+                return True
+
+        cl = FakeClient()
+        user_cl = FakeUserClient()
+        res = asyncio.run(fwd_mgr.auto_join_destinations_for_client(cl, user_client=user_cl, delay_seconds=0))
+        self.assertEqual(res["joined"], 1)
+        self.assertTrue(any(isinstance(c, ImportChatInviteRequest) and c.hash == "BioDiscoveredHash999" for c in cl.calls))
+
+        # Check DB was updated with the discovered invite link
+        dests = db.list_destinations(db_path=self._test_db)
+        target_d = next((d for d in dests if d["id"] == did), None)
+        self.assertIsNotNone(target_d)
+        self.assertIn("BioDiscoveredHash999", target_d.get("invite_link") or "")
+
+    def test_admin_bot_destlink_and_set_invite_link_flow(self):
+        """Admin can tap [Set Invite Link], provide invite link, and forwarders auto-join."""
+        import asyncio
+        import types
+        import admin_bot
+        from telethon.tl.functions.messages import ImportChatInviteRequest
+
+        did = db.add_destination(
+            "-1001199228833", "VIP OTC Zone", active=True,
+            db_path=self._test_db,
+        )
+
+        class FakeForwardClient:
+            def __init__(self):
+                self.calls = []
+            def is_connected(self):
+                return True
+            async def get_me(self):
+                class FakeMe:
+                    username = "accept_Escrow"
+                    phone = "+1234567890"
+                return FakeMe()
+            async def __call__(self, request):
+                self.calls.append(request)
+                return True
+
+        fwd_client = FakeForwardClient()
+        admin_bot.set_forward_clients([fwd_client])
+
+        class FakeEvent:
+            def __init__(self, data_str=None, text=None):
+                self.data = data_str.encode() if data_str else b""
+                self.text = text or ""
+                self.answered = []
+                self.replies = []
+                self.client = self
+                self.message = self
+            async def answer(self, text=None, alert=False):
+                self.answered.append(text)
+            async def reply(self, text, buttons=None, parse_mode=None):
+                self.replies.append({"text": text, "buttons": buttons})
+                return self
+            async def edit(self, text, buttons=None, parse_mode=None):
+                self.replies.append({"text": text, "buttons": buttons})
+            async def send_message(self, *args, **kwargs):
+                pass
+            async def delete(self):
+                pass
+
+        async def _run():
+            old_admin = admin_bot.ADMIN_USER_ID
+            admin_bot.ADMIN_USER_ID = 999999
+
+            class FakeTelethonBot:
+                def __init__(self):
+                    self.handlers = []
+                def on(self, filt):
+                    def deco(fn):
+                        self.handlers.append((filt, fn))
+                        return fn
+                    return deco
+                def add_event_handler(self, fn, event_type=None):
+                    self.handlers.append((event_type, fn))
+                def is_connected(self):
+                    return True
+
+            fake_b = FakeTelethonBot()
+            admin_bot.setup_admin_handlers(fake_b)
+            cb_handler = next(fn for _, fn in fake_b.handlers if getattr(fn, "__name__", "") == "handle_callback")
+            msg_handler = next(fn for _, fn in fake_b.handlers if getattr(fn, "__name__", "") == "handle_wizard_input")
+
+            try:
+                # 1. Trigger destlink callback
+                cb_event = FakeEvent(data_str=f"destlink:{did}")
+                cb_event.sender_id = 999999
+                await cb_handler(cb_event)
+                state = admin_bot._wizard_state.get(999999)
+                self.assertIsNotNone(state)
+                self.assertEqual(state.get("step"), "dest_set_link")
+                self.assertEqual(state.get("dest_id"), did)
+
+                # 2. Provide invite link message
+                msg_event = FakeEvent(text="https://t.me/+SecretZoneJoinHash456")
+                msg_event.sender_id = 999999
+                await msg_handler(msg_event)
+
+                # Wizard state cleared
+                self.assertNotIn(999999, admin_bot._wizard_state)
+
+                # Forwarder client called ImportChatInviteRequest
+                self.assertTrue(any(isinstance(c, ImportChatInviteRequest) and c.hash == "SecretZoneJoinHash456" for c in fwd_client.calls))
+
+                # DB updated
+                dests = db.list_destinations(db_path=self._test_db)
+                d_row = next((d for d in dests if d["id"] == did), None)
+                self.assertIsNotNone(d_row)
+                self.assertEqual(d_row.get("invite_link"), "https://t.me/+SecretZoneJoinHash456")
+            finally:
+                admin_bot.ADMIN_USER_ID = old_admin
+                admin_bot.set_forward_clients([])
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

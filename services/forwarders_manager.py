@@ -367,6 +367,7 @@ async def auto_join_destinations_for_client(
     delay_seconds: float = 12.0,
     status_message: Optional[Any] = None,
     user_client: Optional[TelegramClient] = None,
+    destinations: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Auto-join a forwarder client to all active destination groups in the database.
     
@@ -387,7 +388,10 @@ async def auto_join_destinations_for_client(
     except Exception:
         acct_label = "forwarder"
 
-    dest_rows = await db.run_async(db.list_destinations, active_only=True)
+    if destinations is not None:
+        dest_rows = destinations
+    else:
+        dest_rows = await db.run_async(db.list_destinations, active_only=True)
     if not dest_rows:
         logger.info("No active destinations found to auto-join for %s", acct_label)
         return results
@@ -407,6 +411,13 @@ async def auto_join_destinations_for_client(
                     joined_refs.add(f"@{uname.lower()}")
     except Exception as exc:
         logger.debug("Could not pre-warm dialogs for auto-join: %s", exc)
+
+    # Pre-warm dialogs for user_client too so it has access_hashes for private destination groups
+    if user_client and hasattr(user_client, "is_connected") and user_client.is_connected():
+        try:
+            await user_client.get_dialogs(limit=250)
+        except Exception as exc:
+            logger.debug("Could not pre-warm dialogs for user_client: %s", exc)
 
     total = len(dest_rows)
     logger.info("Starting auto-join to %s destinations for %s", total, acct_label)
@@ -518,9 +529,18 @@ async def auto_join_destinations_for_client(
                             # If private, user_client invites/adds client directly:
                             if not success:
                                 client_me = await client.get_me()
+                                target_user = None
+                                if getattr(client_me, "username", None):
+                                    try:
+                                        target_user = await user_client.get_input_entity(f"@{client_me.username}")
+                                    except Exception:
+                                        target_user = None
+                                if not target_user:
+                                    target_user = client_me
+
                                 # Try channel/supergroup direct invite
                                 try:
-                                    await user_client(InviteToChannelRequest(channel=main_ent, users=[client_me]))
+                                    await user_client(InviteToChannelRequest(channel=main_ent, users=[target_user]))
                                     success = True
                                     logger.info("Directly added %s to channel %s via user_client", acct_label, title)
                                 except UserAlreadyParticipantError:
@@ -534,7 +554,7 @@ async def auto_join_destinations_for_client(
                                 if not success:
                                     try:
                                         chat_id_int = abs(peer) if peer < 0 else peer
-                                        await user_client(AddChatUserRequest(chat_id=chat_id_int, user_id=client_me, fwd_limit=0))
+                                        await user_client(AddChatUserRequest(chat_id=chat_id_int, user_id=target_user, fwd_limit=0))
                                         success = True
                                         logger.info("Directly added %s to chat %s via user_client", acct_label, title)
                                     except UserAlreadyParticipantError:
@@ -560,6 +580,44 @@ async def auto_join_destinations_for_client(
                                                     pass
                                     except Exception as exp_err:
                                         logger.debug("ExportChatInviteRequest failed for %s: %s", title, exp_err)
+
+                                # Try inspecting channel/chat info for existing invite link or bio
+                                if not success:
+                                    try:
+                                        from telethon.tl.types import Channel
+                                        if isinstance(main_ent, Channel) or (peer is not None and peer < -1000000000000):
+                                            from telethon.tl.functions.channels import GetFullChannelRequest
+                                            full_info = await user_client(GetFullChannelRequest(main_ent))
+                                        else:
+                                            from telethon.tl.functions.messages import GetFullChatRequest
+                                            chat_id_int = abs(peer) if peer < 0 else peer
+                                            full_info = await user_client(GetFullChatRequest(chat_id_int))
+                                        full_chat = getattr(full_info, "full_chat", None)
+                                        found_link = None
+                                        if full_chat:
+                                            exp = getattr(full_chat, "exported_invite", None)
+                                            if exp and getattr(exp, "link", None):
+                                                found_link = exp.link
+                                            elif getattr(full_chat, "about", None):
+                                                m_bio = re.search(r"https?://(?:t\.me/\+|t\.me/joinchat/)[\w-]+", full_chat.about)
+                                                if m_bio:
+                                                    found_link = m_bio.group(0)
+                                        if found_link:
+                                            found_hash = parse_invite_hash(found_link)
+                                            if found_hash:
+                                                await client(ImportChatInviteRequest(found_hash))
+                                                success = True
+                                                try:
+                                                    await db.run_async(db.set_destination_invite_link, d["id"], found_link)
+                                                except Exception:
+                                                    pass
+                                                logger.info("Auto-joined %s via discovered invite link in group info", title)
+                                    except UserAlreadyParticipantError:
+                                        results["already_member"] += 1
+                                        results["details"].append((title, "already_member"))
+                                        continue
+                                    except Exception as full_err:
+                                        logger.debug("GetFullChannel/ChatRequest inspection failed for %s: %s", title, full_err)
 
                         except Exception as ent_lookup_err:
                             logger.debug("user_client failed resolving peer %s for %s: %s", peer, title, ent_lookup_err)

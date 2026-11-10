@@ -1595,11 +1595,20 @@ async def _edit_destination_menu(event, d: dict) -> None:
         health_lines += texts.DEST_HEALTH_LAST_ERR.format(reason=reason)
     id_line = _destination_id_line(d.get("chat_id"))
     open_chat = _destination_open_button(d.get("chat_id"))
+    inv_link = d.get("invite_link")
+    is_numeric = str(d.get("chat_id") or "").lstrip("-").isdigit()
     rows = []
     if open_chat is not None:
         rows.append([open_chat])
     rows.append([Button.inline(toggle_label, data=f"desttoggle:{did}")])
     rows.append([Button.inline(texts.BTN_DELETE_PERM, data=f"destdel:{did}")])
+    if inv_link:
+        rows.append([
+            Button.inline("🔗 Update Link", data=f"destlink:{did}"),
+            Button.inline("🚀 Sync Accounts", data=f"destjoin:{did}"),
+        ])
+    elif is_numeric:
+        rows.append([Button.inline("🔗 Set Invite Link", data=f"destlink:{did}")])
     rows.append([Button.inline(texts.BTN_BACK, data="menu:destinations")])
     header = texts.DEST_HEADER.format(
         icon=icon,
@@ -1608,6 +1617,10 @@ async def _edit_destination_menu(event, d: dict) -> None:
     )
     if id_line:
         header += f"\n{id_line}"
+    if inv_link:
+        header += f"\nInvite Link: `{inv_link}`"
+    elif str(d.get("chat_id") or "").lstrip("-").isdigit():
+        header += "\nInvite Link: _None (Private group)_"
     await _message_delete_send(
         event,
         texts.DEST_DETAIL_CARD.format(header=header, health=health_lines),
@@ -1756,6 +1769,62 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             buttons=_home_keyboard(),
         )
         return
+
+    from services.forwarders_manager import parse_invite_hash
+    inv_hash = parse_invite_hash(raw_text)
+    if inv_hash:
+        from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+        from telethon.tl.types import ChatInvite, ChatInviteAlready
+        from telethon.errors import UserAlreadyParticipantError
+        resolved_title = None
+        resolved_peer = None
+        clients_to_check = ([user_client_ref] if user_client_ref else []) + list(forward_clients_ref)
+        for cl in clients_to_check:
+            if cl and hasattr(cl, "is_connected") and cl.is_connected():
+                try:
+                    res = await cl(CheckChatInviteRequest(inv_hash))
+                    if isinstance(res, ChatInviteAlready):
+                        resolved_peer = db.normalize_channel_id(res.chat)
+                        resolved_title = getattr(res.chat, "title", "Private Group")
+                        break
+                    elif isinstance(res, ChatInvite):
+                        resolved_title = getattr(res, "title", "Private Group")
+                        try:
+                            upd = await cl(ImportChatInviteRequest(inv_hash))
+                            if getattr(upd, "chats", None):
+                                resolved_peer = db.normalize_channel_id(upd.chats[0])
+                                resolved_title = getattr(upd.chats[0], "title", resolved_title)
+                                break
+                        except UserAlreadyParticipantError:
+                            pass
+                        except Exception:
+                            pass
+                except UserAlreadyParticipantError:
+                    pass
+                except Exception:
+                    pass
+
+        if resolved_peer is not None:
+            await db.run_async(db.add_destination, resolved_peer, resolved_title, True, raw_text)
+            await db.run_async(
+                db.record_audit,
+                "destination_added",
+                None,
+                actor_id=ADMIN_USER_ID,
+                detail=f"{raw_text} -> {resolved_title} ({resolved_peer})",
+            )
+            for fc in forward_clients_ref:
+                if fc and hasattr(fc, "is_connected") and fc.is_connected():
+                    try:
+                        await fc(ImportChatInviteRequest(inv_hash))
+                    except Exception:
+                        pass
+            await event.reply(
+                f"✅ **Destination Added:** {resolved_title}\nID: `{resolved_peer}`\nInvite Link: `{raw_text}`",
+                buttons=_home_keyboard(),
+                parse_mode="markdown",
+            )
+            return
 
     reference = int(numeric) if numeric is not None else (username or raw_text)
     entity = await _resolve_destination_peer(reference)
@@ -3386,6 +3455,62 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
                 await _edit_destination_menu(event, refreshed)
             return
 
+        destlink_match = re.match(r"^destlink:(\d+)$", data_str)
+        if destlink_match:
+            did = int(destlink_match.group(1))
+            d = db.get_destination_by_id(did)
+            if not d:
+                await event.answer(texts.DEST_NOT_FOUND, alert=True)
+                return
+            label = _destination_label(d)
+            _wizard_state[ADMIN_USER_ID] = {
+                "step": "dest_set_link",
+                "dest_id": did,
+                "dest_name": label,
+            }
+            prompt_text = (
+                f"🔗 **Set Invite Link for {label}**\n\n"
+                f"Send the Telegram invite link for this group:\n"
+                f"Example: `https://t.me/+AbCdEf123` or `https://t.me/joinchat/...`\n\n"
+                f"_💡 Connected forwarders (like @accept_Escrow) will automatically use this link to join._"
+            )
+            buttons = [[Button.inline(texts.BTN_CANCEL_X, data="wiz:cancel")]]
+            await _message_delete_send(event, prompt_text, buttons=buttons, parse_mode="markdown")
+            return
+
+        destjoin_match = re.match(r"^destjoin:(\d+)$", data_str)
+        if destjoin_match:
+            did = int(destjoin_match.group(1))
+            d = db.get_destination_by_id(did)
+            if not d:
+                await event.answer(texts.DEST_NOT_FOUND, alert=True)
+                return
+            label = _destination_label(d)
+            if not forward_clients_ref:
+                await event.answer("No forwarder accounts connected.", alert=True)
+                return
+            await event.answer("🔄 Syncing forwarders for this group...", alert=True)
+            import services.forwarders_manager as fwd_mgr
+            sync_results = []
+            for fc in forward_clients_ref:
+                if fc and hasattr(fc, "is_connected") and fc.is_connected():
+                    res = await fwd_mgr.auto_join_destinations_for_client(
+                        fc,
+                        user_client=user_client_ref,
+                        destinations=[d],
+                    )
+                    me = await fc.get_me()
+                    acct = f"@{me.username}" if getattr(me, "username", None) else (getattr(me, "phone", "") or "forwarder")
+                    if res["joined"] > 0:
+                        sync_results.append(f"• **{acct}**: 🟢 Joined successfully")
+                    elif res["already_member"] > 0:
+                        sync_results.append(f"• **{acct}**: ℹ️ Already a member")
+                    else:
+                        sync_results.append(f"• **{acct}**: 🔴 Failed / Private (needs invite link)")
+            summary = f"📋 **Sync Result for {label}:**\n\n" + "\n".join(sync_results)
+            await event.client.send_message(ADMIN_USER_ID, summary, parse_mode="markdown")
+            return
+
         destdel_match = re.match(r"^destdel:(\d+)$", data_str)
         if destdel_match:
             did = int(destdel_match.group(1))
@@ -4442,6 +4567,63 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
 
         if state["step"] == "add":
             await _run_add_supplier_flow(event, text)
+            return
+
+        if state["step"] == "dest_set_link":
+            did = state.get("dest_id")
+            dest_name = state.get("dest_name", "Destination")
+            import services.forwarders_manager as fwd_mgr
+            inv_hash = fwd_mgr.parse_invite_hash(text)
+            if not inv_hash:
+                await event.reply(
+                    f"⚠️ **Invalid invite link format**.\n\n"
+                    f"Please provide a valid Telegram invite link like `https://t.me/+AbCdEf` or `https://t.me/joinchat/...`.\n"
+                    f"Or tap /destinations to exit.",
+                    parse_mode="markdown",
+                )
+                return
+
+            await db.run_async(db.set_destination_invite_link, did, text.strip())
+            await db.run_async(
+                db.record_audit,
+                "destination_link_updated",
+                None,
+                actor_id=ADMIN_USER_ID,
+                detail=f"id={did} link={text.strip()}",
+            )
+
+            # Auto-join connected forwarders immediately using this link
+            join_report = []
+            for fc in forward_clients_ref:
+                if fc and hasattr(fc, "is_connected") and fc.is_connected():
+                    try:
+                        me = await fc.get_me()
+                        acct_label = f"@{me.username}" if getattr(me, "username", None) else (getattr(me, "phone", "") or "forwarder")
+                        from telethon.tl.functions.messages import ImportChatInviteRequest
+                        from telethon.errors import UserAlreadyParticipantError
+                        try:
+                            await fc(ImportChatInviteRequest(inv_hash))
+                            join_report.append(f"• **{acct_label}**: 🟢 Joined successfully!")
+                        except UserAlreadyParticipantError:
+                            join_report.append(f"• **{acct_label}**: ℹ️ Already a member.")
+                        except Exception as j_err:
+                            join_report.append(f"• **{acct_label}**: 🔴 Could not join ({j_err})")
+                    except Exception:
+                        pass
+
+            report_suffix = ""
+            if join_report:
+                report_suffix = "\n\n**Forwarders Status:**\n" + "\n".join(join_report)
+
+            await event.reply(
+                f"✅ **Invite Link Saved for {dest_name}!**\n\n"
+                f"• Link: `{text.strip()}`"
+                f"{report_suffix}",
+                parse_mode="markdown",
+            )
+            refreshed = db.get_destination_by_id(did, with_health=True)
+            if refreshed:
+                await _edit_destination_menu(event, refreshed)
             return
 
         if state["step"] == "add_fwd_phone":
