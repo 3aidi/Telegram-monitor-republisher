@@ -10,6 +10,7 @@ import db
 
 # Flag names
 UI_V2_RENDERER = "ui_v2_renderer"
+UI_V2_HOME = "ui_v2_home"
 UI_V2_REVIEW = "ui_v2_review"
 UI_V2_POSTS = "ui_v2_posts"
 UI_V2_SOURCES = "ui_v2_sources"
@@ -19,6 +20,7 @@ UI_V2_SINGLE_PUBLISH = "ui_v2_single_publish"
 
 _DEFAULT_FLAGS = {
     UI_V2_RENDERER: False,  # Opt-in for V2 handlers to ensure legacy test suite compatibility
+    UI_V2_HOME: True,
     UI_V2_REVIEW: True,
     UI_V2_POSTS: True,
     UI_V2_SOURCES: True,

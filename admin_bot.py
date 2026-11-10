@@ -27,6 +27,7 @@ from services.renderer import show
 from services.feature_flags import (
     is_flag_enabled,
     UI_V2_RENDERER,
+    UI_V2_HOME,
     UI_V2_REVIEW,
     UI_V2_POSTS,
     UI_V2_SOURCES,
@@ -873,6 +874,9 @@ HEADER_EMOJI_COUNT = 3
 # Keep in sync with the NewMessage handlers: listing a command here that has no
 # handler leaves a dead entry in Telegram's menu.
 BOT_MENU = [
+    ("home", "⚡ Control Center"),
+    ("review", "⏳ Review pending queue"),
+    ("posts", "✅ Published posts"),
     ("status", " Today's stats report"),
     ("pending", "Pending approval listings"),
     ("skipall", "Skip all pending listings"),
@@ -1061,6 +1065,13 @@ def _home_keyboard() -> List[List[object]]:
         [Button.text("✅ Published", resize=True), Button.text(DESTINATIONS_BTN, resize=True)],
         [Button.text("🚫 Skipped", resize=True), Button.text(pause_label, resize=True)],
     ]
+
+
+def _active_reply_keyboard() -> List[List[object]]:
+    """Return active persistent reply keyboard (4-button V2 if enabled, otherwise legacy 6-button)."""
+    if is_flag_enabled(UI_V2_HOME):
+        return get_home_reply_keyboard()
+    return _home_keyboard()
 
 
 def _tgram_chat_link(chat_ref: Optional[str], message_id: Optional[int]) -> Optional[str]:
@@ -2635,17 +2646,40 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return False
         return True
 
-    @bot.on(events.NewMessage(pattern=r"^(?:/start|/help|❓ Help)"))
-    async def handle_start(event):
+    @bot.on(events.NewMessage(pattern=r"^(?:/help|❓ Help)$"))
+    async def handle_help(event):
         if not await check_admin(event):
             return
-        await event.reply(_help_text(), buttons=_home_keyboard())
+        await event.reply(_help_text(), buttons=_active_reply_keyboard())
 
-    @bot.on(events.NewMessage(pattern=r"^(?:/menu|/home|🏠 Home)$"))
+    @bot.on(events.NewMessage(pattern=r"^(?:/start|/menu|/home|🏠 Home)$"))
     async def handle_menu(event):
         if not await check_admin(event):
             return
         payload = render_home_screen()
+        reply_kb = _active_reply_keyboard()
+        raw_cmd = (event.raw_text or "").strip()
+        if raw_cmd in ("/start", "🏠 Home", "/menu", "/home"):
+            await event.reply("⚡ **Control Center Online**", buttons=reply_kb, parse_mode="markdown")
+        await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
+
+    @bot.on(events.NewMessage(pattern=r"^(?:/review|⏳ Review)$"))
+    async def handle_review_command(event):
+        if not await check_admin(event):
+            return
+        listings = db.get_pending_listings(limit=10, offset=0)
+        total_pending = db.count_pending_listings()
+        if not listings or total_pending == 0:
+            payload = render_review_empty_state()
+        else:
+            payload = render_review_card(listings[0], page_idx=0, total_count=total_pending)
+        await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, formatting_entities=payload.formatting_entities, admin_id=ADMIN_USER_ID)
+
+    @bot.on(events.NewMessage(pattern=r"^(?:/posts|✅ Posts)$"))
+    async def handle_posts_command(event):
+        if not await check_admin(event):
+            return
+        payload = render_posts_list(page=0)
         await show(event, payload.text, buttons=payload.buttons, parse_mode=payload.parse_mode, admin_id=ADMIN_USER_ID)
 
     @bot.on(events.NewMessage(pattern=r"^(?:/suppliers|/sources|📋 Sources)"))
@@ -2695,18 +2729,18 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         state_label = texts.PAUSE_ON if not paused else texts.PAUSE_OFF
         await event.reply(
             state_label,
-            buttons=_home_keyboard(),
+            buttons=_active_reply_keyboard(),
             parse_mode="markdown",
         )
 
-    @bot.on(events.NewMessage(pattern=r"^(?:💤 I'm Asleep|☀️ I'm Awake)$"))
+    @bot.on(events.NewMessage(pattern=r"^(?:💤 I'm Asleep|☀️ I'm Awake|💤 Turn away mode on|☀️ Turn away mode off)$"))
     async def handle_asleep_toggle(event):
         if not await check_admin(event):
             return
         asleep = db.is_buyer_asleep()
         await db.run_async(db.set_buyer_asleep, not asleep)
         state_label = texts.ASLEEP_ON if not asleep else texts.ASLEEP_OFF
-        await event.reply(state_label, buttons=_home_keyboard(), parse_mode="markdown")
+        await event.reply(state_label, buttons=_active_reply_keyboard(), parse_mode="markdown")
 
     @bot.on(events.NewMessage(pattern=r"^/addsupplier(?:\s+(.+))?"))
     async def handle_add_supplier(event):
