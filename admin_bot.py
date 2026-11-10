@@ -1234,7 +1234,8 @@ async def _edit_supplier_menu(event, s: dict) -> None:
             id=s['channel_id'] or texts.ID_UNRESOLVED,
         ),
         buttons=[
-            [Button.inline(toggle_label, data=f"suptoggle:{sid}"), Button.inline(texts.BTN_DELETE_PERM, data=f"supdel:{sid}")],
+            [Button.inline(toggle_label, data=f"suptoggle:{sid}")],
+            [Button.inline(texts.BTN_DELETE_PERM, data=f"supdel:{sid}")],
             [Button.inline(texts.BTN_BACK, data="menu:sources")],
         ],
     )
@@ -1568,22 +1569,30 @@ async def _edit_destination_menu(event, d: dict) -> None:
     health_lines = ""
     attempts = int(d.get("attempts") or 0)
     if d.get("is_throttled"):
-        health_lines = f"\nDelivery: ⏳ rate-limited ({d.get('deferred', 0)} queued)"
+        # Rate limiting is the account's problem, not this group's. Say so, so
+        # the admin does not disable a destination that will deliver fine.
+        health_lines = texts.DEST_HEALTH_THROTTLED.format(deferred=d.get('deferred', 0))
     elif attempts:
         if d.get("is_dead"):
-            verdict = "❌ Inactive"
+            verdict = texts.DEST_V_DEAD
         elif d.get("is_flapping"):
-            verdict = f"⚠️ Flapping ({d.get('fail_pct', 0):.0f}% fail)"
+            verdict = texts.DEST_V_FLAPPING.format(pct=d.get('fail_pct', 0))
         elif d.get("fail_pct", 0) >= 25:
-            verdict = f"⚠️ Failing ({d.get('fail_pct', 0):.0f}% fail)"
+            verdict = texts.DEST_V_FAILING.format(pct=d.get('fail_pct', 0))
         else:
-            verdict = "✅ Healthy"
-        health_lines = f"\nDelivery: {verdict} ({d.get('successes', 0)}/{attempts} ok)"
+            verdict = texts.DEST_V_OK
+        health_lines = texts.DEST_HEALTH_ATTEMPTS.format(
+            verdict=verdict,
+            successes=d.get('successes', 0),
+            attempts=attempts,
+        )
+        if d.get("last_success_at"):
+            health_lines += texts.DEST_HEALTH_LAST_OK.format(when=d['last_success_at'][:16].replace('T', ' '))
     else:
-        health_lines = "\nDelivery: 0 attempts"
+        health_lines = texts.DEST_HEALTH_NO_ATTEMPTS
     if d.get("last_error"):
-        reason = str(d["last_error"]).split(" (caused by")[0][:60]
-        health_lines += f"\n⚠️ Error: `{reason}`"
+        reason = str(d["last_error"]).split(" (caused by")[0][:120]
+        health_lines += texts.DEST_HEALTH_LAST_ERR.format(reason=reason)
     id_line = _destination_id_line(d.get("chat_id"))
     open_chat = _destination_open_button(d.get("chat_id"))
     inv_link = d.get("invite_link")
@@ -1647,11 +1656,18 @@ async def _forwarders_menu_payload() -> Tuple[str, List[List[object]]]:
     accounts = await db.run_async(db.list_forward_accounts)
     active_count = sum(1 for a in accounts if a.get("active"))
 
-    header = f"👥 **Forwarder Accounts Pool** ({active_count} Active)\n"
+    header = (
+        f"👥 **Forwarder Accounts Pool** ({active_count} Active)\n"
+        f"{texts.LINE}\n"
+        f"Posts are forwarded to groups with cascading failover:\n"
+        f"• **1st account** forwards\n"
+        f"• If restricted/banned, **2nd account** takes over\n"
+        f"• Stops on success and proceeds to the next group\n\n"
+    )
 
     body_lines = []
     if not accounts:
-        body_lines.append("_No forwarders added yet. Main account is used._")
+        body_lines.append("_No dedicated forwarder accounts added yet._\n_The main listener account is currently used as fallback._")
     else:
         connected_sessions = set()
         for cl in forward_clients_ref:
@@ -1675,14 +1691,14 @@ async def _forwarders_menu_payload() -> Tuple[str, List[List[object]]]:
             if not acct.get("active"):
                 status_icon = "⏸️ Paused"
 
-            body_lines.append(f"**{idx}.** {display}{username_part} · {status_icon}")
+            body_lines.append(f"**{idx}.** {display}{username_part}\n    └ Status: {status_icon}")
 
-    full_text = header + "\n".join(body_lines)
+    full_text = header + "\n\n".join(body_lines) + f"\n\n{texts.LINE}"
 
     buttons: List[List[object]] = [
         [
-            Button.inline("➕ Add Forwarder", data="fwdadd:start"),
-            Button.inline("🔄 Auto-Join Groups", data="fwdjoin:all"),
+            Button.inline("Add Forwarder", data="fwdadd:start"),
+            Button.inline("Auto-Join Groups", data="fwdjoin:all"),
         ]
     ]
 
@@ -1962,42 +1978,34 @@ def _home_button_row() -> List[List[object]]:
 
 def _home_text() -> str:
     paused = db.is_paused()
-    state_badge = "⏸️ **Paused**" if paused else "🟢 **Running**"
-    asleep_badge = "🌙 **Night**" if db.is_buyer_asleep() else "☀️ **Online**"
+    state_badge = "⏸️ **Paused**" if paused else "🟢 **Active**"
+    asleep_badge = "💤 Away" if db.is_buyer_asleep() else "☀️ Online"
     try:
         stats = db.get_today_stats()
         pub = stats.get("published", 0)
         pend = stats.get("pending", 0)
         skip = stats.get("total_skipped", 0)
-        kpi = f"\n`{pub}` published · `{pend}` pending · `{skip}` skipped"
+        kpi = f"\n📊 Today: `{pub}` published · `{pend}` pending · `{skip}` skipped"
     except Exception:
         kpi = ""
-    return f"⚡ **Control Center** · {state_badge} · {asleep_badge}{kpi}"
+    return f"⚡ **Control Center** — {state_badge} | {asleep_badge}{kpi}"
 
 
 def _home_inline_keyboard() -> List[List[object]]:
     """Inline navigation for the Home landing message."""
-    pause_label = "▶ Resume" if db.is_paused() else "⏸ Pause"
-    asleep_label = "☀️ Awake" if db.is_buyer_asleep() else "🌙 Night"
+    pause_label = "Resume" if db.is_paused() else "Pause"
     return [
         [
-            Button.inline("⏳ Pending", data="home:pending"),
-            Button.inline("✅ Published", data="home:published"),
+            Button.inline("Pending", data="home:pending"),
+            Button.inline("Sources", data="menu:sources"),
         ],
         [
-            Button.inline("📥 Destinations", data="menu:destinations"),
-            Button.inline("👥 Forwarders", data="forwarders:view"),
+            Button.inline("Published", data="home:published"),
+            Button.inline("Destinations", data="menu:destinations"),
         ],
         [
-            Button.inline("📋 Sources", data="menu:sources"),
-            Button.inline("🚫 Skipped", data="home:skipped"),
-        ],
-        [
-            Button.inline("📊 Status", data="home:status"),
+            Button.inline("Skipped", data="home:skipped"),
             Button.inline(pause_label, data="home:toggle"),
-        ],
-        [
-            Button.inline(asleep_label, data="home:asleep"),
         ],
     ]
 
@@ -2009,30 +2017,41 @@ def _help_text() -> str:
 def _status_report_text() -> str:
     stats = db.get_today_stats()
 
+    supplier_lines = []
+    for s in stats["supplier_breakdown"]:
+        handle = _pretty_source(s.get("channel_username"), s.get("supplier_display_name"))
+        supplier_lines.append(
+            texts.STATUS_SUPPLIER_LINE.format(
+                name=handle,
+                processed=s['processed'],
+                published=s['published'],
+                skipped=s['skipped'],
+            )
+        )
+    if not supplier_lines:
+        supplier_lines = [texts.STATUS_NONE]
+    supplier_text = "\n\n".join(supplier_lines)
+
+    reason_lines = [texts.STATUS_REASON_LINE.format(reason=r, count=c) for r, c in stats["skip_reasons"].items()]
+    if not reason_lines:
+        reason_lines = [texts.STATUS_NONE]
+    reason_text = "\n\n".join(reason_lines)
+
     curr_dest = get_dest_channel()
-    main_channel_info = f"• Main: `{curr_dest}`\n" if curr_dest else ""
-    paused_tag = "⏸️ Paused" if db.is_paused() else "🟢 Running"
-    asleep_tag = "🌙 Night" if db.is_buyer_asleep() else "☀️ Online"
-
-    top_sups = sorted(stats.get("supplier_breakdown", []), key=lambda x: x.get("processed", 0), reverse=True)[:5]
-    if top_sups:
-        sup_str = "\n".join(f"• `{_pretty_source(s.get('channel_username'), s.get('display_name'))}`: {s.get('published', 0)} pub / {s.get('processed', 0)} total" for s in top_sups)
-    else:
-        sup_str = "• None"
-
-    top_reasons = sorted(stats.get("skip_reasons", {}).items(), key=lambda x: x[1], reverse=True)[:3]
-    if top_reasons:
-        reason_str = ", ".join(f"{r} (`{c}`)" for r, c in top_reasons)
-    else:
-        reason_str = "None"
+    main_channel_info = f"• Main Channel: `{curr_dest}`\n" if curr_dest else ""
 
     msg = (
-        f"📊 **System Telemetry** · {paused_tag} · {asleep_tag}\n"
+        texts.STATUS_HEADER
         + main_channel_info
-        + f"• Suppliers: `{stats['active_suppliers']}` active\n"
-        f"• Today: `{stats['published']}` pub · `{stats['pending']}` pend · `{stats['total_skipped']}` skip (`{stats['total_processed']}` total)\n\n"
-        f"**Top Sources:**\n{sup_str}\n\n"
-        f"**Top Skips:** {reason_str}"
+        + texts.STATUS_TOTALS.format(
+            active=stats['active_suppliers'],
+            processed=stats['total_processed'],
+            published=stats['published'],
+            pending=stats['pending'],
+            skipped=stats['total_skipped'],
+        )
+        + texts.STATUS_BY_SUPPLIER.format(suppliers=supplier_text)
+        + texts.STATUS_BY_REASON.format(reasons=reason_text)
     )
     if db.is_paused():
         msg = texts.STATUS_PAUSED_BANNER + msg
