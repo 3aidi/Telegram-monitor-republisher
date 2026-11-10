@@ -7845,6 +7845,127 @@ class TestHardenTasks(unittest.TestCase):
         asyncio.run(callback_handler(ev))
         self.assertTrue(any("applied" in a["text"].lower() for a in ev.answered))
 
+    def test_auto_join_uses_stored_invite_link(self):
+        """Forwarder auto-join uses stored destination invite_link to join private groups."""
+        import asyncio
+        import services.forwarders_manager as fwd_mgr
+        from telethon.tl.functions.messages import ImportChatInviteRequest
+
+        did = db.add_destination(
+            "-1009988776655", "Private VIP Group", active=True,
+            invite_link="https://t.me/+SecretInviteHash123", db_path=self._test_db,
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+            def is_connected(self):
+                return True
+            async def get_me(self):
+                class FakeMe:
+                    username = "accept_Escrow"
+                    phone = "+1234567890"
+                return FakeMe()
+            async def get_dialogs(self, limit=250):
+                return []
+            async def __call__(self, request):
+                self.calls.append(request)
+                return True
+
+        cl = FakeClient()
+        res = asyncio.run(fwd_mgr.auto_join_destinations_for_client(cl, delay_seconds=0))
+        self.assertEqual(res["joined"], 1)
+        self.assertTrue(any(isinstance(c, ImportChatInviteRequest) and c.hash == "SecretInviteHash123" for c in cl.calls))
+
+    def test_auto_join_direct_invite_fallback(self):
+        """When destination is private numeric ID without invite link, user_client invites forwarder directly."""
+        import asyncio
+        import services.forwarders_manager as fwd_mgr
+        from telethon.tl.functions.channels import InviteToChannelRequest
+
+        did = db.add_destination(
+            "-1001122334455", "Private Supergroup", active=True,
+            db_path=self._test_db,
+        )
+
+        class FakeUserClient:
+            def __init__(self):
+                self.calls = []
+            def is_connected(self):
+                return True
+            async def get_entity(self, peer):
+                class FakeEntity:
+                    id = peer
+                    username = None
+                return FakeEntity()
+            async def __call__(self, request):
+                self.calls.append(request)
+                return True
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+            def is_connected(self):
+                return True
+            async def get_me(self):
+                class FakeMe:
+                    id = 777888
+                    username = "accept_Escrow"
+                    phone = "+1234567890"
+                return FakeMe()
+            async def get_dialogs(self, limit=250):
+                return []
+            async def get_entity(self, peer):
+                raise ValueError("cannot resolve entity")
+            async def __call__(self, request):
+                self.calls.append(request)
+                return True
+
+        cl = FakeClient()
+        user_cl = FakeUserClient()
+        res = asyncio.run(fwd_mgr.auto_join_destinations_for_client(cl, user_client=user_cl, delay_seconds=0))
+        self.assertEqual(res["joined"], 1)
+        self.assertTrue(any(isinstance(c, InviteToChannelRequest) for c in user_cl.calls))
+
+    def test_auto_join_summary_includes_failed_details(self):
+        """When auto-join cannot join private groups, completion summary details the failure reasons and tips."""
+        import asyncio
+        import services.forwarders_manager as fwd_mgr
+
+        did = db.add_destination(
+            "-1005544332211", "Restricted Private Group", active=True,
+            db_path=self._test_db,
+        )
+
+        class FakeClient:
+            def is_connected(self):
+                return True
+            async def get_me(self):
+                class FakeMe:
+                    username = "accept_Escrow"
+                    phone = "+1234567890"
+                return FakeMe()
+            async def get_dialogs(self, limit=250):
+                return []
+            async def get_entity(self, peer):
+                raise ValueError("cannot resolve entity")
+            async def __call__(self, request):
+                raise Exception("Cannot join")
+
+        class FakeBot:
+            def __init__(self):
+                self.sent = []
+            async def send_message(self, peer, text, **kw):
+                self.sent.append(text)
+
+        bot = FakeBot()
+        cl = FakeClient()
+        res = asyncio.run(fwd_mgr.auto_join_destinations_for_client(cl, bot_client=bot, admin_user_id=12345, delay_seconds=0))
+        self.assertEqual(res["failed"], 1)
+        self.assertEqual(len(bot.sent), 1)
+        self.assertIn("Restricted Private Group", bot.sent[0])
+        self.assertIn("To connect private groups", bot.sent[0])
+
 
 class TestLatencyAndDelaysPerformance(unittest.IsolatedAsyncioTestCase):
     """Verify elimination of all pipeline delays and event-driven wakeups."""

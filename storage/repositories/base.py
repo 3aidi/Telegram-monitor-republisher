@@ -244,6 +244,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 chat_id TEXT NOT NULL UNIQUE,
                 title TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
+                invite_link TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -496,6 +497,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 chat_id TEXT NOT NULL UNIQUE,
                 title TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
+                invite_link TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -611,6 +613,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_forwardings_listing ON forwardings(listing_id);"
         )
+    _dest_table_info = cursor.execute("PRAGMA table_info(destinations)").fetchall()
+    if _dest_table_info:
+        _dest_cols = {r["name"] for r in _dest_table_info}
+        if "invite_link" not in _dest_cols:
+            cursor.execute("ALTER TABLE destinations ADD COLUMN invite_link TEXT")
     if version < 12:
         cursor.execute("PRAGMA user_version = 12")
 

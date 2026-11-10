@@ -23,8 +23,12 @@ from telethon.errors import (
     UserAlreadyParticipantError,
 )
 from telethon.tl.functions.auth import ResendCodeRequest
-from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
+from telethon.tl.functions.messages import (
+    AddChatUserRequest,
+    ExportChatInviteRequest,
+    ImportChatInviteRequest,
+)
 
 import db
 
@@ -410,6 +414,7 @@ async def auto_join_destinations_for_client(
     stopped_early = False
     for idx, d in enumerate(dest_rows, start=1):
         chat_ref = str(d.get("chat_id") or "").strip()
+        invite_link = str(d.get("invite_link") or "").strip()
         title = d.get("title") or chat_ref
         norm_ref = chat_ref.lower() if chat_ref.startswith("@") else chat_ref
 
@@ -421,56 +426,147 @@ async def auto_join_destinations_for_client(
 
         success = False
         try:
-            # 1. Public group by @username
-            if chat_ref.startswith("@"):
-                await client(JoinChannelRequest(chat_ref))
-                success = True
-            # 2. Private group invite link
-            elif "t.me/" in chat_ref:
+            # 1. Stored invite link
+            if invite_link and ("t.me/" in invite_link):
+                inv_hash = parse_invite_hash(invite_link)
+                if inv_hash:
+                    try:
+                        await client(ImportChatInviteRequest(inv_hash))
+                        success = True
+                    except UserAlreadyParticipantError:
+                        results["already_member"] += 1
+                        results["details"].append((title, "already_member"))
+                        continue
+                    except Exception as inv_err:
+                        logger.debug("Failed joining %s via stored invite_link: %s", title, inv_err)
+
+            # 2. Public group by @username
+            if not success and chat_ref.startswith("@"):
+                try:
+                    await client(JoinChannelRequest(chat_ref))
+                    success = True
+                except UserAlreadyParticipantError:
+                    results["already_member"] += 1
+                    results["details"].append((title, "already_member"))
+                    continue
+                except Exception as pub_err:
+                    logger.debug("Failed joining %s via @username: %s", title, pub_err)
+
+            # 3. chat_ref itself is an invite link
+            elif not success and "t.me/" in chat_ref:
                 inv_hash = parse_invite_hash(chat_ref)
                 if inv_hash:
-                    await client(ImportChatInviteRequest(inv_hash))
-                    success = True
+                    try:
+                        await client(ImportChatInviteRequest(inv_hash))
+                        success = True
+                    except UserAlreadyParticipantError:
+                        results["already_member"] += 1
+                        results["details"].append((title, "already_member"))
+                        continue
                 else:
                     results["failed"] += 1
                     results["details"].append((title, "invalid_invite_link"))
                     continue
-            else:
-                # Numeric ID without public handle: try resolving entity if visible
+
+            # 4. Numeric ID without public handle (or if public join failed):
+            if not success and not chat_ref.startswith("@") and "t.me/" not in chat_ref:
                 try:
                     peer = int(chat_ref)
+                except ValueError:
+                    peer = None
+
+                if peer is not None:
+                    # 4a. Can client resolve entity directly?
                     ent = None
                     try:
                         ent = await client.get_entity(peer)
                     except Exception:
                         ent = None
                     if ent:
-                        await client(JoinChannelRequest(ent))
-                        success = True
-                    elif user_client and hasattr(user_client, "is_connected") and user_client.is_connected():
-                        # Main account fallback: export invite link from main account
+                        try:
+                            await client(JoinChannelRequest(ent))
+                            success = True
+                        except UserAlreadyParticipantError:
+                            results["already_member"] += 1
+                            results["details"].append((title, "already_member"))
+                            continue
+                        except Exception:
+                            pass
+
+                    # 4b. Main account (user_client) is already in the group
+                    if not success and user_client and hasattr(user_client, "is_connected") and user_client.is_connected():
                         try:
                             main_ent = await user_client.get_entity(peer)
                             main_uname = getattr(main_ent, "username", None)
+
+                            # If the group has a public username:
                             if main_uname:
-                                await client(JoinChannelRequest(f"@{main_uname}"))
-                                success = True
-                            else:
-                                from telethon.tl.functions.messages import ExportChatInviteRequest
-                                inv = await user_client(ExportChatInviteRequest(main_ent))
-                                inv_link = getattr(inv, "link", None)
-                                if inv_link:
-                                    inv_hash = parse_invite_hash(inv_link)
-                                    if inv_hash:
-                                        await client(ImportChatInviteRequest(inv_hash))
+                                try:
+                                    await client(JoinChannelRequest(f"@{main_uname}"))
+                                    success = True
+                                    try:
+                                        await db.run_async(db.add_destination, f"@{main_uname.lower()}", title, True)
+                                    except Exception:
+                                        pass
+                                except UserAlreadyParticipantError:
+                                    results["already_member"] += 1
+                                    results["details"].append((title, "already_member"))
+                                    continue
+                                except Exception:
+                                    pass
+
+                            # If private, user_client invites/adds client directly:
+                            if not success:
+                                client_me = await client.get_me()
+                                # Try channel/supergroup direct invite
+                                try:
+                                    await user_client(InviteToChannelRequest(channel=main_ent, users=[client_me]))
+                                    success = True
+                                    logger.info("Directly added %s to channel %s via user_client", acct_label, title)
+                                except UserAlreadyParticipantError:
+                                    results["already_member"] += 1
+                                    results["details"].append((title, "already_member"))
+                                    continue
+                                except Exception as direct_err:
+                                    logger.debug("Direct invite via InviteToChannelRequest failed for %s: %s", title, direct_err)
+
+                                # Try basic chat direct add
+                                if not success:
+                                    try:
+                                        chat_id_int = abs(peer) if peer < 0 else peer
+                                        await user_client(AddChatUserRequest(chat_id=chat_id_int, user_id=client_me, fwd_limit=0))
                                         success = True
-                        except Exception as exp_err:
-                            results["failed"] += 1
-                            results["details"].append((title, f"private_invite_error: {exp_err}"))
-                            continue
-                except Exception as ent_err:
+                                        logger.info("Directly added %s to chat %s via user_client", acct_label, title)
+                                    except UserAlreadyParticipantError:
+                                        results["already_member"] += 1
+                                        results["details"].append((title, "already_member"))
+                                        continue
+                                    except Exception as basic_err:
+                                        logger.debug("Direct invite via AddChatUserRequest failed for %s: %s", title, basic_err)
+
+                                # Try exporting invite link if user_client is admin
+                                if not success:
+                                    try:
+                                        inv = await user_client(ExportChatInviteRequest(peer=main_ent))
+                                        inv_link = getattr(inv, "link", None)
+                                        if inv_link:
+                                            inv_hash = parse_invite_hash(inv_link)
+                                            if inv_hash:
+                                                await client(ImportChatInviteRequest(inv_hash))
+                                                success = True
+                                                try:
+                                                    await db.run_async(db.set_destination_invite_link, d["id"], inv_link)
+                                                except Exception:
+                                                    pass
+                                    except Exception as exp_err:
+                                        logger.debug("ExportChatInviteRequest failed for %s: %s", title, exp_err)
+
+                        except Exception as ent_lookup_err:
+                            logger.debug("user_client failed resolving peer %s for %s: %s", peer, title, ent_lookup_err)
+
+                if not success:
                     results["failed"] += 1
-                    results["details"].append((title, f"unresolvable_id: {ent_err}"))
+                    results["details"].append((title, "private_group_no_invite"))
                     continue
 
             if success:
@@ -558,6 +654,36 @@ async def auto_join_destinations_for_client(
                 f"• 🔴 Failed / Private: **{results['failed']}**\n"
                 f"• 📊 Total Verified: **{total}** groups"
             )
+
+        if results["failed"] > 0 and results["details"]:
+            failed_lines = []
+            for title, reason in results["details"]:
+                if reason in ("joined", "already_member"):
+                    continue
+                if reason == "private_group_no_invite" or "private_invite_error" in reason or "unresolvable_id" in reason:
+                    desc = "Private group (requires invite link or manual add)"
+                elif reason == "channels_too_much":
+                    desc = "Account in too many groups (Telegram limit)"
+                elif "floodwait" in reason:
+                    desc = "Telegram rate limit"
+                elif "invite_expired" in reason or reason == "invalid_invite_link":
+                    desc = "Invite link expired / invalid"
+                else:
+                    clean_r = str(reason).split(" (caused by")[0].replace("_", " ").title()[:60]
+                    desc = clean_r
+                failed_lines.append(f"• **{title}**: _{desc}_")
+
+            if failed_lines:
+                summary_text += "\n\n📋 **Failed Destinations:**\n" + "\n".join(failed_lines[:15])
+                if len(failed_lines) > 15:
+                    summary_text += f"\n_...and {len(failed_lines) - 15} more_"
+
+            summary_text += (
+                f"\n\n💡 **To connect private groups:**\n"
+                f"1. Open the group in Telegram and add {acct_label} as a member, OR\n"
+                f"2. Add the destination in **Destinations** using its invite link (`https://t.me/+...`)."
+            )
+
         try:
             if status_message:
                 await status_message.edit(summary_text, parse_mode="markdown")

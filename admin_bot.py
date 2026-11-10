@@ -1727,7 +1727,11 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
         chat_ref = db.normalize_channel_id(raw_chat_id)
         entity = await _resolve_destination_peer(chat_ref)
         display = _entity_display(entity, fallback=f"chat {chat_ref}")
-        await db.run_async(db.add_destination, chat_ref, display, True)
+        entity_username = (
+            (getattr(entity, "username", None) or "").strip().lstrip("@") or None
+        )
+        store_ref = f"@{entity_username.lower()}" if entity_username else chat_ref
+        await db.run_async(db.add_destination, store_ref, display, True)
         await db.run_async(
             db.record_audit,
             "destination_added",
@@ -1767,7 +1771,9 @@ async def _run_add_destination_flow(event, text: str, fwd=None) -> None:
             if entity_username
             else (str(entity_id) if entity_id else username or raw_text)
         )
-        await db.run_async(db.add_destination, store_ref, display, True)
+        is_invite = bool(re.search(r"(?:t\.me/\+|joinchat/)([\w-]+)", raw_text))
+        inv_to_store = raw_text if is_invite else None
+        await db.run_async(db.add_destination, store_ref, display, True, inv_to_store)
         await db.run_async(
             db.record_audit,
             "destination_added",

@@ -55,6 +55,7 @@ def add_destination(
     chat_id,
     title: Optional[str] = None,
     active: bool = True,
+    invite_link: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> int:
     """Register a destination chat (upsert by chat_id) and return its id.
@@ -68,23 +69,37 @@ def add_destination(
         raise ValueError("destination requires a valid Telegram chat id or @username")
     name = (title or "").strip()[:100]
     active_int = 1 if active else 0
+    inv = invite_link.strip() if invite_link else None
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
         conn.execute(
             """
-            INSERT INTO destinations (chat_id, title, active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO destinations (chat_id, title, active, invite_link, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 title = excluded.title,
                 active = excluded.active,
+                invite_link = COALESCE(excluded.invite_link, destinations.invite_link),
                 updated_at = excluded.updated_at
             """,
-            (chat_ref, name, active_int, now_iso, now_iso),
+            (chat_ref, name, active_int, inv, now_iso, now_iso),
         )
         row = conn.execute(
             "SELECT id FROM destinations WHERE chat_id = ?", (chat_ref,)
         ).fetchone()
         return row["id"] if row else None
+
+def set_destination_invite_link(
+    destination_id: int, invite_link: str, db_path: Optional[str] = None
+) -> bool:
+    """Save an invite link for a destination so forwarders can auto-join."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE destinations SET invite_link = ?, updated_at = ? WHERE id = ?",
+            (invite_link.strip() if invite_link else None, now_iso, destination_id),
+        )
+        return cursor.rowcount > 0
 
 def set_destination_active(
     destination_id: int, active: bool, db_path: Optional[str] = None
