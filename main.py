@@ -1861,7 +1861,7 @@ async def _evaluate_listing(
     # Media-only posts have no analyzable text: skip fingerprint/AI entirely and
     # route straight to admin review (never silently dropped, never auto-published).
     if media_only:
-        await db.run_async(db.update_listing_status, listing_id, "pending_review")
+        await db.run_async(db.update_listing_status, listing_id, "pending_review", review_reason="media_only")
         await db.run_async(
             db.record_audit,
             "media_only_review",
@@ -1911,7 +1911,7 @@ async def _evaluate_listing(
     # path — so it is caught BEFORE the AI and routed to manual review.
     payment_proof = filters.detect_payment_proof(raw_text)
     if payment_proof:
-        await db.run_async(db.update_listing_status, listing_id, "pending_review")
+        await db.run_async(db.update_listing_status, listing_id, "pending_review", review_reason="payment_proof")
         await db.run_async(
             db.record_audit,
             "payment_proof_review",
@@ -2075,7 +2075,7 @@ async def _evaluate_listing(
             if risky_keyword
             else f"manual review: {review_reason}"
         )
-        await db.run_async(db.update_listing_status, listing_id, "pending_approval")
+        await db.run_async(db.update_listing_status, listing_id, "pending_approval", review_reason=review_reason)
         await db.run_async(db.record_audit, review_reason, listing_id, detail=reason_detail)
         logger.info(
             "Listing #%s routed to pending_approval (%s).",
@@ -2096,7 +2096,7 @@ async def _evaluate_listing(
     risky_keyword = filters.contains_blocked_keyword(raw_text)
     if analysis.get("blocked") or risky_keyword:
         reason = analysis.get("block_reason") or f"blocked-keyword screen: {risky_keyword}"
-        await db.run_async(db.update_listing_status, listing_id, "pending_review")
+        await db.run_async(db.update_listing_status, listing_id, "pending_review", review_reason="ai_blocked_review")
         await db.run_async(db.record_blocklist_hit, listing_id, reason[:200])
         await db.run_async(db.record_audit, "ai_blocked_review", listing_id, detail=reason)
         logger.warning(
@@ -2141,7 +2141,7 @@ async def _evaluate_listing(
     # Check category blocklist (Task 11)
     category_blocked = filters.check_category_blocked(raw_text, platform_name, BLOCKED_PLATFORM_CATEGORIES)
     if category_blocked:
-        await db.run_async(db.update_listing_status, listing_id, "pending_review")
+        await db.run_async(db.update_listing_status, listing_id, "pending_review", review_reason=f"category_{category_blocked}")
         await db.run_async(
             db.record_audit,
             "category_blocked_review",
@@ -2281,7 +2281,7 @@ async def _evaluate_listing(
         else:
             gate_reason = "unclassified"
 
-        await db.run_async(db.update_listing_status, listing_id, "pending_approval")
+        await db.run_async(db.update_listing_status, listing_id, "pending_approval", review_reason=gate_reason)
         logger.info(
             "Listing #%s marked pending_approval (gate=%s). Alerting admin...",
             listing_id,
@@ -2940,12 +2940,32 @@ async def approved_listings_worker(
                         listing_id,
                         exc,
                     )
+                    if bot_client and ADMIN_USER_ID:
+                        try:
+                            alert_text = texts.APPROVE_SEND_FAIL.format(id=listing_id, error=exc)
+                            fail_buttons = [
+                                [Button.inline("🔁 Retry Publish", data=f"pubretry:{listing_id}")],
+                                [Button.inline(texts.BTN_SKIP, data=f"skip:{listing_id}")],
+                            ]
+                            await bot_client.send_message(ADMIN_USER_ID, alert_text, buttons=fail_buttons, parse_mode="markdown")
+                        except Exception:
+                            pass
                     continue
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     await db.run_async(db.mark_listing_failed, listing_id, str(exc)[:500])
                     logger.exception("Worker failed to publish approved listing #%s", listing_id)
+                    if bot_client and ADMIN_USER_ID:
+                        try:
+                            alert_text = texts.APPROVE_SEND_FAIL.format(id=listing_id, error=exc)
+                            fail_buttons = [
+                                [Button.inline("🔁 Retry Publish", data=f"pubretry:{listing_id}")],
+                                [Button.inline(texts.BTN_SKIP, data=f"skip:{listing_id}")],
+                            ]
+                            await bot_client.send_message(ADMIN_USER_ID, alert_text, buttons=fail_buttons, parse_mode="markdown")
+                        except Exception:
+                            pass
                     continue
 
                 try:

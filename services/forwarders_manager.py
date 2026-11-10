@@ -435,6 +435,12 @@ async def auto_join_destinations_for_client(
             results["details"].append((title, "already_member"))
             continue
 
+        # R-17/B-7: If link is marked needs_link and no fresh invite_link exists, skip to prevent retry storms
+        if d.get("link_state") == "needs_link" and not invite_link:
+            results["failed"] += 1
+            results["details"].append((title, "needs_link"))
+            continue
+
         success = False
         try:
             # 1. Stored invite link
@@ -447,6 +453,15 @@ async def auto_join_destinations_for_client(
                     except UserAlreadyParticipantError:
                         results["already_member"] += 1
                         results["details"].append((title, "already_member"))
+                        continue
+                    except (InviteHashExpiredError, InviteHashInvalidError) as inv_err:
+                        logger.warning("Stored invite_link for %s expired/invalid: %s", title, inv_err)
+                        try:
+                            await db.run_async(db.set_destination_link_state, d["id"], "needs_link")
+                        except Exception:
+                            pass
+                        results["failed"] += 1
+                        results["details"].append((title, f"invite_expired: {inv_err}"))
                         continue
                     except Exception as inv_err:
                         logger.debug("Failed joining %s via stored invite_link: %s", title, inv_err)
@@ -473,6 +488,15 @@ async def auto_join_destinations_for_client(
                     except UserAlreadyParticipantError:
                         results["already_member"] += 1
                         results["details"].append((title, "already_member"))
+                        continue
+                    except (InviteHashExpiredError, InviteHashInvalidError) as inv_err:
+                        logger.warning("Invite link in chat_ref for %s expired/invalid: %s", title, inv_err)
+                        try:
+                            await db.run_async(db.set_destination_link_state, d["id"], "needs_link")
+                        except Exception:
+                            pass
+                        results["failed"] += 1
+                        results["details"].append((title, f"invite_expired: {inv_err}"))
                         continue
                 else:
                     results["failed"] += 1
@@ -718,7 +742,9 @@ async def auto_join_destinations_for_client(
             for title, reason in results["details"]:
                 if reason in ("joined", "already_member"):
                     continue
-                if reason == "private_group_no_invite" or "private_invite_error" in reason or "unresolvable_id" in reason:
+                if reason == "needs_link":
+                    desc = "Invite link needed / expired (retries paused)"
+                elif reason == "private_group_no_invite" or "private_invite_error" in reason or "unresolvable_id" in reason:
                     desc = "Private group (requires invite link or manual add)"
                 elif reason == "channels_too_much":
                     desc = "Account in too many groups (Telegram limit)"

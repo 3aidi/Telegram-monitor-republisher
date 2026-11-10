@@ -151,9 +151,10 @@ def update_listing_status(
     status: str,
     published_message_id: Optional[int] = None,
     post_number: Optional[int] = None,
+    review_reason: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> None:
-    """Update listing status, and optionally published_message_id and post_number."""
+    """Update listing status, and optionally published_message_id, post_number, and review_reason."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with db_session(db_path) as conn:
         # published_at is stamped when transitioning to a published state.
@@ -167,10 +168,22 @@ def update_listing_status(
                 published_message_id = coalesce(?, published_message_id),
                 post_number = coalesce(?, post_number),
                 published_at = coalesce(?, published_at),
+                review_reason = coalesce(?, review_reason),
                 updated_at = ?
             WHERE id = ?
             """,
-            (status, published_message_id, post_number, publish_ts, now_iso, listing_id),
+            (status, published_message_id, post_number, publish_ts, review_reason, now_iso, listing_id),
+        )
+
+def set_listing_draft(
+    listing_id: int, draft_text: Optional[str], db_path: Optional[str] = None
+) -> None:
+    """Set or clear a persistent manual draft for a listing (R-02, B-4)."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db_session(db_path) as conn:
+        conn.execute(
+            "UPDATE listings SET draft_text = ?, updated_at = ? WHERE id = ?",
+            (draft_text, now_iso, listing_id),
         )
 
 def update_listing_content(
@@ -873,7 +886,8 @@ def get_unpublished_listings(
 def get_approved_listings_to_publish(
     limit: int = 10, db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """Listings approved by admin that still need publishing (never double-publish)."""
+    """Listings approved by admin that still need publishing (never double-publish, honors hold_until)."""
+    now_iso = datetime.now(timezone.utc).isoformat()
     query = """
         SELECT l.*, s.channel_username as supplier_username,
                s.display_name as supplier_display_name
@@ -881,11 +895,12 @@ def get_approved_listings_to_publish(
         LEFT JOIN suppliers s ON l.supplier_id = s.id
         WHERE l.status = 'approved'
           AND l.published_message_id IS NULL
+          AND (l.hold_until IS NULL OR l.hold_until <= ?)
         ORDER BY l.id ASC
         LIMIT ?
     """
     with db_session(db_path) as conn:
-        rows = conn.execute(query, (limit,)).fetchall()
+        rows = conn.execute(query, (now_iso, limit)).fetchall()
         return [dict(row) for row in rows]
 
 def claim_listing_for_publish(
