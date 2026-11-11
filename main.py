@@ -3528,6 +3528,7 @@ async def main() -> None:
                 await bot_client.send_message(
                     ADMIN_USER_ID,
                     texts.BOT_ONLINE,
+                    buttons=admin_bot._home_keyboard(),
                 )
                 logger.info("Sent online notice to admin %s", ADMIN_USER_ID)
             except Exception:

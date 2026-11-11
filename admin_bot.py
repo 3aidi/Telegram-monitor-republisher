@@ -2411,7 +2411,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return False
         return True
 
-    @bot.on(events.NewMessage(pattern=r"^(?:/start|/help|❓ Help)"))
+    @bot.on(events.NewMessage(pattern=r"^(?:/start|/help|/home|/menu|🏠 Home|❓ Help)"))
     async def handle_start(event):
         if not await check_admin(event):
             return
@@ -2645,7 +2645,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
         await event.reply(_status_report_text(), buttons=_home_keyboard())
 
-    @bot.on(events.NewMessage(pattern=r"^(?:/pending|⏳ Pending)"))
+    @bot.on(events.NewMessage(pattern=r"^(?:/pending|⏳ Pending|/review|⏳ Review)"))
     async def handle_pending(event):
         if not await check_admin(event):
             return
@@ -2697,7 +2697,7 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
         text, buttons = _skipped_digest(skips, 0, db.count_skipped_listings())
         await event.reply(text, buttons=buttons, parse_mode="markdown")
 
-    @bot.on(events.NewMessage(pattern=r"^(?:/published|✅ Published)"))
+    @bot.on(events.NewMessage(pattern=r"^(?:/published|✅ Published|/posts|✅ Posts)"))
     async def handle_published(event):
         if not await check_admin(event):
             return
@@ -2887,6 +2887,12 @@ def setup_admin_handlers(bot: TelegramClient) -> None:
             return
 
         data_str = event.data.decode("utf-8")
+
+        # Stale V2 token fallback: reset to original menu
+        if any(data_str.startswith(p) for p in ("nav:", "rev:", "dlv:", "src:", "skp:", "sys:", "post:")):
+            await event.answer("Restoring menu...")
+            await _message_delete_send(event, _help_text(), buttons=_home_keyboard())
+            return
 
         # ---- Edit propagation rejected review actions (Task 1) ------------
         if data_str.startswith("apply_edit:"):
